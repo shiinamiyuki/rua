@@ -1,0 +1,68 @@
+WHITESPACE = _{ " " | "\t" | NEWLINE}
+
+keywords = {
+    "return"|
+    "if"|
+    "while"|
+    "for"|
+    "function"|
+    "do"|
+    "end"
+}
+alpha = @{ 'a'..'z' | 'A'..'Z' }
+digit = @{ '0'..'9' }
+
+ident = @{ !keywords ~ (alpha | "_" ) ~ (alpha | digit | "_")* }
+
+int_lit10 = @{ digit+ }
+
+int_lit16 = @{ "0x" ~ ('a'..'f' | 'A'..'F' | digit)+}
+
+literal = { int_lit10 | int_lit16 }
+
+atom = {literal | ident | "(" ~ expr ~ ")" }
+
+arg_list = {  expr ~ ("," ~ expr)* }
+
+call_expr = {"(" ~  arg_list  ~")"}
+
+index_expr = {"[" ~ expr ~ "]"}
+
+postfix_expr = {atom ~ (call_expr | index_expr)*}
+
+prefix_op = { not | neg }
+
+not = {"~"}
+neg = {"-"}
+prefix_expr = {(not | neg)* ~ postfix_expr}
+
+binop = {add | sub | mul | div }
+
+add = {"+"}
+sub = {"-"}
+mul = {"*"}
+div = {"/"}
+
+mul_expr = {prefix_expr ~ ((mul | div) ~ mul_expr)* }
+
+
+add_expr = {mul_expr ~ ((add | sub ) ~ mul_expr )*}
+
+expr = {add_expr}
+
+assign_stmt = { ident ~ "=" ~ expr }
+var_list = { ident ~ ("," ~ ident)*}
+var_list_stmt = {var_list ~ "=" ~ arg_list}
+
+stmt = { (expr | assign_stmt | var_list_stmt | ("do" ~ block ~ "end")) | ("return" ~ expr ) }
+
+block = {(stmt ~ ";"?)*} 
+
+function = {
+    "function" ~ ident ~ "(" ~ var_list ?~ ")"
+        ~ block
+    ~ "end"
+}
+
+program = { SOI ~ function* ~ EOI }
+
