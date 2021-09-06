@@ -5,7 +5,10 @@ use std::{
 
 use ordered_float::OrderedFloat;
 
-use crate::{bytecode::ByteCode, gc::{Gc, Traceable}};
+use crate::{
+    bytecode::ByteCode,
+    gc::{Gc, Traceable},
+};
 
 pub struct Table {
     pub array: Vec<Value>,
@@ -41,7 +44,23 @@ impl Traceable for GcObject {
     }
 }
 #[derive(Clone, Copy, Hash, PartialEq, Eq)]
-pub enum Value {
+pub enum ValueData {
+    Nil,
+    Bool(bool),
     Number(OrderedFloat<f64>),
     Ref(*const GcObject),
+}
+#[derive(Clone, Copy, Hash, PartialEq, Eq)]
+pub struct Value {
+    pub data: ValueData,
+    pub metatable: *const GcObject,
+}
+
+impl Default for Value {
+    fn default() -> Self {
+        Self {
+            data: ValueData::Nil,
+            metatable: std::ptr::null(),
+        }
+    }
 }

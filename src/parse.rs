@@ -59,18 +59,26 @@ impl Token {
     #[allow(dead_code)]
     pub fn loc(&self) -> &SourceLocation {
         match self {
-            Token::Number { value, loc } => loc,
-            Token::Symbol { value, loc } => loc,
-            Token::String { value, loc } => loc,
-            Token::Identifier { value, loc } => loc,
-            Token::Keyword { value, loc } => loc,
+            Token::Number { value: _, loc } => loc,
+            Token::Symbol { value: _, loc } => loc,
+            Token::String { value: _, loc } => loc,
+            Token::Identifier { value: _, loc } => loc,
+            Token::Keyword { value: _, loc } => loc,
             Token::EOF { loc } => loc,
         }
     }
 }
-
+#[derive(Clone, Debug)]
+pub enum TableField {
+    ExprPair(Rc<Expr>, Rc<Expr>),
+    NamePair(Token, Rc<Expr>),
+    ArrayEntry(Rc<Expr>),
+}
 #[derive(Clone, Debug)]
 pub enum Expr {
+    Const {
+        token: Token,
+    },
     Literal {
         token: Token,
     },
@@ -100,10 +108,19 @@ pub enum Expr {
         callee: Rc<Expr>,
         args: Vec<Rc<Expr>>,
     },
+    MethodCallExpr {
+        callee: Rc<Expr>,
+        method: Token,
+        args: Vec<Rc<Expr>>,
+    },
     FunctionExpr {
         loc: SourceLocation,
         args: Vec<Token>,
         body: Rc<Stmt>,
+    },
+    Table {
+        loc: SourceLocation,
+        fields: Vec<TableField>,
     },
 }
 impl Expr {
@@ -112,14 +129,44 @@ impl Expr {
         match self {
             Expr::Literal { token } => token.loc(),
             Expr::Identifier { token } => token.loc(),
-            Expr::BinaryExpr { op, lhs, rhs } => lhs.loc(),
-            Expr::UnaryExpr { op, arg } => op.loc(),
-            Expr::IndexExpr { loc, lhs, rhs } => lhs.loc(),
-            Expr::DotExpr { loc, lhs, rhs } => lhs.loc(),
-            Expr::CallExpr { callee, args } => callee.loc(),
-            Expr::FunctionExpr { loc, args, body } => loc,
+            Expr::BinaryExpr { op: _, lhs, rhs: _ } => lhs.loc(),
+            Expr::UnaryExpr { op, arg: _ } => op.loc(),
+            Expr::IndexExpr {
+                loc: _,
+                lhs,
+                rhs: _,
+            } => lhs.loc(),
+            Expr::DotExpr {
+                loc: _,
+                lhs,
+                rhs: _,
+            } => lhs.loc(),
+            Expr::CallExpr { callee, args: _ } => callee.loc(),
+            Expr::FunctionExpr {
+                loc,
+                args: _,
+                body: _,
+            } => loc,
+            Expr::MethodCallExpr {
+                callee,
+                method: _,
+                args: _,
+            } => callee.loc(),
+            Expr::Table { loc, fields: _ } => loc,
+            Expr::Const { token } => token.loc(),
         }
     }
+}
+
+#[derive(Clone, Debug)]
+pub enum FunctionName {
+    Method {
+        access_chain: Vec<Token>,
+        method: Option<Token>,
+    },
+    Function {
+        name: Token,
+    },
 }
 #[derive(Clone, Debug)]
 pub enum Stmt {
@@ -127,15 +174,15 @@ pub enum Stmt {
         loc: SourceLocation,
         expr: Rc<Expr>,
     },
-    // LocalVar {
-    //     loc: SourceLocation,
-    //     vars: Rc<Stmt>,
-    // },
-    // LocalFunction {
-    //     name: Token,
-    //     args: Vec<Token>,
-    //     body: Rc<Stmt>,
-    // },
+    LocalVar {
+        loc: SourceLocation,
+        vars: Rc<Stmt>,
+    },
+    LocalFunction {
+        name: Token,
+        args: Vec<Token>,
+        body: Rc<Stmt>,
+    },
     If {
         loc: SourceLocation,
         cond: Rc<Expr>,
@@ -179,37 +226,70 @@ pub enum Stmt {
         stmts: Vec<Rc<Stmt>>,
     },
     Function {
-        name: Token,
+        name: FunctionName,
         args: Vec<Token>,
         body: Rc<Stmt>,
     },
 }
 
 impl Stmt {
+    #[allow(dead_code)]
     pub fn loc(&self) -> &SourceLocation {
         match self {
-            Stmt::Return { loc, expr } => loc,
+            Stmt::Return { loc, expr: _ } => loc,
             Stmt::If {
                 loc,
-                cond,
-                then,
-                else_ifs,
-                else_,
+                cond: _,
+                then: _,
+                else_ifs: _,
+                else_: __,
             } => loc,
-            Stmt::While { loc, cond, body } => loc,
-            Stmt::Repeat { loc, cond, body } => loc,
+            Stmt::While {
+                loc,
+                cond: _,
+                body: _,
+            } => loc,
+            Stmt::Repeat {
+                loc,
+                cond: _,
+                body: _,
+            } => loc,
             Stmt::For {
                 name,
-                init,
-                end,
-                step,
-                body,
+                init: _,
+                end: _,
+                step: _,
+                body: _,
             } => name.loc(),
-            Stmt::ForIn { name, range, body } => name.loc(),
-            Stmt::Assign { loc, lhs, rhs } => loc,
-            Stmt::Expr { loc, expr } => loc,
-            Stmt::Block { loc, stmts } => loc,
-            Stmt::Function { name, args, body } => name.loc(),
+            Stmt::ForIn {
+                name,
+                range: _,
+                body: _,
+            } => name.loc(),
+            Stmt::Assign {
+                loc,
+                lhs: _,
+                rhs: _,
+            } => loc,
+            Stmt::Expr { loc, expr: _ } => loc,
+            Stmt::Block { loc, stmts: _ } => loc,
+            Stmt::Function {
+                name,
+                args: _,
+                body: _,
+            } => match name {
+                FunctionName::Method {
+                    access_chain,
+                    method: _,
+                } => access_chain[0].loc(),
+                FunctionName::Function { name } => name.loc(),
+            },
+            Stmt::LocalVar { loc, vars: _ } => loc,
+            Stmt::LocalFunction {
+                name,
+                args: _,
+                body: _,
+            } => name.loc(),
         }
     }
 }
@@ -663,7 +743,6 @@ impl Parser {
     }
 
     fn parse_postfix_expr(&mut self) -> Result<Rc<Expr>, ParseError> {
-        let loc = self.peek().loc().clone();
         let prefix = self.parse_prefix_expr()?;
         let mut expr = prefix;
         loop {
@@ -716,10 +795,39 @@ impl Parser {
                 let callee = expr.clone();
                 let args = self.parse_expr_list(false)?;
                 expr = Rc::new(Expr::CallExpr { callee, args });
+            } else if self.has(":") {
+                self.advance(1);
+                let callee = expr.clone();
+                let method = self.peek().clone();
+                if method.is_eof() {
+                    return Err(self.error(
+                        ErrorKind::UnexpectedEOF,
+                        "unexpected eof in method call expression",
+                        method.loc().clone(),
+                    ));
+                }
+                match method {
+                    Token::Identifier { .. } => {}
+                    _ => {
+                        return Err(self.error(
+                            ErrorKind::SyntaxError,
+                            "expected identifier in method name ",
+                            method.loc().clone(),
+                        ));
+                    }
+                }
+                self.advance(1);
+                let args = self.parse_expr_list(false)?;
+                expr = Rc::new(Expr::MethodCallExpr {
+                    callee,
+                    method,
+                    args,
+                });
             } else {
                 break;
             }
         }
+
         Ok(expr)
     }
     fn eof_loc(&mut self) -> SourceLocation {
@@ -776,12 +884,27 @@ impl Parser {
                     token: token.clone(),
                 }))
             }
+            Token::String { .. } => {
+                self.advance(1);
+                Ok(Rc::new(Expr::Literal {
+                    token: token.clone(),
+                }))
+            }
             Token::Identifier { .. } => {
                 self.advance(1);
                 Ok(Rc::new(Expr::Identifier {
                     token: token.clone(),
                 }))
             }
+            Token::Keyword { ref value, .. }
+                if value == "nil" || value == "true" || value == "false" =>
+            {
+                self.advance(1);
+                Ok(Rc::new(Expr::Const {
+                    token: token.clone(),
+                }))
+            }
+            Token::Symbol { value, .. } if value == "{" => self.parse_table(),
             Token::Symbol { value, loc } if value == "(" => {
                 self.advance(1);
                 let expr = if self.has("function") {
@@ -848,7 +971,7 @@ impl Parser {
         )
     }
     fn parse_prefix_expr(&mut self) -> Result<Rc<Expr>, ParseError> {
-        if self.has("not") {
+        if self.has("not") || self.has("-") || self.has("~") {
             let op = self.peek().clone();
             self.advance(1);
             let expr = self.parse_atom()?;
@@ -880,6 +1003,87 @@ impl Parser {
     }
     fn parse_expr(&mut self) -> Result<Rc<Expr>, ParseError> {
         self.parse_binary_expr()
+    }
+    fn parse_table(&mut self) -> Result<Rc<Expr>, ParseError> {
+        assert!(self.has("{"));
+        self.advance(1);
+        let loc = self.peek().loc().clone();
+        let mut fields = vec![];
+        while !self.has("}") {
+            fields.push(self.parse_table_field()?);
+            if self.has("}") || self.peek().is_eof() {
+                break;
+            }
+            if self.has(",") || self.has(";") {
+                self.advance(1);
+            } else {
+                let loc = self.peek().loc().clone();
+                return Err(self.error(
+                    ErrorKind::SyntaxError,
+                    "expected ',' or ';' in table constructor",
+                    loc,
+                ));
+            }
+        }
+        if self.peek().is_eof() {
+            let loc = self.peek().loc().clone();
+            return Err(self.error(
+                ErrorKind::UnexpectedEOF,
+                "unexpected eof in table constructor",
+                loc,
+            ));
+        }
+        self.advance(1);
+        Ok(Rc::new(Expr::Table { fields, loc }))
+    }
+    fn parse_table_field(&mut self) -> Result<TableField, ParseError> {
+        if self.has("[") {
+            self.advance(1);
+            let key = self.parse_expr()?;
+            if !self.has("]") {
+                let loc = self.peek().loc().clone();
+                return Err(self.error(ErrorKind::SyntaxError, "expected ']' in table field", loc));
+            }
+            self.advance(1);
+            if !self.has("=") {
+                let loc = self.peek().loc().clone();
+                return Err(self.error(ErrorKind::SyntaxError, "expected '=' in table field", loc));
+            }
+            self.advance(1);
+            let value = self.parse_expr()?;
+            Ok(TableField::ExprPair(key, value))
+        } else {
+            let name = self.peek().clone();
+            let loc = name.loc().clone();
+            let mut is_name_pair = false;
+            if name.is_eof() {
+                return Err(self.error(
+                    ErrorKind::UnexpectedEOF,
+                    "unexpected eof in table field",
+                    loc,
+                ));
+            }
+            match name {
+                Token::Identifier { .. } => {
+                    if let Some(next) = self.peek_n(1) {
+                        match next {
+                            Token::Symbol { value, loc: _ } if value == "=" => {
+                                is_name_pair = true;
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                _ => {}
+            }
+            if is_name_pair {
+                self.advance(2);
+                let expr = self.parse_expr()?;
+                Ok(TableField::NamePair(name, expr))
+            } else {
+                Ok(TableField::ArrayEntry(self.parse_expr()?))
+            }
+        }
     }
     fn parse_repeat_stmt(&mut self) -> Result<Rc<Stmt>, ParseError> {
         assert!(self.has("repeat"));
@@ -1049,6 +1253,7 @@ impl Parser {
         let loc = self.peek().loc().clone();
         self.advance(1);
         let name = self.peek().clone();
+        self.advance(1);
         if name.is_eof() {
             return Err(self.error(
                 ErrorKind::UnexpectedEOF,
@@ -1061,17 +1266,93 @@ impl Parser {
             _ => {
                 return Err(self.error(
                     ErrorKind::SyntaxError,
-                    "expected identifier in for function",
+                    "expected identifier in function",
                     name.loc().clone(),
                 ));
             }
         }
-        self.advance(1);
+        let mut func_name = FunctionName::Function { name };
+        while self.has(".") {
+            self.advance(1);
+            let name = self.peek().clone();
+            self.advance(1);
+            if name.is_eof() {
+                return Err(self.error(
+                    ErrorKind::UnexpectedEOF,
+                    "unexpected EOF in function definition",
+                    loc,
+                ));
+            }
+            match &name {
+                Token::Identifier { .. } => {}
+                _ => {
+                    return Err(self.error(
+                        ErrorKind::SyntaxError,
+                        "expected identifier in function",
+                        name.loc().clone(),
+                    ));
+                }
+            }
+            func_name = match func_name {
+                FunctionName::Method {
+                    access_chain,
+                    method,
+                } => {
+                    let mut access_chain = access_chain;
+                    access_chain.push(name);
+                    FunctionName::Method {
+                        access_chain,
+                        method,
+                    }
+                }
+                FunctionName::Function { name: first } => FunctionName::Method {
+                    access_chain: vec![first, name],
+                    method: None,
+                },
+            };
+        }
+        if self.has(":") {
+            self.advance(1);
+            let name = self.peek().clone();
+            self.advance(1);
+            if name.is_eof() {
+                return Err(self.error(
+                    ErrorKind::UnexpectedEOF,
+                    "unexpected EOF in method definition",
+                    loc,
+                ));
+            }
+            match &name {
+                Token::Identifier { .. } => {}
+                _ => {
+                    return Err(self.error(
+                        ErrorKind::SyntaxError,
+                        "expected identifier in method",
+                        name.loc().clone(),
+                    ));
+                }
+            }
+            func_name = match func_name {
+                FunctionName::Method {
+                    access_chain,
+                    method: _,
+                } => FunctionName::Method {
+                    access_chain,
+                    method: Some(name),
+                },
+                FunctionName::Function { name: first } => FunctionName::Method {
+                    access_chain: vec![first, name.clone()],
+                    method: Some(name),
+                },
+            };
+        }
+
         if !self.has("(") {
+            let loc = self.peek().loc().clone();
             return Err(self.error(
                 ErrorKind::SyntaxError,
                 "expected '(' in function definition",
-                name.loc().clone(),
+                loc,
             ));
         }
         let args = self.parse_expr_list(false)?;
@@ -1098,10 +1379,38 @@ impl Parser {
         }
         self.advance(1);
         Ok(Rc::new(Stmt::Function {
-            name,
+            name: func_name,
             args: func_args,
             body,
         }))
+    }
+    fn parse_local(&mut self) -> Result<Rc<Stmt>, ParseError> {
+        assert!(self.has("local"));
+        self.advance(1);
+        if self.has("function") {
+            let function = self.parse_function()?;
+            match &*function {
+                Stmt::Function { name, args, body } => match name {
+                    FunctionName::Method { .. } => Err(self.error(
+                        ErrorKind::SyntaxError,
+                        "method definition not allowed in local function",
+                        function.loc().clone(),
+                    )),
+                    FunctionName::Function { name } => Ok(Rc::new(Stmt::LocalFunction {
+                        args: args.clone(),
+                        body: body.clone(),
+                        name: name.clone(),
+                    })),
+                },
+                _ => unreachable!(),
+            }
+        } else {
+            let assignment = self.parse_assignment_stmt()?;
+            Ok(Rc::new(Stmt::LocalVar {
+                loc: assignment.loc().clone(),
+                vars: assignment,
+            }))
+        }
     }
     fn parse_stmt(&mut self) -> Result<Rc<Stmt>, ParseError> {
         if self.has("if") {
@@ -1116,7 +1425,9 @@ impl Parser {
             self.parse_repeat_stmt()
         } else if self.has("function") {
             self.parse_function()
-        } else {
+        } else if self.has("local") {
+            self.parse_local()
+        }else {
             self.parse_assignment_stmt()
         }
     }
