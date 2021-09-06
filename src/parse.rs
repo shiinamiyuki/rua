@@ -56,6 +56,7 @@ impl Token {
             _ => false,
         }
     }
+    #[allow(dead_code)]
     pub fn loc(&self) -> &SourceLocation {
         match self {
             Token::Number { value, loc } => loc,
@@ -99,11 +100,27 @@ pub enum Expr {
         callee: Rc<Expr>,
         args: Vec<Rc<Expr>>,
     },
-    // FunctionExpr {
-
-    // }
+    FunctionExpr {
+        loc: SourceLocation,
+        args: Vec<Token>,
+        body: Rc<Stmt>,
+    },
 }
-
+impl Expr {
+    #[allow(dead_code)]
+    pub fn loc(&self) -> &SourceLocation {
+        match self {
+            Expr::Literal { token } => token.loc(),
+            Expr::Identifier { token } => token.loc(),
+            Expr::BinaryExpr { op, lhs, rhs } => lhs.loc(),
+            Expr::UnaryExpr { op, arg } => op.loc(),
+            Expr::IndexExpr { loc, lhs, rhs } => lhs.loc(),
+            Expr::DotExpr { loc, lhs, rhs } => lhs.loc(),
+            Expr::CallExpr { callee, args } => callee.loc(),
+            Expr::FunctionExpr { loc, args, body } => loc,
+        }
+    }
+}
 #[derive(Clone, Debug)]
 pub enum Stmt {
     Return {
@@ -120,18 +137,18 @@ pub enum Stmt {
     While {
         loc: SourceLocation,
         cond: Rc<Expr>,
-        body: Rc<Expr>,
+        body: Rc<Stmt>,
     },
     Repeat {
         loc: SourceLocation,
         cond: Rc<Expr>,
-        body: Rc<Expr>,
+        body: Rc<Stmt>,
     },
     For {
         name: Token,
         init: Rc<Expr>,
         end: Rc<Expr>,
-        step: Rc<Expr>,
+        step: Option<Rc<Expr>>,
         body: Rc<Stmt>,
     },
     ForIn {
@@ -148,6 +165,44 @@ pub enum Stmt {
         loc: SourceLocation,
         expr: Rc<Expr>,
     },
+    Block {
+        loc: SourceLocation,
+        stmts: Vec<Rc<Stmt>>,
+    },
+    Function {
+        name: Token,
+        args: Vec<Token>,
+        body: Rc<Stmt>,
+    },
+}
+
+impl Stmt {
+    pub fn loc(&self) -> &SourceLocation {
+        match self {
+            Stmt::Return { loc, expr } => loc,
+            Stmt::If {
+                loc,
+                cond,
+                then,
+                else_ifs,
+                else_,
+            } => loc,
+            Stmt::While { loc, cond, body } => loc,
+            Stmt::Repeat { loc, cond, body } => loc,
+            Stmt::For {
+                name,
+                init,
+                end,
+                step,
+                body,
+            } => name.loc(),
+            Stmt::ForIn { name, range, body } => name.loc(),
+            Stmt::Assign { loc, lhs, rhs } => loc,
+            Stmt::Expr { loc, expr } => loc,
+            Stmt::Block { loc, stmts } => loc,
+            Stmt::Function { name, args, body } => name.loc(),
+        }
+    }
 }
 pub struct Program {}
 
@@ -430,9 +485,9 @@ pub fn tokenize(filename: &str, source: &str) -> Result<Vec<Token>, TokenizeErro
     }
     let keywords = HashSet::from_iter(
         vec![
-            "break", "goto", "do", "end", "while", "if", "elseif", "else", "repeat", "until",
-            "for", "local", "function", "do", "in", "return", "nil", "false", "true", "and", "not",
-            "or",
+            "break", "goto", "do", "end", "while", "if", "elseif", "then", "else", "repeat",
+            "until", "for", "local", "function", "do", "in", "return", "nil", "false", "true",
+            "and", "not", "or",
         ]
         .into_iter()
         .map(|s| String::from(s)),
@@ -478,7 +533,7 @@ macro_rules! gen_parse_binary_expr {
                     let new = op.clone();
                     std::mem::drop(op);
                     let op = new;
-                    let (value, loc) = match &op {
+                    let (value, _loc) = match &op {
                         Token::Symbol { value, loc } => {
                             (value, loc)
                         }
@@ -661,6 +716,39 @@ impl Parser {
     fn eof_loc(&mut self) -> SourceLocation {
         self.tokens.last().unwrap().loc().clone()
     }
+    fn parse_function_expr(&mut self) -> Result<Rc<Expr>, ParseError> {
+        assert!(self.has("function"));
+        let loc = self.peek().loc().clone();
+        self.advance(1);
+        let args = self.parse_expr_list(false)?;
+        let mut func_args = vec![];
+        for arg in args {
+            match &*arg {
+                Expr::Identifier { token } => func_args.push(token.clone()),
+                _ => {
+                    return Err(self.error(
+                        ErrorKind::SyntaxError,
+                        "unexpected expression function definition",
+                        arg.loc().clone(),
+                    ));
+                }
+            }
+        }
+        let body = self.parse_block()?;
+        if !self.has("end") {
+            return Err(self.error(
+                ErrorKind::SyntaxError,
+                "expected 'end' in function definition",
+                loc,
+            ));
+        }
+        self.advance(1);
+        Ok(Rc::new(Expr::FunctionExpr {
+            loc,
+            args: func_args,
+            body,
+        }))
+    }
     fn parse_atom(&mut self) -> Result<Rc<Expr>, ParseError> {
         let token = self.peek();
         if token.is_eof() {
@@ -687,7 +775,11 @@ impl Parser {
             }
             Token::Symbol { value, loc } if value == "(" => {
                 self.advance(1);
-                let expr = self.parse_expr()?;
+                let expr = if self.has("function") {
+                    self.parse_function_expr()?
+                } else {
+                    self.parse_expr()?
+                };
 
                 if !self.has(")") {
                     return Err(self.error(ErrorKind::SyntaxError, "expected ')'", loc.clone()));
@@ -695,12 +787,19 @@ impl Parser {
                 self.advance(1);
                 Ok(expr)
             }
-            Token::EOF{loc}=>{
-                Err(self.error(ErrorKind::UnexpectedEOF, "unexpected EOF when parsing atom", loc.clone()))
-            }
-            t@_=>{
-                Err(self.error(ErrorKind::UnexpectedEOF, "expected literals or identifiers when parsing atom", t.loc().clone()))
-            }
+            Token::EOF { loc } => Err(self.error(
+                ErrorKind::UnexpectedEOF,
+                "unexpected EOF when parsing atom",
+                loc.clone(),
+            )),
+            t @ _ => Err(self.error(
+                ErrorKind::UnexpectedEOF,
+                &format!(
+                    "expected literals or identifiers when parsing atom but found {:?}",
+                    t
+                ),
+                t.loc().clone(),
+            )),
         }
     }
     fn parse_pow_expr(&mut self) -> Result<Rc<Expr>, ParseError> {
@@ -773,13 +872,148 @@ impl Parser {
     fn parse_expr(&mut self) -> Result<Rc<Expr>, ParseError> {
         self.parse_binary_expr()
     }
-    // fn parse_if_stmt(&mut self) -> Option<Result<Rc<Stmt>, ParseError>> {
-    //     if self.has("if") {
-
-    //     }else{
-    //         None
-    //     }
-    // }
+    fn parse_repeat_stmt(&mut self) -> Result<Rc<Stmt>, ParseError> {
+        assert!(self.has("repeat"));
+        let loc = self.peek().loc().clone();
+        self.advance(1);
+        let body = self.parse_block()?;
+        if !self.has("until") {
+            return Err(self.error(ErrorKind::SyntaxError, "expected 'until' in while", loc));
+        }
+        let cond = self.parse_expr()?;
+        Ok(Rc::new(Stmt::Repeat { loc, cond, body }))
+    }
+    fn parse_return_stmt(&mut self) -> Result<Rc<Stmt>, ParseError> {
+        assert!(self.has("return"));
+        let loc = self.peek().loc().clone();
+        self.advance(1);
+        let expr = self.parse_expr()?;
+        Ok(Rc::new(Stmt::Return { loc, expr }))
+    }
+    fn parse_for_stmt(&mut self) -> Result<Rc<Stmt>, ParseError> {
+        assert!(self.has("for"));
+        let loc = self.peek().loc().clone();
+        self.advance(1);
+        let name = self.peek().clone();
+        if name.is_eof() {
+            return Err(self.error(ErrorKind::UnexpectedEOF, "unexpected EOF in for loop", loc));
+        }
+        match &name {
+            Token::Symbol { .. } => {}
+            _ => {
+                return Err(self.error(
+                    ErrorKind::SyntaxError,
+                    "expected identifier in for loop",
+                    name.loc().clone(),
+                ));
+            }
+        }
+        self.advance(1);
+        if self.has("=") {
+            self.advance(1);
+            let init = self.parse_expr()?;
+            if !self.has(",") {
+                let loc = self.peek().loc().clone();
+                return Err(self.error(ErrorKind::SyntaxError, "expected ',' in for loop", loc));
+            }
+            self.advance(1);
+            let end = self.parse_expr()?;
+            let step = if self.has(",") {
+                self.advance(1);
+                Some(self.parse_expr()?)
+            } else {
+                None
+            };
+            if !self.has("do") {
+                return Err(self.error(ErrorKind::SyntaxError, "expected 'do' in for", loc));
+            }
+            let body = self.parse_block()?;
+            let loc = self.peek().loc().clone();
+            if !self.has("end") {
+                return Err(self.error(ErrorKind::SyntaxError, "expected 'end' in for", loc));
+            }
+            Ok(Rc::new(Stmt::For {
+                name,
+                init,
+                end,
+                step,
+                body,
+            }))
+        } else if self.has("in") {
+            self.advance(1);
+            let range = self.parse_expr()?;
+            let loc = self.peek().loc().clone();
+            if !self.has("do") {
+                return Err(self.error(ErrorKind::SyntaxError, "expected 'do' in for", loc));
+            }
+            let body = self.parse_block()?;
+            let loc = self.peek().loc().clone();
+            if !self.has("end") {
+                return Err(self.error(ErrorKind::SyntaxError, "expected 'end' in for", loc));
+            }
+            Ok(Rc::new(Stmt::ForIn { range, body, name }))
+        } else {
+            let loc = self.peek().loc().clone();
+            Err(self.error(
+                ErrorKind::SyntaxError,
+                "expected 'in' or '=' in for loop",
+                loc,
+            ))
+        }
+    }
+    fn parse_while_stmt(&mut self) -> Result<Rc<Stmt>, ParseError> {
+        assert!(self.has("while"));
+        let loc = self.peek().loc().clone();
+        self.advance(1);
+        let cond = self.parse_expr()?;
+        if !self.has("do") {
+            return Err(self.error(ErrorKind::SyntaxError, "expected 'do' in while", loc));
+        }
+        let body = self.parse_block()?;
+        if !self.has("end") {
+            return Err(self.error(ErrorKind::SyntaxError, "expected 'end' in while", loc));
+        }
+        Ok(Rc::new(Stmt::While { loc, cond, body }))
+    }
+    fn parse_if_stmt(&mut self) -> Result<Rc<Stmt>, ParseError> {
+        assert!(self.has("if"));
+        let loc = self.peek().loc().clone();
+        self.advance(1);
+        let cond = self.parse_expr()?;
+        if !self.has("then") {
+            return Err(self.error(ErrorKind::SyntaxError, "expected 'then' in if", loc));
+        }
+        self.advance(1);
+        let then = self.parse_block()?;
+        let mut else_ifs = vec![];
+        while self.has("elseif") {
+            self.advance(1);
+            let loc = self.peek().loc().clone();
+            let cond = self.parse_expr()?;
+            if !self.has("then") {
+                return Err(self.error(ErrorKind::SyntaxError, "expected 'then' in elseif", loc));
+            }
+            self.advance(1);
+            let body = self.parse_block()?;
+            else_ifs.push((cond, body));
+        }
+        let else_ = if self.has("else") {
+            self.advance(1);
+            Some(self.parse_block()?)
+        } else {
+            None
+        };
+        if !self.has("end") {
+            return Err(self.error(ErrorKind::SyntaxError, "expected 'end' in if", loc));
+        }
+        Ok(Rc::new(Stmt::If {
+            loc,
+            cond,
+            then,
+            else_ifs,
+            else_,
+        }))
+    }
     fn parse_assignment_stmt(&mut self) -> Result<Rc<Stmt>, ParseError> {
         let loc = self.peek().loc().clone();
         let lhs = self.parse_expr_list(true)?;
@@ -801,9 +1035,112 @@ impl Parser {
             }))
         }
     }
-    fn parse_stmt(&mut self) -> Result<Rc<Stmt>, ParseError> {
-        self.parse_assignment_stmt()
+    fn parse_function(&mut self) -> Result<Rc<Stmt>, ParseError> {
+        assert!(self.has("function"));
+        let loc = self.peek().loc().clone();
+        self.advance(1);
+        let name = self.peek().clone();
+        if name.is_eof() {
+            return Err(self.error(
+                ErrorKind::UnexpectedEOF,
+                "unexpected EOF in function definition",
+                loc,
+            ));
+        }
+        match &name {
+            Token::Identifier { .. } => {}
+            _ => {
+                return Err(self.error(
+                    ErrorKind::SyntaxError,
+                    "expected identifier in for function",
+                    name.loc().clone(),
+                ));
+            }
+        }
+        self.advance(1);
+        if !self.has("(") {
+            return Err(self.error(
+                ErrorKind::SyntaxError,
+                "expected '(' in function definition",
+                name.loc().clone(),
+            ));
+        }
+        let args = self.parse_expr_list(false)?;
+        let mut func_args = vec![];
+        for arg in args {
+            match &*arg {
+                Expr::Identifier { token } => func_args.push(token.clone()),
+                _ => {
+                    return Err(self.error(
+                        ErrorKind::SyntaxError,
+                        "unexpected expression function definition",
+                        arg.loc().clone(),
+                    ));
+                }
+            }
+        }
+        let body = self.parse_block()?;
+        if !self.has("end") {
+            return Err(self.error(
+                ErrorKind::SyntaxError,
+                "expected 'end' in function definition",
+                loc,
+            ));
+        }
+        self.advance(1);
+        Ok(Rc::new(Stmt::Function {
+            name,
+            args: func_args,
+            body,
+        }))
     }
+    fn parse_stmt(&mut self) -> Result<Rc<Stmt>, ParseError> {
+        if self.has("if") {
+            self.parse_if_stmt()
+        } else if self.has("while") {
+            self.parse_while_stmt()
+        } else if self.has("for") {
+            self.parse_for_stmt()
+        } else if self.has("return") {
+            self.parse_return_stmt()
+        } else if self.has("repeat") {
+            self.parse_repeat_stmt()
+        } else if self.has("function") {
+            self.parse_function()
+        } else {
+            self.parse_assignment_stmt()
+        }
+    }
+    fn parse_block(&mut self) -> Result<Rc<Stmt>, ParseError> {
+        let loc = self.peek().loc().clone();
+        let mut stmts = vec![];
+        let mut has_return = false;
+        while !self.has("end")
+            && !self.has("elseif")
+            && !self.has("else")
+            && !self.has("until")
+            && !self.peek().is_eof()
+        {
+            let loc = self.peek().loc().clone();
+            let stmt = self.parse_stmt()?;
+            match &*stmt {
+                Stmt::Return { .. } => {
+                    if has_return {
+                        return Err(self.error(
+                            ErrorKind::SyntaxError,
+                            "multiple return statement in block",
+                            loc,
+                        ));
+                    }
+                    has_return = true;
+                }
+                _ => {}
+            }
+            stmts.push(stmt);
+        }
+        Ok(Rc::new(Stmt::Block { loc, stmts }))
+    }
+
     fn error(&mut self, kind: ErrorKind, msg: &str, loc: SourceLocation) -> ParseError {
         ParseError {
             loc,
@@ -812,7 +1149,7 @@ impl Parser {
         }
     }
     fn run(&mut self) -> Result<Rc<Stmt>, ParseError> {
-        self.parse_stmt()
+        self.parse_block()
     }
 }
 
