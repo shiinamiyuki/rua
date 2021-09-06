@@ -50,6 +50,12 @@ pub enum Token {
     EOF { loc: SourceLocation },
 }
 impl Token {
+    pub fn is_eof(&self) -> bool {
+        match self {
+            Token::EOF { .. } => true,
+            _ => false,
+        }
+    }
     pub fn loc(&self) -> &SourceLocation {
         match self {
             Token::Number { value, loc } => loc,
@@ -445,7 +451,13 @@ pub fn tokenize(filename: &str, source: &str) -> Result<Vec<Token>, TokenizeErro
     tokenizer.run()
 }
 
+#[derive(Clone, Copy, Debug)]
+pub enum ErrorKind {
+    UnexpectedEOF,
+    SyntaxError,
+}
 pub struct ParseError {
+    pub kind: ErrorKind,
     pub msg: String,
     pub loc: SourceLocation,
 }
@@ -456,25 +468,13 @@ struct Parser {
 macro_rules! gen_parse_binary_expr {
     ($self:ident, $parse_lhs:expr, $parse_rhs:expr, $($op:literal),+) => {
         {
-            let lhs = $parse_lhs;
-            if lhs.is_none(){
-                let loc = $self.peek().unwrap().loc().clone();
-                return Some(Err($self.error(
-                    &format!("cannot parse expression"),
-                    loc,
-                )));
-            }
-            let lhs = lhs.unwrap();
-            let mut expr = match lhs {
-                Ok(x) => x,
-                Err(x) => {
-                    return Some(Err(x));
-                }
-            };
+            let lhs = $parse_lhs?;
+            let mut expr = lhs;
             let ops:Vec<_> = vec![$($op),+].into_iter().map(|s|String::from(s)).collect();
             loop {
                 let next = $self.peek();
-                if let Some(op) = next {
+                if !next.is_eof() {
+                    let op = next;
                     let new = op.clone();
                     std::mem::drop(op);
                     let op = new;
@@ -490,18 +490,7 @@ macro_rules! gen_parse_binary_expr {
 
                     if ops.contains(&value) {
                         $self.advance(1);
-                        let rhs = $parse_rhs;//$self.parse_atom();
-                        if rhs.is_none() {
-                            return Some(Err($self.error(
-                                &format!("when parsing binary expr {:?}", ops),
-                                loc.clone(),
-                            )));
-                        }
-                        let rhs = rhs.unwrap();
-                        let rhs = match rhs {
-                            Err(e) => return Some(Err(e)),
-                            Ok(e) => e,
-                        };
+                        let rhs = $parse_rhs?;//$self.parse_atom();
                         expr = Rc::new(Expr::BinaryExpr {
                             op: op.clone(),
                             lhs: expr,
@@ -516,7 +505,7 @@ macro_rules! gen_parse_binary_expr {
                     break;
                 }
             };
-            Some(Ok(expr))
+            Ok(expr)
         }
     };
 }
@@ -525,18 +514,18 @@ impl Parser {
         assert!(n > 0);
         self.pos += n;
     }
-    fn peek(&mut self) -> Option<&Token> {
-        self.peek_n(0)
+    fn peek(&mut self) -> &Token {
+        self.peek_n(0).unwrap()
     }
     fn peek_n(&mut self, n: usize) -> Option<&Token> {
         self.tokens.get(self.pos + n)
     }
     fn has(&mut self, s: &str) -> bool {
         let token = self.peek();
-        if token.is_none() {
+        if token.is_eof() {
             return false;
         }
-        match token.unwrap() {
+        match token {
             Token::Symbol { value, .. } if *value == s => true,
             Token::Keyword { value, .. } if *value == s => true,
             _ => false,
@@ -545,8 +534,8 @@ impl Parser {
     fn parse_expr_list(
         &mut self,
         is_parallel_assigment: bool,
-    ) -> Option<Result<Vec<Rc<Expr>>, ParseError>> {
-        let loc = self.peek().unwrap().loc().clone();
+    ) -> Result<Vec<Rc<Expr>>, ParseError> {
+        let loc = self.peek().loc().clone();
 
         let mut args = vec![];
         if !is_parallel_assigment {
@@ -555,7 +544,7 @@ impl Parser {
         }
         let mut cnt = 0;
         loop {
-            if self.peek().is_none() {
+            if self.peek().is_eof() {
                 break;
             }
             if !is_parallel_assigment {
@@ -573,17 +562,7 @@ impl Parser {
                 }
                 self.advance(1);
             }
-            let arg = self.parse_expr();
-            if arg.is_none() {
-                return Some(Err(
-                    self.error(&format!("cannot parse expression in expression list"), loc)
-                ));
-            }
-            let arg = arg.unwrap();
-            let arg = match arg {
-                Ok(x) => x,
-                Err(e) => return Some(Err(e)),
-            };
+            let arg = self.parse_expr()?;
             args.push(arg);
             // if !is_parallel_assigment {
             //     if self.has(")") {
@@ -598,54 +577,44 @@ impl Parser {
         }
         if !is_parallel_assigment {
             if !self.has(")") {
-                let loc = self.peek().unwrap().loc().clone();
-                if self.peek().is_some() {
-                    return Some(Err(self.error(&format!("expected ')' in expression"), loc)));
+                if !self.peek().is_eof() {
+                    return Err(self.error(
+                        ErrorKind::SyntaxError,
+                        &format!("expected ')' in expression"),
+                        loc,
+                    ));
                 } else {
-                    return Some(Err(self.error(
+                    let loc = self.peek().loc().clone();
+                    return Err(self.error(
+                        ErrorKind::UnexpectedEOF,
                         &format!("unexpected EOF when parsing call expression"),
                         loc,
-                    )));
+                    ));
                 }
             } else {
                 self.advance(1);
             }
         }
-        Some(Ok(args))
+        Ok(args)
     }
 
-    fn parse_postfix_expr(&mut self) -> Option<Result<Rc<Expr>, ParseError>> {
-        let loc = self.peek().unwrap().loc().clone();
-        let prefix = self.parse_prefix_expr();
-        if prefix.is_none() {
-            return Some(Err(
-                self.error(&format!("cannot parse prefix expr in postfix expr"), loc)
-            ));
-        }
-        let prefix = prefix.unwrap();
-        let mut expr = match prefix {
-            Ok(x) => x,
-            Err(e) => return Some(Err(e)),
-        };
+    fn parse_postfix_expr(&mut self) -> Result<Rc<Expr>, ParseError> {
+        let loc = self.peek().loc().clone();
+        let prefix = self.parse_prefix_expr()?;
+        let mut expr = prefix;
         loop {
             if self.has(".") {
-                let loc = self.peek().unwrap().loc().clone();
+                let loc = self.peek().loc().clone();
                 self.advance(1);
-                let rhs = self.parse_atom();
-                if rhs.is_none() {
-                    return Some(Err(
-                        self.error(&format!("cannot parse prefix in dot expr"), loc)
-                    ));
-                }
-                let rhs = rhs.unwrap();
-                let rhs = match rhs {
-                    Ok(x) => x,
-                    Err(e) => return Some(Err(e)),
-                };
+                let rhs = self.parse_atom()?;
                 match &*rhs {
                     Expr::Identifier { .. } => {}
                     _ => {
-                        return Some(Err(self.error(&format!("expected dot expr"), loc)));
+                        return Err(self.error(
+                            ErrorKind::SyntaxError,
+                            &format!("expected dot expr"),
+                            loc,
+                        ));
                     }
                 }
                 expr = Rc::new(Expr::DotExpr {
@@ -654,31 +623,23 @@ impl Parser {
                     lhs: expr,
                 });
             } else if self.has("[") {
-                let loc = self.peek().unwrap().loc().clone();
+                let loc = self.peek().loc().clone();
                 self.advance(1);
-                let rhs = self.parse_expr();
-                if rhs.is_none() {
-                    return Some(Err(
-                        self.error(&format!("cannot parse expression in dot expression"), loc)
-                    ));
-                }
-                let rhs = rhs.unwrap();
-                let rhs = match rhs {
-                    Ok(x) => x,
-                    Err(e) => return Some(Err(e)),
-                };
+                let rhs = self.parse_expr()?;
                 if !self.has("]") {
-                    let loc = self.peek().unwrap().loc().clone();
-                    if self.peek().is_some() {
-                        return Some(Err(self.error(
+                    let loc = self.peek().loc().clone();
+                    if !self.peek().is_eof() {
+                        return Err(self.error(
+                            ErrorKind::SyntaxError,
                             &format!("expected ']' expression in index expression"),
                             loc,
-                        )));
+                        ));
                     } else {
-                        return Some(Err(self.error(
+                        return Err(self.error(
+                            ErrorKind::UnexpectedEOF,
                             &format!("unexpected EOF when parsing index expression"),
                             loc,
-                        )));
+                        ));
                     }
                 }
                 self.advance(1);
@@ -689,65 +650,60 @@ impl Parser {
                 });
             } else if self.has("(") {
                 let callee = expr.clone();
-                let args = self.parse_expr_list(false).unwrap();
-                let args = match args {
-                    Err(e) => {
-                        return Some(Err(e));
-                    }
-                    Ok(args) => args,
-                };
+                let args = self.parse_expr_list(false)?;
                 expr = Rc::new(Expr::CallExpr { callee, args });
             } else {
                 break;
             }
         }
-        Some(Ok(expr))
+        Ok(expr)
     }
     fn eof_loc(&mut self) -> SourceLocation {
         self.tokens.last().unwrap().loc().clone()
     }
-    fn parse_atom(&mut self) -> Option<Result<Rc<Expr>, ParseError>> {
+    fn parse_atom(&mut self) -> Result<Rc<Expr>, ParseError> {
         let token = self.peek();
-        if token.is_none() {
+        if token.is_eof() {
             let loc = self.eof_loc();
-            return Some(Err(self.error("unexpected EOF when parsing atom '('", loc)));
+            return Err(self.error(
+                ErrorKind::UnexpectedEOF,
+                "unexpected EOF when parsing atom '('",
+                loc,
+            ));
         }
-        let token = token.unwrap().clone();
+        let token = token.clone();
         match token {
             Token::Number { .. } => {
                 self.advance(1);
-                Some(Ok(Rc::new(Expr::Literal {
+                Ok(Rc::new(Expr::Literal {
                     token: token.clone(),
-                })))
+                }))
             }
             Token::Identifier { .. } => {
                 self.advance(1);
-                Some(Ok(Rc::new(Expr::Identifier {
+                Ok(Rc::new(Expr::Identifier {
                     token: token.clone(),
-                })))
+                }))
             }
             Token::Symbol { value, loc } if value == "(" => {
                 self.advance(1);
-                let expr = self.parse_expr();
-                if let Some(expr) = expr {
-                    match expr {
-                        Ok(expr) => {
-                            if !self.has(")") {
-                                return Some(Err(self.error("expected ')'", loc.clone())));
-                            }
-                            self.advance(1);
-                            Some(Ok(expr))
-                        }
-                        Err(e) => Some(Err(e)),
-                    }
-                } else {
-                    return Some(Err(self.error("expected expression after '('", loc.clone())));
+                let expr = self.parse_expr()?;
+
+                if !self.has(")") {
+                    return Err(self.error(ErrorKind::SyntaxError, "expected ')'", loc.clone()));
                 }
+                self.advance(1);
+                Ok(expr)
             }
-            _ => None,
+            Token::EOF{loc}=>{
+                Err(self.error(ErrorKind::UnexpectedEOF, "unexpected EOF when parsing atom", loc.clone()))
+            }
+            t@_=>{
+                Err(self.error(ErrorKind::UnexpectedEOF, "expected literals or identifiers when parsing atom", t.loc().clone()))
+            }
         }
     }
-    fn parse_pow_expr(&mut self) -> Option<Result<Rc<Expr>, ParseError>> {
+    fn parse_pow_expr(&mut self) -> Result<Rc<Expr>, ParseError> {
         gen_parse_binary_expr!(
             self,
             self.parse_postfix_expr(),
@@ -755,7 +711,7 @@ impl Parser {
             "^"
         )
     }
-    fn parse_mul_expr(&mut self) -> Option<Result<Rc<Expr>, ParseError>> {
+    fn parse_mul_expr(&mut self) -> Result<Rc<Expr>, ParseError> {
         gen_parse_binary_expr!(
             self,
             self.parse_pow_expr(),
@@ -766,10 +722,10 @@ impl Parser {
             "//"
         )
     }
-    fn parse_add_expr(&mut self) -> Option<Result<Rc<Expr>, ParseError>> {
+    fn parse_add_expr(&mut self) -> Result<Rc<Expr>, ParseError> {
         gen_parse_binary_expr!(self, self.parse_mul_expr(), self.parse_mul_expr(), "+", "-")
     }
-    fn parse_cmp_expr(&mut self) -> Option<Result<Rc<Expr>, ParseError>> {
+    fn parse_cmp_expr(&mut self) -> Result<Rc<Expr>, ParseError> {
         gen_parse_binary_expr!(
             self,
             self.parse_add_expr(),
@@ -783,29 +739,17 @@ impl Parser {
             "~="
         )
     }
-    fn parse_prefix_expr(&mut self) -> Option<Result<Rc<Expr>, ParseError>> {
+    fn parse_prefix_expr(&mut self) -> Result<Rc<Expr>, ParseError> {
         if self.has("not") {
-            let op = self.peek().unwrap().clone();
+            let op = self.peek().clone();
             self.advance(1);
-            let expr = self.parse_atom();
-            match expr {
-                None => {
-                    return Some(Err(
-                        self.error("expected expression after not", op.loc().clone())
-                    ));
-                }
-                Some(e) => match e {
-                    Ok(e) => return Some(Ok(Rc::new(Expr::UnaryExpr { op, arg: e }))),
-                    Err(e) => {
-                        return Some(Err(e));
-                    }
-                },
-            }
+            let expr = self.parse_atom()?;
+            Ok(Rc::new(Expr::UnaryExpr { op, arg: expr }))
         } else {
             self.parse_atom()
         }
     }
-    fn parse_and_expr(&mut self) -> Option<Result<Rc<Expr>, ParseError>> {
+    fn parse_and_expr(&mut self) -> Result<Rc<Expr>, ParseError> {
         gen_parse_binary_expr!(
             self,
             self.parse_cmp_expr(),
@@ -814,7 +758,7 @@ impl Parser {
             "&"
         )
     }
-    fn parse_or_expr(&mut self) -> Option<Result<Rc<Expr>, ParseError>> {
+    fn parse_or_expr(&mut self) -> Result<Rc<Expr>, ParseError> {
         gen_parse_binary_expr!(
             self,
             self.parse_and_expr(),
@@ -823,61 +767,52 @@ impl Parser {
             "|"
         )
     }
-    fn parse_binary_expr(&mut self) -> Option<Result<Rc<Expr>, ParseError>> {
+    fn parse_binary_expr(&mut self) -> Result<Rc<Expr>, ParseError> {
         self.parse_or_expr()
     }
-    fn parse_expr(&mut self) -> Option<Result<Rc<Expr>, ParseError>> {
+    fn parse_expr(&mut self) -> Result<Rc<Expr>, ParseError> {
         self.parse_binary_expr()
     }
-    fn parse_if_stmt(&mut self) -> Option<Result<Rc<Stmt>, ParseError>> {
-        if self.has("if") {
-            
-        }else{
-            None
-        }
-    }
-    fn parse_assignment_stmt(&mut self) -> Option<Result<Rc<Stmt>, ParseError>> {
-        let loc = self.peek().unwrap().loc().clone();
-        let lhs = self.parse_expr_list(true).unwrap();
-        let lhs = match lhs {
-            Err(e) => {
-                return Some(Err(e));
-            }
-            Ok(lhs) => lhs,
-        };
+    // fn parse_if_stmt(&mut self) -> Option<Result<Rc<Stmt>, ParseError>> {
+    //     if self.has("if") {
+
+    //     }else{
+    //         None
+    //     }
+    // }
+    fn parse_assignment_stmt(&mut self) -> Result<Rc<Stmt>, ParseError> {
+        let loc = self.peek().loc().clone();
+        let lhs = self.parse_expr_list(true)?;
         if self.has("=") {
             self.advance(1);
-            let rhs = self.parse_expr_list(true).unwrap();
-            let rhs = match rhs {
-                Err(e) => {
-                    return Some(Err(e));
-                }
-                Ok(rhs) => rhs,
-            };
-            Some(Ok(Rc::new(Stmt::Assign { loc, lhs, rhs })))
+            let rhs = self.parse_expr_list(true)?;
+            Ok(Rc::new(Stmt::Assign { loc, lhs, rhs }))
         } else {
             if lhs.len() > 1 {
-                return Some(Err(
-                    self.error("parallel assignment expect right hand side", loc)
+                return Err(self.error(
+                    ErrorKind::SyntaxError,
+                    "parallel assignment expect right hand side",
+                    loc,
                 ));
             }
-            Some(Ok(Rc::new(Stmt::Expr {
+            Ok(Rc::new(Stmt::Expr {
                 loc,
                 expr: lhs[0].clone(),
-            })))
+            }))
         }
     }
-    fn parse_stmt(&mut self) -> Option<Result<Rc<Stmt>, ParseError>> {
+    fn parse_stmt(&mut self) -> Result<Rc<Stmt>, ParseError> {
         self.parse_assignment_stmt()
     }
-    fn error(&mut self, msg: &str, loc: SourceLocation) -> ParseError {
+    fn error(&mut self, kind: ErrorKind, msg: &str, loc: SourceLocation) -> ParseError {
         ParseError {
             loc,
+            kind,
             msg: String::from(msg),
         }
     }
     fn run(&mut self) -> Result<Rc<Stmt>, ParseError> {
-        self.parse_stmt().unwrap()
+        self.parse_stmt()
     }
 }
 
