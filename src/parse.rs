@@ -47,6 +47,19 @@ pub enum Token {
     String { value: String, loc: SourceLocation },
     Identifier { value: String, loc: SourceLocation },
     Keyword { value: String, loc: SourceLocation },
+    EOF { loc: SourceLocation },
+}
+impl Token {
+    pub fn loc(&self) -> &SourceLocation {
+        match self {
+            Token::Number { value, loc } => loc,
+            Token::Symbol { value, loc } => loc,
+            Token::String { value, loc } => loc,
+            Token::Identifier { value, loc } => loc,
+            Token::Keyword { value, loc } => loc,
+            Token::EOF { loc } => loc,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -54,12 +67,32 @@ pub enum Expr {
     Literal {
         token: Token,
     },
+    Identifier {
+        token: Token,
+    },
     BinaryExpr {
         op: Token,
         lhs: Rc<Expr>,
         rhs: Rc<Expr>,
     },
-    UnaryExpr { op: Token, arg: Rc<Expr> },
+    UnaryExpr {
+        op: Token,
+        arg: Rc<Expr>,
+    },
+    IndexExpr {
+        loc: SourceLocation,
+        lhs: Rc<Expr>,
+        rhs: Rc<Expr>,
+    },
+    DotExpr {
+        loc: SourceLocation,
+        lhs: Rc<Expr>,
+        rhs: Rc<Expr>,
+    },
+    CallExpr {
+        callee: Rc<Expr>,
+        args: Vec<Rc<Expr>>,
+    },
 }
 #[derive(Clone, Debug)]
 pub struct IfStmt {
@@ -325,6 +358,9 @@ impl Tokenizer {
             self.skip_space();
             tokens.push(self.next_token()?);
         }
+        tokens.push(Token::EOF {
+            loc: self.loc.clone(),
+        });
         Ok(tokens)
     }
 }
@@ -380,9 +416,17 @@ struct Parser {
     pos: usize,
 }
 macro_rules! gen_parse_binary_expr {
-    ($self:ident, $parse_next:expr, $($op:literal),+) => {
+    ($self:ident, $parse_lhs:expr, $parse_rhs:expr, $($op:literal),+) => {
         {
-            let lhs = $parse_next?;
+            let lhs = $parse_lhs;
+            if lhs.is_none(){
+                let loc = $self.peek().unwrap().loc().clone();
+                return Some(Err($self.error(
+                    &format!("cannot parse expression"),
+                    loc,
+                )));
+            }
+            let lhs = lhs.unwrap();
             let mut expr = match lhs {
                 Ok(x) => x,
                 Err(x) => {
@@ -396,35 +440,40 @@ macro_rules! gen_parse_binary_expr {
                     let new = op.clone();
                     std::mem::drop(op);
                     let op = new;
-                    match &op {
+                    let (value, loc) = match &op {
                         Token::Symbol { value, loc } => {
-                            if ops.contains(&value) {
-                                $self.advance(1);
-                                let rhs = $parse_next;//$self.parse_atom();
-                                if rhs.is_none() {
-                                    return Some(Err($self.error(
-                                        &format!("expect atom when parsing binary expr {:?}", ops),
-                                        loc.clone(),
-                                    )));
-                                }
-                                let rhs = rhs.unwrap();
-                                let rhs = match rhs {
-                                    Err(e) => return Some(Err(e)),
-                                    Ok(e) => e,
-                                };
-                                expr = Rc::new(Expr::BinaryExpr {
-                                    op: op.clone(),
-                                    lhs: expr,
-                                    rhs,
-                                });
-                            } else {
-                                break;
-                            }
+                            (value, loc)
                         }
-                        _ => {
-                            break;
+                        Token::Keyword { value, loc } => {
+                            (value, loc)
                         }
+                        _=>{break;}
+                    };
+
+                    if ops.contains(&value) {
+                        $self.advance(1);
+                        let rhs = $parse_rhs;//$self.parse_atom();
+                        if rhs.is_none() {
+                            return Some(Err($self.error(
+                                &format!("when parsing binary expr {:?}", ops),
+                                loc.clone(),
+                            )));
+                        }
+                        let rhs = rhs.unwrap();
+                        let rhs = match rhs {
+                            Err(e) => return Some(Err(e)),
+                            Ok(e) => e,
+                        };
+                        expr = Rc::new(Expr::BinaryExpr {
+                            op: op.clone(),
+                            lhs: expr,
+                            rhs,
+                        });
+
+                    } else {
+                        break;
                     }
+
                 } else {
                     break;
                 }
@@ -444,8 +493,156 @@ impl Parser {
     fn peek_n(&mut self, n: usize) -> Option<&Token> {
         self.tokens.get(self.pos + n)
     }
+    fn has(&mut self, s: &str) -> bool {
+        let token = self.peek();
+        if token.is_none() {
+            return false;
+        }
+        match token.unwrap() {
+            Token::Symbol { value, .. } if *value == s => true,
+            Token::Keyword { value, .. } if *value == s => true,
+            _ => false,
+        }
+    }
+
+    fn parse_postfix_expr(&mut self) -> Option<Result<Rc<Expr>, ParseError>> {
+        let prefix = self.parse_prefix_expr();
+        let loc = self.peek().unwrap().loc().clone();
+        if prefix.is_none() {
+            return Some(Err(
+                self.error(&format!("cannot parse prefix expr in postfix expr"), loc)
+            ));
+        }
+        let prefix = prefix.unwrap();
+        let mut expr = match prefix {
+            Ok(x) => x,
+            Err(e) => return Some(Err(e)),
+        };
+        loop {
+            if self.has(".") {
+                let loc = self.peek().unwrap().loc().clone();
+                self.advance(1);
+                let rhs = self.parse_atom();
+                if rhs.is_none() {
+                    return Some(Err(
+                        self.error(&format!("cannot parse prefix in dot expr"), loc)
+                    ));
+                }
+                let rhs = rhs.unwrap();
+                let rhs = match rhs {
+                    Ok(x) => x,
+                    Err(e) => return Some(Err(e)),
+                };
+                match &*rhs {
+                    Expr::Identifier { .. } => {}
+                    _ => {
+                        return Some(Err(self.error(&format!("expected dot expr"), loc)));
+                    }
+                }
+                expr = Rc::new(Expr::DotExpr {
+                    loc,
+                    rhs,
+                    lhs: expr,
+                });
+            } else if self.has("[") {
+                let loc = self.peek().unwrap().loc().clone();
+                self.advance(1);
+                let rhs = self.parse_expr();
+                if rhs.is_none() {
+                    return Some(Err(
+                        self.error(&format!("cannot parse expression in dot expression"), loc)
+                    ));
+                }
+                let rhs = rhs.unwrap();
+                let rhs = match rhs {
+                    Ok(x) => x,
+                    Err(e) => return Some(Err(e)),
+                };
+                if !self.has("]") {
+                    let loc = self.peek().unwrap().loc().clone();
+                    if self.peek().is_some() {
+                        return Some(Err(self.error(
+                            &format!("expected ']' expression in index expression"),
+                            loc,
+                        )));
+                    } else {
+                        return Some(Err(self.error(
+                            &format!("unexpected EOF when parsing index expression"),
+                            loc,
+                        )));
+                    }
+                }
+                self.advance(1);
+                expr = Rc::new(Expr::IndexExpr {
+                    loc,
+                    rhs,
+                    lhs: expr,
+                });
+            } else if self.has("(") {
+                let loc = self.peek().unwrap().loc().clone();
+                self.advance(1);
+                let callee = expr.clone();
+                let mut args = vec![];
+                loop {
+                    if self.peek().is_none() {
+                        break;
+                    }
+                    if self.has(")") {
+                        break;
+                    }
+                    let arg = self.parse_expr();
+                    if arg.is_none() {
+                        return Some(Err(
+                            self.error(&format!("cannot parse expression in call expression"), loc)
+                        ));
+                    }
+                    let arg = arg.unwrap();
+                    let arg = match arg {
+                        Ok(x) => x,
+                        Err(e) => return Some(Err(e)),
+                    };
+                    args.push(arg);
+                    if self.has(")") {
+                        break;
+                    } else if !self.has(",") {
+                        return Some(Err(
+                            self.error(&format!("expected ',' in call expression arguments"), loc)
+                        ));
+                    }else{
+                        self.advance(1);
+                    }
+                }
+                if !self.has(")") {
+                    let loc = self.peek().unwrap().loc().clone();
+                    if self.peek().is_some() {
+                        return Some(Err(
+                            self.error(&format!("expected ')' in call expression"), loc)
+                        ));
+                    } else {
+                        return Some(Err(self.error(
+                            &format!("unexpected EOF when parsing call expression"),
+                            loc,
+                        )));
+                    }
+                }
+                self.advance(1);
+                expr = Rc::new(Expr::CallExpr { callee, args });
+            } else {
+                break;
+            }
+        }
+        Some(Ok(expr))
+    }
+    fn eof_loc(&mut self) -> SourceLocation {
+        self.tokens.last().unwrap().loc().clone()
+    }
     fn parse_atom(&mut self) -> Option<Result<Rc<Expr>, ParseError>> {
-        let token = self.peek()?.clone();
+        let token = self.peek();
+        if token.is_none() {
+            let loc = self.eof_loc();
+            return Some(Err(self.error("unexpected EOF when parsing atom '('", loc)));
+        }
+        let token = token.unwrap().clone();
         match token {
             Token::Number { .. } => {
                 self.advance(1);
@@ -453,17 +650,114 @@ impl Parser {
                     token: token.clone(),
                 })))
             }
+            Token::Identifier { .. } => {
+                self.advance(1);
+                Some(Ok(Rc::new(Expr::Identifier {
+                    token: token.clone(),
+                })))
+            }
+            Token::Symbol { value, loc } if value == "(" => {
+                self.advance(1);
+                let expr = self.parse_expr();
+                if let Some(expr) = expr {
+                    match expr {
+                        Ok(expr) => {
+                            if !self.has(")") {
+                                return Some(Err(self.error("expected ')'", loc.clone())));
+                            }
+                            self.advance(1);
+                            Some(Ok(expr))
+                        }
+                        Err(e) => Some(Err(e)),
+                    }
+                } else {
+                    return Some(Err(self.error("expected expression after '('", loc.clone())));
+                }
+            }
             _ => None,
         }
     }
+    fn parse_pow_expr(&mut self) -> Option<Result<Rc<Expr>, ParseError>> {
+        gen_parse_binary_expr!(
+            self,
+            self.parse_postfix_expr(),
+            self.parse_postfix_expr(),
+            "^"
+        )
+    }
     fn parse_mul_expr(&mut self) -> Option<Result<Rc<Expr>, ParseError>> {
-        gen_parse_binary_expr!(self, self.parse_atom(), "*", "/")
+        gen_parse_binary_expr!(
+            self,
+            self.parse_pow_expr(),
+            self.parse_pow_expr(),
+            "*",
+            "/",
+            "%",
+            "//"
+        )
     }
     fn parse_add_expr(&mut self) -> Option<Result<Rc<Expr>, ParseError>> {
-        gen_parse_binary_expr!(self, self.parse_mul_expr(), "+", "-")
+        gen_parse_binary_expr!(self, self.parse_mul_expr(), self.parse_mul_expr(), "+", "-")
+    }
+    fn parse_cmp_expr(&mut self) -> Option<Result<Rc<Expr>, ParseError>> {
+        gen_parse_binary_expr!(
+            self,
+            self.parse_add_expr(),
+            self.parse_add_expr(),
+            "<",
+            "<=",
+            ">",
+            ">=",
+            "==",
+            "!=",
+            "~="
+        )
+    }
+    fn parse_prefix_expr(&mut self) -> Option<Result<Rc<Expr>, ParseError>> {
+        if self.has("not") {
+            let op = self.peek().unwrap().clone();
+            self.advance(1);
+            let expr = self.parse_atom();
+            match expr {
+                None => {
+                    return Some(Err(
+                        self.error("expected expression after not", op.loc().clone())
+                    ));
+                }
+                Some(e) => match e {
+                    Ok(e) => return Some(Ok(Rc::new(Expr::UnaryExpr { op, arg: e }))),
+                    Err(e) => {
+                        return Some(Err(e));
+                    }
+                },
+            }
+        } else {
+            self.parse_atom()
+        }
+    }
+    fn parse_and_expr(&mut self) -> Option<Result<Rc<Expr>, ParseError>> {
+        gen_parse_binary_expr!(
+            self,
+            self.parse_cmp_expr(),
+            self.parse_cmp_expr(),
+            "and",
+            "&"
+        )
+    }
+    fn parse_or_expr(&mut self) -> Option<Result<Rc<Expr>, ParseError>> {
+        gen_parse_binary_expr!(
+            self,
+            self.parse_and_expr(),
+            self.parse_and_expr(),
+            "or",
+            "|"
+        )
     }
     fn parse_binary_expr(&mut self) -> Option<Result<Rc<Expr>, ParseError>> {
-        self.parse_add_expr()
+        self.parse_or_expr()
+    }
+    fn parse_expr(&mut self) -> Option<Result<Rc<Expr>, ParseError>> {
+        self.parse_binary_expr()
     }
     fn error(&mut self, msg: &str, loc: SourceLocation) -> ParseError {
         ParseError {
@@ -472,7 +766,7 @@ impl Parser {
         }
     }
     fn run(&mut self) -> Result<Rc<Expr>, ParseError> {
-        self.parse_binary_expr().unwrap()
+        self.parse_expr().unwrap()
     }
 }
 
