@@ -127,6 +127,15 @@ pub enum Stmt {
         loc: SourceLocation,
         expr: Rc<Expr>,
     },
+    // LocalVar {
+    //     loc: SourceLocation,
+    //     vars: Rc<Stmt>,
+    // },
+    // LocalFunction {
+    //     name: Token,
+    //     args: Vec<Token>,
+    //     body: Rc<Stmt>,
+    // },
     If {
         loc: SourceLocation,
         cond: Rc<Expr>,
