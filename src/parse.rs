@@ -93,17 +93,55 @@ pub enum Expr {
         callee: Rc<Expr>,
         args: Vec<Rc<Expr>>,
     },
+    // FunctionExpr {
+
+    // }
 }
-#[derive(Clone, Debug)]
-pub struct IfStmt {
-    pub cond: Rc<Expr>,
-    pub then: Rc<Stmt>,
-    pub else_ifs: Vec<(Rc<Expr>, Rc<Stmt>)>,
-    pub else_: Option<Rc<Stmt>>,
-}
+
 #[derive(Clone, Debug)]
 pub enum Stmt {
-    If(IfStmt),
+    Return {
+        loc: SourceLocation,
+        expr: Rc<Expr>,
+    },
+    If {
+        loc: SourceLocation,
+        cond: Rc<Expr>,
+        then: Rc<Stmt>,
+        else_ifs: Vec<(Rc<Expr>, Rc<Stmt>)>,
+        else_: Option<Rc<Stmt>>,
+    },
+    While {
+        loc: SourceLocation,
+        cond: Rc<Expr>,
+        body: Rc<Expr>,
+    },
+    Repeat {
+        loc: SourceLocation,
+        cond: Rc<Expr>,
+        body: Rc<Expr>,
+    },
+    For {
+        name: Token,
+        init: Rc<Expr>,
+        end: Rc<Expr>,
+        step: Rc<Expr>,
+        body: Rc<Stmt>,
+    },
+    ForIn {
+        name: Token,
+        range: Rc<Expr>,
+        body: Rc<Stmt>,
+    },
+    Assign {
+        loc: SourceLocation,
+        lhs: Vec<Rc<Expr>>,
+        rhs: Vec<Rc<Expr>>,
+    },
+    Expr {
+        loc: SourceLocation,
+        expr: Rc<Expr>,
+    },
 }
 pub struct Program {}
 
@@ -504,10 +542,81 @@ impl Parser {
             _ => false,
         }
     }
+    fn parse_expr_list(
+        &mut self,
+        is_parallel_assigment: bool,
+    ) -> Option<Result<Vec<Rc<Expr>>, ParseError>> {
+        let loc = self.peek().unwrap().loc().clone();
+
+        let mut args = vec![];
+        if !is_parallel_assigment {
+            assert!(self.has("("));
+            self.advance(1);
+        }
+        let mut cnt = 0;
+        loop {
+            if self.peek().is_none() {
+                break;
+            }
+            if !is_parallel_assigment {
+                if self.has(")") {
+                    break;
+                }
+            } else {
+                if self.has("=") {
+                    break;
+                }
+            }
+            if cnt > 0 {
+                if !self.has(",") {
+                    break;
+                }
+                self.advance(1);
+            }
+            let arg = self.parse_expr();
+            if arg.is_none() {
+                return Some(Err(
+                    self.error(&format!("cannot parse expression in expression list"), loc)
+                ));
+            }
+            let arg = arg.unwrap();
+            let arg = match arg {
+                Ok(x) => x,
+                Err(e) => return Some(Err(e)),
+            };
+            args.push(arg);
+            // if !is_parallel_assigment {
+            //     if self.has(")") {
+            //         break;
+            //     }
+            // } else {
+            //     if self.has("=") {
+            //         break;
+            //     }
+            // }
+            cnt += 1;
+        }
+        if !is_parallel_assigment {
+            if !self.has(")") {
+                let loc = self.peek().unwrap().loc().clone();
+                if self.peek().is_some() {
+                    return Some(Err(self.error(&format!("expected ')' in expression"), loc)));
+                } else {
+                    return Some(Err(self.error(
+                        &format!("unexpected EOF when parsing call expression"),
+                        loc,
+                    )));
+                }
+            } else {
+                self.advance(1);
+            }
+        }
+        Some(Ok(args))
+    }
 
     fn parse_postfix_expr(&mut self) -> Option<Result<Rc<Expr>, ParseError>> {
-        let prefix = self.parse_prefix_expr();
         let loc = self.peek().unwrap().loc().clone();
+        let prefix = self.parse_prefix_expr();
         if prefix.is_none() {
             return Some(Err(
                 self.error(&format!("cannot parse prefix expr in postfix expr"), loc)
@@ -579,53 +688,14 @@ impl Parser {
                     lhs: expr,
                 });
             } else if self.has("(") {
-                let loc = self.peek().unwrap().loc().clone();
-                self.advance(1);
                 let callee = expr.clone();
-                let mut args = vec![];
-                loop {
-                    if self.peek().is_none() {
-                        break;
+                let args = self.parse_expr_list(false).unwrap();
+                let args = match args {
+                    Err(e) => {
+                        return Some(Err(e));
                     }
-                    if self.has(")") {
-                        break;
-                    }
-                    let arg = self.parse_expr();
-                    if arg.is_none() {
-                        return Some(Err(
-                            self.error(&format!("cannot parse expression in call expression"), loc)
-                        ));
-                    }
-                    let arg = arg.unwrap();
-                    let arg = match arg {
-                        Ok(x) => x,
-                        Err(e) => return Some(Err(e)),
-                    };
-                    args.push(arg);
-                    if self.has(")") {
-                        break;
-                    } else if !self.has(",") {
-                        return Some(Err(
-                            self.error(&format!("expected ',' in call expression arguments"), loc)
-                        ));
-                    }else{
-                        self.advance(1);
-                    }
-                }
-                if !self.has(")") {
-                    let loc = self.peek().unwrap().loc().clone();
-                    if self.peek().is_some() {
-                        return Some(Err(
-                            self.error(&format!("expected ')' in call expression"), loc)
-                        ));
-                    } else {
-                        return Some(Err(self.error(
-                            &format!("unexpected EOF when parsing call expression"),
-                            loc,
-                        )));
-                    }
-                }
-                self.advance(1);
+                    Ok(args) => args,
+                };
                 expr = Rc::new(Expr::CallExpr { callee, args });
             } else {
                 break;
@@ -759,18 +829,59 @@ impl Parser {
     fn parse_expr(&mut self) -> Option<Result<Rc<Expr>, ParseError>> {
         self.parse_binary_expr()
     }
+    fn parse_if_stmt(&mut self) -> Option<Result<Rc<Stmt>, ParseError>> {
+        if self.has("if") {
+            
+        }else{
+            None
+        }
+    }
+    fn parse_assignment_stmt(&mut self) -> Option<Result<Rc<Stmt>, ParseError>> {
+        let loc = self.peek().unwrap().loc().clone();
+        let lhs = self.parse_expr_list(true).unwrap();
+        let lhs = match lhs {
+            Err(e) => {
+                return Some(Err(e));
+            }
+            Ok(lhs) => lhs,
+        };
+        if self.has("=") {
+            self.advance(1);
+            let rhs = self.parse_expr_list(true).unwrap();
+            let rhs = match rhs {
+                Err(e) => {
+                    return Some(Err(e));
+                }
+                Ok(rhs) => rhs,
+            };
+            Some(Ok(Rc::new(Stmt::Assign { loc, lhs, rhs })))
+        } else {
+            if lhs.len() > 1 {
+                return Some(Err(
+                    self.error("parallel assignment expect right hand side", loc)
+                ));
+            }
+            Some(Ok(Rc::new(Stmt::Expr {
+                loc,
+                expr: lhs[0].clone(),
+            })))
+        }
+    }
+    fn parse_stmt(&mut self) -> Option<Result<Rc<Stmt>, ParseError>> {
+        self.parse_assignment_stmt()
+    }
     fn error(&mut self, msg: &str, loc: SourceLocation) -> ParseError {
         ParseError {
             loc,
             msg: String::from(msg),
         }
     }
-    fn run(&mut self) -> Result<Rc<Expr>, ParseError> {
-        self.parse_expr().unwrap()
+    fn run(&mut self) -> Result<Rc<Stmt>, ParseError> {
+        self.parse_stmt().unwrap()
     }
 }
 
-pub fn parse_impl(tokens: Vec<Token>) -> Result<Rc<Expr>, ParseError> {
+pub fn parse_impl(tokens: Vec<Token>) -> Result<Rc<Stmt>, ParseError> {
     let mut parser = Parser { tokens, pos: 0 };
     parser.run()
 }
