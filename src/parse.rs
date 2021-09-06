@@ -50,36 +50,26 @@ pub enum Token {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct Literal {
-    pub(crate) tok: Token,
-}
-#[derive(Clone, Debug)]
-pub(crate) struct BinaryExpr {
-    pub(crate) op: Token,
-    pub(crate) lhs: Rc<Expr>,
-    pub(crate) rhs: Rc<Expr>,
-}
-#[derive(Clone, Debug)]
-pub(crate) struct UnaryExpr {
-    pub(crate) op: Token,
-    pub(crate) arg: Rc<Expr>,
-}
-
-#[derive(Clone, Debug)]
-pub(crate) enum Expr {
-    Literal(Literal),
-    BinaryExpr(BinaryExpr),
+pub enum Expr {
+    Literal {
+        token: Token,
+    },
+    BinaryExpr {
+        op: Token,
+        lhs: Rc<Expr>,
+        rhs: Rc<Expr>,
+    },
     UnaryExpr { op: Token, arg: Rc<Expr> },
 }
 #[derive(Clone, Debug)]
-pub(crate) struct IfStmt {
-    pub(crate) cond: Rc<Expr>,
-    pub(crate) then: Rc<Stmt>,
-    pub(crate) else_ifs: Vec<(Rc<Expr>, Rc<Stmt>)>,
-    pub(crate) else_: Option<Rc<Stmt>>,
+pub struct IfStmt {
+    pub cond: Rc<Expr>,
+    pub then: Rc<Stmt>,
+    pub else_ifs: Vec<(Rc<Expr>, Rc<Stmt>)>,
+    pub else_: Option<Rc<Stmt>>,
 }
 #[derive(Clone, Debug)]
-pub(crate) enum Stmt {
+pub enum Stmt {
     If(IfStmt),
 }
 pub struct Program {}
@@ -170,7 +160,7 @@ impl Tokenizer {
                 }
             }
             if self.keywords.contains(&ident) {
-                return Some(Ok(Token::Keyword { value: ident, loc }))
+                return Some(Ok(Token::Keyword { value: ident, loc }));
             }
             Some(Ok(Token::Identifier { value: ident, loc }))
         } else {
@@ -262,7 +252,7 @@ impl Tokenizer {
                     _ => {
                         if ch == open {
                             break;
-                        }else{
+                        } else {
                             s.push(ch);
                         }
                     }
@@ -344,7 +334,7 @@ pub fn tokenize(filename: &str, source: &str) -> Result<Vec<Token>, TokenizeErro
         symbols.push(HashSet::from_iter(
             vec![
                 "+", "-", "*", "/", "[", "]", "(", ")", "{", "}", "%", "&", "^", "~", "!", ";",
-                ",", ":", ".", "<", ">", "#","=",
+                ",", ":", ".", "<", ">", "#", "=",
             ]
             .into_iter()
             .map(|s| String::from(s)),
@@ -379,4 +369,114 @@ pub fn tokenize(filename: &str, source: &str) -> Result<Vec<Token>, TokenizeErro
         keywords,
     };
     tokenizer.run()
+}
+
+pub struct ParseError {
+    pub msg: String,
+    pub loc: SourceLocation,
+}
+struct Parser {
+    tokens: Vec<Token>,
+    pos: usize,
+}
+macro_rules! gen_parse_binary_expr {
+    ($self:ident, $parse_next:expr, $($op:literal),+) => {
+        {
+            let lhs = $parse_next?;
+            let mut expr = match lhs {
+                Ok(x) => x,
+                Err(x) => {
+                    return Some(Err(x));
+                }
+            };
+            let ops:Vec<_> = vec![$($op),+].into_iter().map(|s|String::from(s)).collect();
+            loop {
+                let next = $self.peek();
+                if let Some(op) = next {
+                    let new = op.clone();
+                    std::mem::drop(op);
+                    let op = new;
+                    match &op {
+                        Token::Symbol { value, loc } => {
+                            if ops.contains(&value) {
+                                $self.advance(1);
+                                let rhs = $parse_next;//$self.parse_atom();
+                                if rhs.is_none() {
+                                    return Some(Err($self.error(
+                                        &format!("expect atom when parsing binary expr {:?}", ops),
+                                        loc.clone(),
+                                    )));
+                                }
+                                let rhs = rhs.unwrap();
+                                let rhs = match rhs {
+                                    Err(e) => return Some(Err(e)),
+                                    Ok(e) => e,
+                                };
+                                expr = Rc::new(Expr::BinaryExpr {
+                                    op: op.clone(),
+                                    lhs: expr,
+                                    rhs,
+                                });
+                            } else {
+                                break;
+                            }
+                        }
+                        _ => {
+                            break;
+                        }
+                    }
+                } else {
+                    break;
+                }
+            };
+            Some(Ok(expr))
+        }
+    };
+}
+impl Parser {
+    fn advance(&mut self, n: usize) {
+        assert!(n > 0);
+        self.pos += n;
+    }
+    fn peek(&mut self) -> Option<&Token> {
+        self.peek_n(0)
+    }
+    fn peek_n(&mut self, n: usize) -> Option<&Token> {
+        self.tokens.get(self.pos + n)
+    }
+    fn parse_atom(&mut self) -> Option<Result<Rc<Expr>, ParseError>> {
+        let token = self.peek()?.clone();
+        match token {
+            Token::Number { .. } => {
+                self.advance(1);
+                Some(Ok(Rc::new(Expr::Literal {
+                    token: token.clone(),
+                })))
+            }
+            _ => None,
+        }
+    }
+    fn parse_mul_expr(&mut self) -> Option<Result<Rc<Expr>, ParseError>> {
+        gen_parse_binary_expr!(self, self.parse_atom(), "*", "/")
+    }
+    fn parse_add_expr(&mut self) -> Option<Result<Rc<Expr>, ParseError>> {
+        gen_parse_binary_expr!(self, self.parse_mul_expr(), "+", "-")
+    }
+    fn parse_binary_expr(&mut self) -> Option<Result<Rc<Expr>, ParseError>> {
+        self.parse_add_expr()
+    }
+    fn error(&mut self, msg: &str, loc: SourceLocation) -> ParseError {
+        ParseError {
+            loc,
+            msg: String::from(msg),
+        }
+    }
+    fn run(&mut self) -> Result<Rc<Expr>, ParseError> {
+        self.parse_binary_expr().unwrap()
+    }
+}
+
+pub fn parse_impl(tokens: Vec<Token>) -> Result<Rc<Expr>, ParseError> {
+    let mut parser = Parser { tokens, pos: 0 };
+    parser.run()
 }
