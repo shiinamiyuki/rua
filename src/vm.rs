@@ -1,11 +1,25 @@
-use crate::value::Value;
+use std::{cell::{RefCell, RefMut}, rc::Rc};
 
-pub const MAX_LOCALS:usize = 200;
-pub const REGISTERS_PER_FRAME:usize = 256;
-struct Frame {
-    registers:[Value; REGISTERS_PER_FRAME],
+use crate::{gc::Gc, state::State, value::Value};
+
+/*
+The instances represents a thread
+*/
+pub struct Instance{
+    gc:Rc<Gc>,
+    state:RefCell<State>,
 }
 
-pub struct VM{
-
+impl Instance {
+    /*
+    
+    */
+    pub fn lock<'a>(&self)->RefMut<State>{
+        self.state.borrow_mut()
+    }
+    fn eval_loop(&self) {
+        loop {
+            
+        }
+    }
 }

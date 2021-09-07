@@ -1,6 +1,6 @@
 use std::process::exit;
 
-use rua::parse::{parse_impl, tokenize};
+use rua::{compile::compile, parse::{parse_impl, tokenize}};
 
 fn main(){
     let src = std::fs::read_to_string("test.lua").unwrap();
@@ -28,4 +28,6 @@ fn main(){
         }
     };
     println!("{:#?}", expr);
+    let module = compile(expr).unwrap();
+    println!("{:#?}", module);
 }

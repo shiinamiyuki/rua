@@ -76,7 +76,7 @@ pub enum TableField {
 }
 #[derive(Clone, Debug)]
 pub enum Expr {
-    Const {
+    Const { // nil, true, false
         token: Token,
     },
     Literal {
