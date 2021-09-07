@@ -1,6 +1,6 @@
 use std::process::exit;
 
-use rua::{compile::compile, parse::{parse_impl, tokenize}};
+use rua::{compile::compile, parse::{parse_impl, tokenize}, runtime::Runtime, vm::Instance};
 
 fn main(){
     let src = std::fs::read_to_string("test.lua").unwrap();
@@ -30,4 +30,7 @@ fn main(){
     println!("{:#?}", expr);
     let module = compile(expr).unwrap();
     println!("{:#?}", module);
+    let mut runtime = Runtime::new();
+    let instance = runtime.create_instance();
+    instance.exec(module).unwrap();
 }

@@ -27,9 +27,14 @@ pub struct Closure {
     pub(crate) module: Rc<ByteCodeModule>,
     pub(crate) upvalues: RefCell<Vec<Value>>,
 }
+impl Traceable for Closure {
+    fn trace(&self, gc: &Gc) {
+        todo!()
+    }
+}
 
 pub struct Managed<T> {
-    data: T,
+    pub data: T,
 }
 
 impl<T: Traceable + 'static> Traceable for Managed<T> {
@@ -54,6 +59,12 @@ pub struct Value {
 impl Value {
     pub fn nil() -> Self {
         Default::default()
+    }
+    pub fn from_bool(x:bool) -> Self {
+        Self {
+            data: ValueData::Bool(x),
+            metatable: std::ptr::null(),
+        }
     }
     pub fn from_number(x: f64) -> Self {
         Self {
@@ -91,6 +102,26 @@ impl Value {
             ValueData::Table(_) => "table",
             ValueData::String(_) => "string",
             ValueData::Closure(_) => "function",
+        }
+    }
+    pub fn print(&self) -> String {
+        match self.data {
+            ValueData::Nil => String::from("nil"),
+            ValueData::Bool(t) => {
+                if t {
+                    String::from("true")
+                } else {
+                    String::from("false")
+                }
+            }
+            ValueData::Number(x) => x.to_string(),
+            ValueData::Table(table) => {
+                format!("table: {:0x}", table as u64)
+            }
+            ValueData::String(s) => unsafe { (*s).data.clone() },
+            ValueData::Closure(closure) => {
+                format!("function: {:0x}", closure as u64)
+            }
         }
     }
 }

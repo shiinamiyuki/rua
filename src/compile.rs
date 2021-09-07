@@ -106,7 +106,7 @@ impl Compiler {
                         "*" => OpCode::Mul,
                         "/" => OpCode::Div,
                         "%" => OpCode::Mod,
-                        "*" => OpCode::Pow,
+                        "^" => OpCode::Pow,
                         "&" => OpCode::And,
                         "|" => OpCode::Or,
                         _ => unreachable!(),

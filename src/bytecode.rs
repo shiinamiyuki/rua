@@ -11,6 +11,7 @@ pub enum OpCode {
     Sub,
     Mul,
     Div,
+    IDiv,
     Mod,
     Pow,
     And,
