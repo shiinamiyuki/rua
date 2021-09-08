@@ -211,7 +211,11 @@ impl Compiler {
                 body,
             } => todo!(),
             Stmt::ForIn { name, range, body } => todo!(),
-            Stmt::Assign { loc, lhs, rhs } => todo!(),
+            Stmt::Assign { loc, lhs, rhs } => {
+                assert!(lhs.len() == 1 && rhs.len() == 1);
+                self.compile_expr(&*rhs[0])?;
+                self.emit_store(&*lhs[0])
+            }
             Stmt::Expr { loc, expr } => {
                 self.compile_expr(expr)?;
                 self.emit(ByteCode::Op(OpCode::Pop));
@@ -226,6 +230,38 @@ impl Compiler {
                 Ok(())
             }
             Stmt::Function { name, args, body } => todo!(),
+        }
+    }
+    fn emit_store(&mut self, expr: &Expr) -> Result<(), CompileError> {
+        match expr {
+            // Expr::Const { token } => todo!(),
+            // Expr::Literal { token } => todo!(),
+            Expr::Identifier { token } => {
+                let name = match token {
+                    Token::Identifier { value, .. } => value,
+                    _ => unreachable!(),
+                };
+                if let Some(info) = self.symbols.get(name) {
+                    self.emit(ByteCode::Op3U8(OpCode::StoreLocal, get_3xu8(info.location)));
+                } else {
+                    self.push_string(name);
+                    self.emit(ByteCode::Op(OpCode::StoreGlobal));
+                }
+                Ok(())
+            }
+            // Expr::BinaryExpr { op, lhs, rhs } => todo!(),
+            // Expr::UnaryExpr { op, arg } => todo!(),
+            Expr::IndexExpr { loc, lhs, rhs } => todo!(),
+            Expr::DotExpr { loc, lhs, rhs } => todo!(),
+            // Expr::CallExpr { callee, args } => todo!(),
+            // Expr::MethodCallExpr { callee, method, args } => todo!(),
+            // Expr::FunctionExpr { loc, args, body } => todo!(),
+            // Expr::Table { loc, fields } => todo!(),
+            _ => Err(CompileError {
+                loc: expr.loc().clone(),
+                kind: ErrorKind::SemanticError,
+                msg: format!("invalid expression on lhs"),
+            }),
         }
     }
     fn run(&mut self, block: Rc<Stmt>) -> Result<ByteCodeModule, CompileError> {

@@ -77,6 +77,12 @@ impl Instance {
                             });
                         }
                     }
+                    OpCode::StoreGlobal => {
+                        let name = eval_stack.pop().unwrap();
+                        let name = name.as_string().unwrap();
+                        let v = eval_stack.pop().unwrap();
+                        self.state.set_global(name.clone(), v);
+                    }
                     OpCode::LoadNil => {
                         eval_stack.push(Value::nil());
                     }

@@ -1240,13 +1240,13 @@ impl Parser {
             let rhs = self.parse_expr_list(true)?;
             Ok(Rc::new(Stmt::Assign { loc, lhs, rhs }))
         } else {
-            if lhs.len() > 1 {
-                return Err(self.error(
-                    ErrorKind::SyntaxError,
-                    "parallel assignment expect right hand side",
-                    loc,
-                ));
-            }
+            // if lhs.len() > 1 {
+            //     return Err(self.error(
+            //         ErrorKind::SyntaxError,
+            //         "parallel assignment expect right hand side",
+            //         loc,
+            //     ));
+            // }
             Ok(Rc::new(Stmt::Expr {
                 loc,
                 expr: lhs[0].clone(),
