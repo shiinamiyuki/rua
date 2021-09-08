@@ -150,6 +150,14 @@ impl Value {
             _ => None,
         }
     }
+    pub fn as_bool(&self)->bool{
+        match self.data{
+            ValueData::Number(x)=>{x!=0.0},
+            ValueData::Bool(x)=>x,
+            ValueData::Nil=>false,
+            _=>true,
+        }
+    }
     pub(crate) fn as_string<'a>(&'a self) -> Option<&'a String> {
         match self.data {
             ValueData::String(s) => unsafe { Some(&(*s).data) },

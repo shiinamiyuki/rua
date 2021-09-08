@@ -1187,6 +1187,7 @@ impl Parser {
         if !self.has("do") {
             return Err(self.error(ErrorKind::SyntaxError, "expected 'do' in while", loc));
         }
+        self.advance(1);
         let body = self.parse_block()?;
         if !self.has("end") {
             return Err(self.error(ErrorKind::SyntaxError, "expected 'end' in while", loc));

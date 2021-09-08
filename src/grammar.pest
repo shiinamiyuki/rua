@@ -1,0 +1,102 @@
+WHITESPACE = _{ " " | "\t" | NEWLINE}
+
+keywords = @{
+    "return"|
+    "if"|
+    "while"|
+    "for"|
+    "function"|
+    "do"|
+    "end"|
+    "repeat"|
+    "until"
+}
+alpha = @{ 'a'..'z' | 'A'..'Z' }
+digit = @{ '0'..'9' }
+
+ident = @{ !keywords ~ (alpha | "_" ) ~ (alpha | digit | "_")* }
+
+int_lit10 = @{ digit+ }
+
+int_lit16 = @{ "0x" ~ ('a'..'f' | 'A'..'F' | digit)+}
+
+literal = { int_lit10 | int_lit16 }
+
+atom = {literal | ident | "(" ~ expr ~ ")" }
+
+arg_list = {  expr ~ ("," ~ expr)* }
+
+call_expr = {"(" ~  arg_list  ~")"}
+
+index_expr = {"[" ~ expr ~ "]"}
+
+postfix_expr = {atom ~ (call_expr | index_expr)*}
+
+prefix_op = { "not" | "~" | "-" }
+
+prefix_expr = {prefix_op* ~ postfix_expr}
+
+binop = {add | sub | mul | div }
+
+add = {"+"}
+sub = {"-"}
+mul = {"*"}
+div = {"/"}
+
+mul_expr = {prefix_expr ~ ((mul | div) ~ mul_expr)* }
+
+
+add_expr = {mul_expr ~ ((add | sub ) ~ mul_expr )*}
+
+compare_op = { lt | gt| le|gt|eq|ne}
+lt = {"<"}
+le = {"<="}
+gt = {">"}
+ge = {">="}
+eq = {"=="}
+ne = {"~="}
+
+compare_expr = {add_expr ~ (compare_op ~ add_expr)?}
+
+
+not_expr = {("not" | "~")? ~ compare_expr}
+and_expr = {not_expr ~ ("and" ~ not_expr)*}
+or_expr = {and_expr ~ ("or" ~ and_expr)*}
+expr = {or_expr}
+
+assign_stmt = { ident ~ "=" ~ expr }
+var_list = { ident ~ ("," ~ ident)*}
+var_list_stmt = {var_list ~ "=" ~ arg_list}
+
+return_stmt = {"return" ~ expr }
+
+block_stmt = { "do" ~ block ~ "end" } 
+
+if_stmt = ${
+    "if" ~ WHITESPACE+ ~ expr ~ WHITESPACE+ ~ "then" ~ WHITESPACE+ ~ 
+        ~ (block ~ WHITESPACE+)? ~ 
+    ("elseif" ~ WHITESPACE+  ~ expr ~ WHITESPACE+ ~ "then" ~ WHITESPACE+ ~ (block ~ WHITESPACE+)?)* ~
+    ("else" ~ WHITESPACE+ ~ (block ~ WHITESPACE+)?)?  ~ "end"
+}
+
+while_stmt = {
+    "while" ~ expr ~ "do"
+        ~ block ~ "end"
+}
+
+repeat_stmt = {
+    "repeat" ~ block ~ "until" ~ expr
+}
+
+stmt = { expr | assign_stmt | var_list_stmt | block_stmt| return_stmt |if_stmt | while_stmt |repeat_stmt}
+
+block = {(stmt ~ ";"?)*} 
+
+function = {
+    "function" ~ ident ~ "(" ~ var_list ?~ ")"
+        ~ block
+    ~ "end"
+}
+
+program = { SOI ~ function* ~ EOI }
+

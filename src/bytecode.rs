@@ -16,6 +16,12 @@ pub enum OpCode {
     Pow,
     And,
     Or,
+    LessThan,
+    LessThanEqual,
+    GreaterThan,
+    GreaterThanEqual,
+    Equal,
+    NotEqual,
     Pop,
     Return,
 
@@ -44,12 +50,33 @@ pub enum OpCode {
 
     // with extended bytes
     LoadNumber,
-    BranchIfFalse,
     Jump,
     Call, // Call{n_args:u8,}, TOS = func, TOS~[1..=n_args] = args, pop func
     TailCall,
+    TestJump, // TestJump b, pop_t, pop_f, addr;  if TOS==b, if pop_t{pop} jmp addr, else {if pop_f pop}
     
 }
+/*
+a or b
+if a then a else b
+
+eval a
+jt
+pop
+eval b
+end
+
+a or b
+if not a then a else b
+
+eval a
+jf
+pop
+eval b
+end
+
+
+*/
 
 #[derive(Clone, Copy, Debug)]
 pub enum ByteCode {
@@ -57,8 +84,7 @@ pub enum ByteCode {
     Op3U8(OpCode, [u8; 3]),
     FloatHi([u8; 4]),
     FloatLo([u8; 4]),
-    RelativeAddress([u8; 4]), 
-    AbsoluteAddress([u8; 4]),
+    Address([u8; 4]),
 }
 #[derive(Clone, Debug)]
 pub struct ByteCodeModule {

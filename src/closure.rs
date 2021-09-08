@@ -30,6 +30,7 @@ pub struct Closure {
     pub(crate) upvalues: RefCell<Vec<Value>>,
 }
 impl Closure {
+    const UPVALUE_ENV: usize = 0;
     pub(crate) fn set_upvalue(&self, i: usize, value: Value) {
         let mut vs = self.upvalues.borrow_mut();
         vs[i] = value;

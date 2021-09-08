@@ -7,7 +7,7 @@ use crate::{
     value::{Managed, Value, ValueData},
     vm::Instance,
 };
-use std::{cell::RefCell, rc::Rc};
+use std::{cell::RefCell, cmp::Ordering, rc::Rc};
 
 pub const MAX_LOCALS: usize = 256;
 pub(crate) struct Frame {
@@ -61,6 +61,7 @@ macro_rules! binary_op_impl {
         }
     };
 }
+
 macro_rules! int_binary_op_impl {
     ($op:tt,$a:expr,$b:expr) => {
         if let (Some(a), Some(b)) = ($a.number(), $b.number()) {
@@ -184,6 +185,54 @@ impl State {
         int_binary_op_impl!(|, a, b)
     }
 
+    pub fn cmp(&self, a: Value, b: Value) -> Result<Ordering, RuntimeError> {
+        match (a.data, b.data) {
+            (ValueData::Nil, ValueData::Nil) => Ok(Ordering::Equal),
+            (ValueData::Bool(a), ValueData::Bool(b)) => Ok(a.cmp(&b)),
+            (ValueData::Number(a), ValueData::Number(b)) => Ok(a.cmp(&b)),
+            (ValueData::String(a), ValueData::String(b)) => unsafe {
+                let a = &(*a).data;
+                let b = &(*b).data;
+                Ok(a.cmp(b))
+            },
+            _ => Err(RuntimeError {
+                kind: ErrorKind::ArithmeticError,
+                msg: format!(
+                    "attempt to perform compare {} with {}",
+                    a.type_of(),
+                    b.type_of()
+                ),
+            }),
+        }
+    }
+    pub fn lt(&self, a: Value, b: Value) -> Result<Value, RuntimeError> {
+        let ordering = self.cmp(a, b)?;
+        Ok(Value::from_bool(ordering == Ordering::Less))
+    }
+    pub fn le(&self, a: Value, b: Value) -> Result<Value, RuntimeError> {
+        let ordering = self.cmp(a, b)?;
+        Ok(Value::from_bool(
+            ordering == Ordering::Less || ordering == Ordering::Equal,
+        ))
+    }
+    pub fn gt(&self, a: Value, b: Value) -> Result<Value, RuntimeError> {
+        let ordering = self.cmp(a, b)?;
+        Ok(Value::from_bool(ordering == Ordering::Greater))
+    }
+    pub fn ge(&self, a: Value, b: Value) -> Result<Value, RuntimeError> {
+        let ordering = self.cmp(a, b)?;
+        Ok(Value::from_bool(
+            ordering == Ordering::Greater || ordering == Ordering::Equal,
+        ))
+    }
+    pub fn eq(&self, a: Value, b: Value) -> Result<Value, RuntimeError> {
+        let ordering = self.cmp(a, b)?;
+        Ok(Value::from_bool(ordering == Ordering::Equal))
+    }
+    pub fn ne(&self, a: Value, b: Value) -> Result<Value, RuntimeError> {
+        let ordering = self.cmp(a, b)?;
+        Ok(Value::from_bool(ordering != Ordering::Equal))
+    }
     pub fn idiv(&self, a: Value, b: Value) -> Result<Value, RuntimeError> {
         if let (Some(a), Some(b)) = (a.number(), b.number()) {
             Ok(Value::from_number((a / b).floor()))

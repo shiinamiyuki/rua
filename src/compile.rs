@@ -157,6 +157,30 @@ impl Compiler {
                         "^" => OpCode::Pow,
                         "&" => OpCode::And,
                         "|" => OpCode::Or,
+                        "<" => OpCode::LessThan,
+                        "<=" => OpCode::LessThanEqual,
+                        ">=" => OpCode::GreaterThanEqual,
+                        ">" => OpCode::GreaterThan,
+                        "and" => {
+                            self.compile_expr(lhs)?;
+                            self.emit(ByteCode::Op3U8(OpCode::TestJump, [0, 0, 1]));
+                            let jmp = self.emit(ByteCode::Address([0; 4]));
+                            self.compile_expr(rhs)?;
+                            self.module.code[jmp] = ByteCode::Address(
+                                (self.module.code.len() as u32 - 1).to_le_bytes(),
+                            );
+                            return Ok(());
+                        }
+                        "or" => {
+                            self.compile_expr(lhs)?;
+                            self.emit(ByteCode::Op3U8(OpCode::TestJump, [1, 0, 1]));
+                            let jmp = self.emit(ByteCode::Address([0; 4]));
+                            self.compile_expr(rhs)?;
+                            self.module.code[jmp] = ByteCode::Address(
+                                (self.module.code.len() as u32 - 1).to_le_bytes(),
+                            );
+                            return Ok(());
+                        }
                         _ => unreachable!(),
                     },
                     _ => unreachable!(),
@@ -268,8 +292,25 @@ impl Compiler {
                 then,
                 else_ifs,
                 else_,
-            } => todo!(),
-            Stmt::While { loc, cond, body } => todo!(),
+            } => {
+                self.compile_expr(cond)?;
+                let jmp = self.module.code.len();
+                self.emit(ByteCode::Op3U8(OpCode::TestJump, [0, 1, 1]));
+                self.compile_stmt(&**then)?;
+                Ok(())
+            }
+            Stmt::While { loc, cond, body } => {
+                let start = self.module.code.len();
+                self.compile_expr(cond)?;
+                self.emit(ByteCode::Op3U8(OpCode::TestJump, [0, 1, 1]));
+                let jmp_endloop = self.emit(ByteCode::Address([0; 4]));
+                self.compile_stmt(body)?;
+                self.emit(ByteCode::Op(OpCode::Jump));
+                self.emit(ByteCode::Address((start as u32).to_le_bytes()));
+                self.module.code[jmp_endloop] =
+                    ByteCode::Address((self.module.code.len() as u32).to_le_bytes());
+                Ok(())
+            }
             Stmt::Repeat { loc, cond, body } => todo!(),
             Stmt::For {
                 name,

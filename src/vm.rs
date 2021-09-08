@@ -108,11 +108,37 @@ impl Instance {
                     OpCode::IDiv => {
                         binary_op_impl!(idiv)
                     }
+                    OpCode::LessThan => {
+                        binary_op_impl!(lt)
+                    }
+                    OpCode::LessThanEqual => {
+                        binary_op_impl!(le)
+                    }
+                    OpCode::GreaterThan => {
+                        binary_op_impl!(gt)
+                    }
+                    OpCode::GreaterThanEqual => {
+                        binary_op_impl!(ge)
+                    }
+                    OpCode::NotEqual => {
+                        binary_op_impl!(ne)
+                    }
+                    OpCode::Equal => {
+                        binary_op_impl!(eq)
+                    }
                     OpCode::Pop => {
                         #[cfg(debug_assertions)]
                         eval_stack.pop().unwrap();
                         #[cfg(not(debug_assertions))]
                         eval_stack.pop();
+                    }
+                    OpCode::Jump => {
+                        ip_modified = true;
+                        let addr = match module.code[*ip + 1] {
+                            ByteCode::Address(bytes) => u32::from_le_bytes(bytes),
+                            _ => unreachable!(),
+                        };
+                        *ip = addr as usize;
                     }
                     OpCode::Return => {
                         break;
@@ -150,6 +176,28 @@ impl Instance {
                             }
                             _ => {
                                 unimplemented!()
+                            }
+                        }
+                    }
+                    OpCode::TestJump => {
+                        ip_modified = true;
+                        let top = *eval_stack.last().unwrap();
+                        let addr = match module.code[*ip + 1] {
+                            ByteCode::Address(bytes) => u32::from_le_bytes(bytes),
+                            _ => unreachable!(),
+                        };
+                        let b = operands[0];
+                        let pop_t = operands[1];
+                        let pop_f = operands[1];
+                        if top.as_bool() == (b != 0) {
+                            *ip = addr as usize;
+                            if pop_t != 0 {
+                                eval_stack.pop();
+                            }
+                        } else {
+                            *ip += 2;
+                            if pop_f != 0 {
+                                eval_stack.pop();
                             }
                         }
                     }
