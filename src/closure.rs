@@ -3,7 +3,7 @@ use std::{cell::RefCell, rc::Rc};
 use crate::{
     bytecode::ByteCodeModule,
     gc::{Gc, Traceable},
-    state::{CallContext},
+    state::CallContext,
     value::Value,
 };
 
@@ -28,6 +28,16 @@ pub struct Closure {
     pub(crate) n_locals: usize,
     pub(crate) module: Rc<ByteCodeModule>,
     pub(crate) upvalues: RefCell<Vec<Value>>,
+}
+impl Closure {
+    pub(crate) fn set_upvalue(&self, i: usize, value: Value) {
+        let mut vs = self.upvalues.borrow_mut();
+        vs[i] = value;
+    }
+    pub(crate) fn get_upvalue(&self, i: usize) -> Value {
+        let vs = self.upvalues.borrow();
+        vs[i]
+    }
 }
 impl Traceable for Closure {
     fn trace(&self, gc: &Gc) {

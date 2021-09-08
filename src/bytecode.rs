@@ -34,6 +34,8 @@ pub enum OpCode {
     StoreLocal, // local[i] = TOS;POP
     Unpack, // Unpack TOS to n values, 
     
+    LoadTable,// TOS~1 = table, TOS = key
+    StoreTable, // TOS~2 = table, key, value
     LoadUpvalue, // TOS=upvalue, push upvalue[i]
     StoreUpvalue,// TOS~1=upvalue, TOS=value upvalue[i] = value
 
@@ -55,8 +57,8 @@ pub enum ByteCode {
     Op3U8(OpCode, [u8; 3]),
     FloatHi([u8; 4]),
     FloatLo([u8; 4]),
-    JumpAddress([u8; 4]),   // absolute
-    BranchAddress([u8; 4]), //relative
+    RelativeAddress([u8; 4]), 
+    AbsoluteAddress([u8; 4]),
 }
 #[derive(Clone, Debug)]
 pub struct ByteCodeModule {

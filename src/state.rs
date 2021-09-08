@@ -39,7 +39,7 @@ A runtime has multiple instances
 */
 pub struct State {
     pub(crate) gc: Rc<Gc>,
-    pub(crate) globals: Rc<Globals>,
+    pub(crate) globals: Value,
     pub(crate) frames: RefCell<Vec<Frame>>,
     pub(crate) eval_stack: RefCell<Vec<Value>>,
 }
@@ -117,13 +117,15 @@ impl<'a> Drop for CallContext<'a> {
     }
 }
 impl State {
-    pub fn get_global(&self, name: &String) -> Option<Value> {
-        let globals = self.globals.borrow();
-        globals.get(name).map(|x| *x)
+    pub fn get_global(&self, name: Value) -> Option<Value> {
+        let globals = self.globals.as_table().unwrap();
+        let globals = globals.borrow();
+        globals.get(name)
     }
-    pub fn set_global(&self, name: String, value: Value) -> Option<Value> {
-        let mut globals = self.globals.borrow_mut();
-        globals.insert(name, value)
+    pub fn set_global(&self, name: Value, value: Value) {
+        let globals = self.globals.as_table().unwrap();
+        let mut globals = globals.borrow_mut();
+        globals.set(name, value)
     }
     fn get_arg_count(&self) -> usize {
         let frames = self.frames.borrow();

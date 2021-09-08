@@ -6,7 +6,7 @@ use std::{
     rc::Rc,
 };
 
-use crate::{closure::{Callable, NativeFunction}, gc::{Gc, Traceable}, state::{CallContext, State}, value::{Managed, Value, ValueData}, vm::Instance};
+use crate::{closure::{Callable, NativeFunction}, gc::{Gc, Traceable}, state::{CallContext, State}, table::Table, value::{Managed, ManagedCell, Value, ValueData}, vm::Instance};
 
 pub(crate) type Globals = RefCell<HashMap<String, Value>>;
 
@@ -26,7 +26,7 @@ pub struct RuntimeError {
 // }
 pub struct Runtime {
     gc: Rc<Gc>,
-    globals: Rc<Globals>,
+    globals: Value,
     instances: Vec<Rc<Instance>>,
     // local_handles:Rc<Locals>,
 }
@@ -47,15 +47,23 @@ Local are gc roots
 // }
 
 impl Runtime {
-    pub fn add_function<'a, F: Fn(&CallContext<'_>) -> () + 'static>(&'a mut self, name: String, f: F) {
+    pub fn add_function<'a, F: Fn(&CallContext<'_>) -> () + 'static>(
+        &'a mut self,
+        name: String,
+        f: F,
+    ) {
         self.add_callable(name, Box::new(NativeFunction::new(f)))
     }
     pub fn add_callable<'a>(&'a mut self, name: String, callable: Box<dyn Callable>)
     /*->Option<Local<'a>>*/
     {
-        let mut globals = self.globals.borrow_mut();
-        globals.insert(
-            name,
+        let mut globals = self.globals.as_table().unwrap();
+        let mut globals = globals.borrow_mut();
+        globals.set(
+            Value {
+                data: ValueData::String(self.gc.manage(Managed { data: name })),
+                metatable: std::ptr::null(),
+            },
             Value {
                 data: ValueData::Callable(self.gc.manage(Managed { data: callable })),
                 metatable: std::ptr::null(),
@@ -71,7 +79,7 @@ impl Runtime {
             gc: self.gc.clone(),
             state: State {
                 gc: self.gc.clone(),
-                globals: self.globals.clone(),
+                globals: self.globals,
                 frames: RefCell::new(vec![]),
                 eval_stack: RefCell::new(vec![]),
             },
@@ -86,9 +94,15 @@ impl Runtime {
         });
     }
     pub fn new() -> Self {
+        let gc = Rc::new(Gc::new());
         let mut runtime = Self {
-            gc: Rc::new(Gc::new()),
-            globals: Rc::new(Globals::new(HashMap::new())),
+            gc: gc.clone(),
+            globals: Value {
+                data: ValueData::Table(gc.manage(ManagedCell {
+                    data: RefCell::new(Table::new()),
+                })),
+                metatable: std::ptr::null(),
+            },
             instances: vec![],
         };
         runtime.add_std_lib();

@@ -67,21 +67,19 @@ impl Instance {
                     }
                     OpCode::LoadGlobal => {
                         let name = eval_stack.pop().unwrap();
-                        let name = name.as_string().unwrap();
                         if let Some(v) = self.state.get_global(name) {
                             eval_stack.push(v);
                         } else {
                             return Err(RuntimeError {
-                                msg: format!("name {} is not defined", name),
+                                msg: format!("name {} is not defined", name.as_string().unwrap()),
                                 kind: ErrorKind::NameError,
                             });
                         }
                     }
                     OpCode::StoreGlobal => {
                         let name = eval_stack.pop().unwrap();
-                        let name = name.as_string().unwrap();
                         let v = eval_stack.pop().unwrap();
-                        self.state.set_global(name.clone(), v);
+                        self.state.set_global(name, v);
                     }
                     OpCode::LoadNil => {
                         eval_stack.push(Value::nil());
@@ -127,6 +125,14 @@ impl Instance {
                         eval_stack
                             .push(state.create_string(module.string_pool[idx as usize].clone()));
                     }
+                    OpCode::LoadLocal => {
+                        let idx = operands[0];
+                        eval_stack.push(frame.locals[idx as usize]);
+                    }
+                    OpCode::StoreLocal => {
+                        let idx = operands[0];
+                        frame.locals[idx as usize] = eval_stack.pop().unwrap();
+                    }
                     OpCode::Call => {
                         let n_args = operands[0] as usize;
                         let func = eval_stack.pop().unwrap();
@@ -149,10 +155,7 @@ impl Instance {
                     }
                     _ => unreachable!(),
                 },
-                ByteCode::FloatHi(_) => unreachable!(),
-                ByteCode::FloatLo(_) => unreachable!(),
-                ByteCode::JumpAddress(_) => unreachable!(),
-                crate::bytecode::ByteCode::BranchAddress(_) => unreachable!(),
+                _ => unreachable!(),
             }
             if !ip_modified {
                 *ip += 1;

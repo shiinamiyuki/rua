@@ -8,10 +8,12 @@ use std::{
 use crate::{
     bytecode::*,
     parse::{Expr, SourceLocation, Stmt, Token},
+    state::MAX_LOCALS,
 };
 
 #[derive(Clone, Copy, Debug)]
 pub enum ErrorKind {
+    TooManyLocals,
     OutOfMemoryError,
     SemanticError,
     InternalError,
@@ -30,9 +32,13 @@ struct VarInfo {
 }
 struct SymbolTable {
     vars: HashMap<String, VarInfo>,
+    n_locals: usize,
     parent: *mut SymbolTable,
 }
 impl SymbolTable {
+    fn set(&mut self, var: String, info: VarInfo) {
+        self.vars.insert(var, info);
+    }
     fn get<'a>(&'a self, var: &String) -> Option<&'a VarInfo> {
         if let Some(info) = self.vars.get(var) {
             Some(info)
@@ -192,7 +198,69 @@ impl Compiler {
                 self.emit(ByteCode::Op(OpCode::Return));
                 Ok(())
             }
-            Stmt::LocalVar { loc, vars } => todo!(),
+            Stmt::LocalVar { loc, vars } => match &**vars {
+                Stmt::Assign { lhs, rhs, .. } => {
+                    assert!(lhs.len() == 1 && rhs.len() == 1);
+                    self.compile_expr(&*rhs[0])?;
+                    for var in lhs {
+                        match &**var {
+                            Expr::Identifier { token } => {
+                                let name = match token {
+                                    Token::Identifier { value, .. } => value,
+                                    _ => unreachable!(),
+                                };
+                                if let None = self.symbols.get(name) {
+                                    self.symbols.set(
+                                        name.clone(),
+                                        VarInfo {
+                                            on_stack: true,
+                                            location: self.symbols.n_locals as u32,
+                                        },
+                                    );
+                                    self.symbols.n_locals += 1;
+                                }
+                            }
+                            _ => unreachable!(),
+                        };
+                    }
+                    self.emit_store(&*lhs[0])
+                }
+                Stmt::Expr { expr, .. } => match &**expr {
+                    Expr::Identifier { token, .. } => {
+                        let name = match token {
+                            Token::Identifier { value, .. } => value,
+                            _ => unreachable!(),
+                        };
+                        if let None = self.symbols.get(name) {
+                            if self.symbols.n_locals >= MAX_LOCALS {
+                                return Err(CompileError {
+                                    loc: expr.loc().clone(),
+                                    kind: ErrorKind::TooManyLocals,
+                                    msg: format!(
+                                        "exceeds maximum number of {} local varibles",
+                                        MAX_LOCALS
+                                    ),
+                                });
+                            }
+                            self.symbols.set(
+                                name.clone(),
+                                VarInfo {
+                                    on_stack: true,
+                                    location: self.symbols.n_locals as u32,
+                                },
+                            );
+                            self.symbols.n_locals += 1;
+                        }
+                        Ok(())
+                    }
+                    _ => Err(CompileError {
+                        loc: expr.loc().clone(),
+                        kind: ErrorKind::SemanticError,
+                        msg: format!("invalid expression on lhs"),
+                    }),
+                },
+                _ => unreachable!(),
+            },
             Stmt::LocalFunction { name, args, body } => todo!(),
             Stmt::If {
                 loc,
@@ -222,7 +290,7 @@ impl Compiler {
                 Ok(())
             }
             Stmt::Block { loc, stmts } => {
-                self.enter_scope();
+                self.enter_scope(false);
                 for stmt in stmts {
                     self.compile_stmt(&**stmt)?;
                 }
@@ -232,6 +300,7 @@ impl Compiler {
             Stmt::Function { name, args, body } => todo!(),
         }
     }
+
     fn emit_store(&mut self, expr: &Expr) -> Result<(), CompileError> {
         match expr {
             // Expr::Const { token } => todo!(),
@@ -275,10 +344,15 @@ impl Compiler {
         );
         Ok(module)
     }
-    fn enter_scope(&mut self) {
+    fn enter_scope(&mut self, function_scope: bool) {
         let new = SymbolTable {
             vars: HashMap::new(),
             parent: std::ptr::null_mut(),
+            n_locals: if function_scope {
+                0
+            } else {
+                self.symbols.n_locals
+            },
         };
         let old = std::mem::replace(&mut self.symbols, new);
         let old = Box::into_raw(Box::new(old));
@@ -298,6 +372,7 @@ pub fn compile(block: Rc<Stmt>) -> Result<ByteCodeModule, CompileError> {
         symbols: SymbolTable {
             vars: HashMap::new(),
             parent: std::ptr::null_mut(),
+            n_locals: 0,
         },
         module: ByteCodeModule {
             code: vec![],
