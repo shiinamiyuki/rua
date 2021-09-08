@@ -29,14 +29,43 @@ struct VarInfo {
     on_stack: bool, // is false, then on upvalue
 }
 struct SymbolTable {
-    vars: RefCell<HashMap<String, VarInfo>>,
-    parent: Option<Rc<SymbolTable>>,
+    vars: HashMap<String, VarInfo>,
+    parent: *mut SymbolTable,
+}
+impl SymbolTable {
+    fn get<'a>(&'a self, var: &String) -> Option<&'a VarInfo> {
+        if let Some(info) = self.vars.get(var) {
+            Some(info)
+        } else {
+            unsafe {
+                if let Some(parent) = self.parent.as_ref() {
+                    parent.get(var)
+                } else {
+                    None
+                }
+            }
+        }
+    }
+    fn get_mut<'a>(&'a mut self, var: &String) -> Option<&'a mut VarInfo> {
+        if let Some(info) = self.vars.get_mut(var) {
+            Some(info)
+        } else {
+            unsafe {
+                if let Some(parent) = self.parent.as_mut() {
+                    parent.get_mut(var)
+                } else {
+                    None
+                }
+            }
+        }
+    }
 }
 struct Compiler {
-    symbols: Rc<SymbolTable>,
+    symbols: SymbolTable,
     module: ByteCodeModule,
     str_map: HashMap<String, usize>,
 }
+
 impl Compiler {
     fn emit(&mut self, inst: ByteCode) -> usize {
         let ret = self.module.code.len();
@@ -66,6 +95,7 @@ impl Compiler {
             [bytes[0], bytes[1], bytes[2]],
         ));
     }
+
     fn compile_expr(&mut self, expr: &Expr) -> Result<(), CompileError> {
         match expr {
             Expr::Const { token } => match token {
@@ -97,7 +127,19 @@ impl Compiler {
                 }
                 _ => unreachable!(),
             },
-            Expr::Identifier { token } => todo!(),
+            Expr::Identifier { token } => {
+                let name = match token {
+                    Token::Identifier { value, .. } => value,
+                    _ => unreachable!(),
+                };
+                if let Some(info) = self.symbols.get(name) {
+                    self.emit(ByteCode::Op3U8(OpCode::LoadLocal, get_3xu8(info.location)));
+                } else {
+                    self.push_string(name);
+                    self.emit(ByteCode::Op(OpCode::LoadGlobal));
+                }
+                Ok(())
+            }
             Expr::BinaryExpr { op, lhs, rhs } => {
                 let opcode = match op {
                     Token::Symbol { value, .. } => match value.as_str() {
@@ -122,7 +164,14 @@ impl Compiler {
             Expr::UnaryExpr { op, arg } => todo!(),
             Expr::IndexExpr { loc, lhs, rhs } => todo!(),
             Expr::DotExpr { loc, lhs, rhs } => todo!(),
-            Expr::CallExpr { callee, args } => todo!(),
+            Expr::CallExpr { callee, args } => {
+                for arg in args {
+                    self.compile_expr(&**arg)?;
+                }
+                self.compile_expr(&*callee)?;
+                self.emit(ByteCode::Op3U8(OpCode::Call, [args.len() as u8, 0, 0]));
+                Ok(())
+            }
             Expr::MethodCallExpr {
                 callee,
                 method,
@@ -134,7 +183,15 @@ impl Compiler {
     }
     fn compile_stmt(&mut self, block: &Stmt) -> Result<(), CompileError> {
         match &*block {
-            Stmt::Return { loc, expr } => todo!(),
+            Stmt::Return { loc, expr } => {
+                if let Some(expr) = expr {
+                    self.compile_expr(&*expr)?;
+                } else {
+                    self.emit(ByteCode::Op(OpCode::LoadNil));
+                }
+                self.emit(ByteCode::Op(OpCode::Return));
+                Ok(())
+            }
             Stmt::LocalVar { loc, vars } => todo!(),
             Stmt::LocalFunction { name, args, body } => todo!(),
             Stmt::If {
@@ -155,11 +212,17 @@ impl Compiler {
             } => todo!(),
             Stmt::ForIn { name, range, body } => todo!(),
             Stmt::Assign { loc, lhs, rhs } => todo!(),
-            Stmt::Expr { loc, expr } => self.compile_expr(expr),
+            Stmt::Expr { loc, expr } => {
+                self.compile_expr(expr)?;
+                self.emit(ByteCode::Op(OpCode::Pop));
+                Ok(())
+            }
             Stmt::Block { loc, stmts } => {
+                self.enter_scope();
                 for stmt in stmts {
                     self.compile_stmt(&**stmt)?;
                 }
+                self.leave_scope();
                 Ok(())
             }
             Stmt::Function { name, args, body } => todo!(),
@@ -176,14 +239,30 @@ impl Compiler {
         );
         Ok(module)
     }
+    fn enter_scope(&mut self) {
+        let new = SymbolTable {
+            vars: HashMap::new(),
+            parent: std::ptr::null_mut(),
+        };
+        let old = std::mem::replace(&mut self.symbols, new);
+        let old = Box::into_raw(Box::new(old));
+        self.symbols.parent = old;
+    }
+    fn leave_scope(&mut self) {
+        unsafe {
+            let parent = self.symbols.parent;
+            std::mem::swap(&mut self.symbols, parent.as_mut().unwrap());
+            Box::from_raw(parent);
+        }
+    }
 }
 
 pub fn compile(block: Rc<Stmt>) -> Result<ByteCodeModule, CompileError> {
     let mut compiler = Compiler {
-        symbols: Rc::new(SymbolTable {
-            vars: RefCell::new(HashMap::new()),
-            parent: None,
-        }),
+        symbols: SymbolTable {
+            vars: HashMap::new(),
+            parent: std::ptr::null_mut(),
+        },
         module: ByteCodeModule {
             code: vec![],
             string_pool: vec![],

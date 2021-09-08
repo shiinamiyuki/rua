@@ -1,9 +1,10 @@
 use crate::{
     bytecode::ByteCode,
+    closure::Closure,
     gc::Gc,
     runtime::Globals,
     runtime::{ErrorKind, RuntimeError},
-    value::{Closure, Managed, Value, ValueData},
+    value::{Managed, Value, ValueData},
     vm::Instance,
 };
 use std::{cell::RefCell, rc::Rc};
@@ -11,8 +12,7 @@ use std::{cell::RefCell, rc::Rc};
 pub const MAX_LOCALS: usize = 256;
 pub(crate) struct Frame {
     pub(crate) locals: [Value; MAX_LOCALS],
-    pub(crate) frame_bottom: usize,
-    pub(crate) prev_frame_top: usize, // stack[prev_frame_top..frame_bottom] are arguments
+    pub(crate) frame_bottom: usize, //stack[frame_buttom..frame_buttom_n_args]
     pub(crate) closure: *const Managed<Closure>,
     pub(crate) ip: usize,
     pub(crate) n_args: usize,
@@ -20,7 +20,7 @@ pub(crate) struct Frame {
 impl Frame {
     pub(crate) fn new(
         frame_bottom: usize,
-        prev_frame_top: usize,
+        n_args: usize,
         closure: *const Managed<Closure>,
     ) -> Self {
         Self {
@@ -28,8 +28,7 @@ impl Frame {
             frame_bottom,
             closure,
             ip: 0,
-            prev_frame_top,
-            n_args: frame_bottom - prev_frame_top,
+            n_args,
         }
     }
 }
@@ -97,15 +96,56 @@ macro_rules! int_binary_op_impl {
         }
     };
 }
-impl State {
+pub struct CallContext<'a> {
+    pub(crate) state: &'a State,
+    pub(crate) ret_values: Vec<Value>,
+}
+impl<'a> CallContext<'a> {
     pub fn get_arg_count(&self) -> usize {
-        0
+        self.state.get_arg_count()
     }
     pub fn arg(&self, i: usize) -> Option<Value> {
-        None
+        self.state.arg(i)
     }
-    pub fn ret(&self, i: usize, value: Value) {}
-
+    pub fn ret(&mut self, i: usize, value: Value) {}
+}
+impl<'a> Drop for CallContext<'a> {
+    fn drop(&mut self) {
+        if self.ret_values.is_empty() {
+        } else {
+        }
+    }
+}
+impl State {
+    pub fn get_global(&self, name: &String) -> Option<Value> {
+        let globals = self.globals.borrow();
+        globals.get(name).map(|x| *x)
+    }
+    pub fn set_global(&self, name: String, value: Value) -> Option<Value> {
+        let mut globals = self.globals.borrow_mut();
+        globals.insert(name, value)
+    }
+    fn get_arg_count(&self) -> usize {
+        let frames = self.frames.borrow();
+        let frame = frames.last().unwrap();
+        frame.n_args
+    }
+    fn arg(&self, i: usize) -> Option<Value> {
+        let frames = self.frames.borrow();
+        let frame = frames.last().unwrap();
+        if i < frame.n_args {
+            Some(self.eval_stack.borrow()[frame.frame_bottom + i])
+        } else {
+            None
+        }
+    }
+    pub fn create_string(&self, s: String) -> Value {
+        let s = self.gc.manage(Managed { data: s });
+        Value {
+            data: ValueData::String(s),
+            metatable: std::ptr::null(),
+        }
+    }
     pub fn add(&self, a: Value, b: Value) -> Result<Value, RuntimeError> {
         binary_op_impl!(+, a,b)
     }

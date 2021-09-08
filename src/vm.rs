@@ -4,11 +4,12 @@ use std::{
 };
 
 use crate::{
-    bytecode::{ByteCode, ByteCodeModule, OpCode},
+    bytecode::{u32_from_3xu8, ByteCode, ByteCodeModule, OpCode},
+    closure::{Callable, Closure},
     gc::Gc,
-    runtime::RuntimeError,
-    state::{Frame, State},
-    value::{Closure, Managed, Value},
+    runtime::{ErrorKind, RuntimeError},
+    state::{CallContext, Frame, State},
+    value::{Managed, Value, ValueData},
 };
 
 /*
@@ -19,6 +20,11 @@ pub struct Instance {
     pub(crate) state: State,
 }
 
+enum Continue {
+    Return,
+    NewFrame(Frame),
+    CallExt(*const Managed<Box<dyn Callable>>, Frame),
+}
 impl Instance {
     /*
 
@@ -26,7 +32,7 @@ impl Instance {
     // pub fn lock<'a>(&self) -> RefMut<State> {
     //     self.state.borrow_mut()
     // }
-    fn exec_frame(&self, state: &State) -> Result<(), RuntimeError> {
+    fn exec_frame(&self, state: &State) -> Result<Continue, RuntimeError> {
         let mut frames = state.frames.borrow_mut();
         let frame = frames.last_mut().unwrap();
         let ip = &mut frame.ip;
@@ -43,7 +49,7 @@ impl Instance {
             let instruction = module.code[*ip];
             let mut ip_modified = false;
             match instruction {
-                crate::bytecode::ByteCode::Op(op) => match op {
+                ByteCode::Op(op) => match op {
                     OpCode::Nop => {}
                     OpCode::LoadNumber => {
                         ip_modified = true;
@@ -58,6 +64,18 @@ impl Instance {
                         let bytes = [lo[0], lo[1], lo[2], lo[3], hi[0], hi[1], hi[2], hi[3]];
                         eval_stack.push(Value::from_number(f64::from_le_bytes(bytes)));
                         *ip += 3;
+                    }
+                    OpCode::LoadGlobal => {
+                        let name = eval_stack.pop().unwrap();
+                        let name = name.as_string().unwrap();
+                        if let Some(v) = self.state.get_global(name) {
+                            eval_stack.push(v);
+                        } else {
+                            return Err(RuntimeError {
+                                msg: format!("name {} is not defined", name),
+                                kind: ErrorKind::NameError,
+                            });
+                        }
                     }
                     OpCode::LoadNil => {
                         eval_stack.push(Value::nil());
@@ -86,20 +104,56 @@ impl Instance {
                     OpCode::IDiv => {
                         binary_op_impl!(idiv)
                     }
+                    OpCode::Pop => {
+                        #[cfg(debug_assertions)]
+                        eval_stack.pop().unwrap();
+                        #[cfg(not(debug_assertions))]
+                        eval_stack.pop();
+                    }
+                    OpCode::Return => {
+                        break;
+                    }
+                    _ => panic!("unreachable, instruction is {:#?}", instruction),
+                },
+                ByteCode::Op3U8(op, operands) => match op {
+                    OpCode::LoadStr => {
+                        let idx = u32_from_3xu8(operands);
+                        eval_stack
+                            .push(state.create_string(module.string_pool[idx as usize].clone()));
+                    }
+                    OpCode::Call => {
+                        let n_args = operands[0] as usize;
+                        let func = eval_stack.pop().unwrap();
+                        match func.data {
+                            ValueData::Closure(closure) => {
+                                *ip += 1;
+                                let frame = Frame::new(eval_stack.len() - n_args, n_args, closure);
+                                return Ok(Continue::NewFrame(frame));
+                            }
+                            ValueData::Callable(callable) => {
+                                *ip += 1;
+                                let frame =
+                                    Frame::new(eval_stack.len() - n_args, n_args, std::ptr::null());
+                                return Ok(Continue::CallExt(callable, frame));
+                            }
+                            _ => {
+                                unimplemented!()
+                            }
+                        }
+                    }
                     _ => unreachable!(),
                 },
-                crate::bytecode::ByteCode::Op3U8(_, _) => todo!(),
-                crate::bytecode::ByteCode::FloatHi(_) => unreachable!(),
-                crate::bytecode::ByteCode::FloatLo(_) => unreachable!(),
-                crate::bytecode::ByteCode::JumpAddress(_) => unreachable!(),
+                ByteCode::FloatHi(_) => unreachable!(),
+                ByteCode::FloatLo(_) => unreachable!(),
+                ByteCode::JumpAddress(_) => unreachable!(),
                 crate::bytecode::ByteCode::BranchAddress(_) => unreachable!(),
             }
             if !ip_modified {
                 *ip += 1;
             }
         }
-        println!("{}", eval_stack.last().unwrap().print());
-        Ok(())
+        // println!("{}", eval_stack.last().unwrap().print());
+        Ok(Continue::Return)
     }
     // top level
     pub fn exec(&self, module: ByteCodeModule) -> Result<(), RuntimeError> {
@@ -115,7 +169,38 @@ impl Instance {
             let mut frames = self.state.frames.borrow_mut();
             frames.push(Frame::new(0, 0, closure));
         }
-        self.exec_frame(&self.state)?;
+        loop {
+            let cont = self.exec_frame(&self.state)?;
+            match cont {
+                Continue::CallExt(callable, frame) => {
+                    {
+                        let mut frames = self.state.frames.borrow_mut();
+                        frames.push(frame);
+                    }
+                    let func = unsafe { &(*callable).data };
+                    let ctx = CallContext {
+                        state: &self.state,
+                        ret_values: vec![],
+                    };
+                    func.call(&ctx);
+                    {
+                        let mut frames = self.state.frames.borrow_mut();
+                        frames.pop().unwrap();
+                    }
+                }
+                Continue::NewFrame(frame) => {
+                    let mut frames = self.state.frames.borrow_mut();
+                    frames.push(frame);
+                }
+                Continue::Return => {
+                    let mut frames = self.state.frames.borrow_mut();
+                    frames.pop().unwrap();
+                    if frames.is_empty() {
+                        break;
+                    }
+                }
+            }
+        }
 
         Ok(())
     }

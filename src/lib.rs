@@ -6,3 +6,5 @@ pub mod compile;
 pub mod bytecode;
 pub mod vm;
 pub mod runtime; 
+pub mod table;
+pub mod closure;

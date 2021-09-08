@@ -8,39 +8,60 @@ use ordered_float::OrderedFloat;
 
 use crate::{
     bytecode::ByteCodeModule,
+    closure::{Callable, Closure},
     gc::{Gc, Traceable},
     state::State,
+    table::Table,
 };
 
-pub struct Table {
-    pub array: Vec<Value>,
-    pub map: HashMap<Value, Value>,
-}
-
 pub trait UserData {}
-pub trait Callable {
-    fn call(&mut self, state: &State);
-}
-pub struct Closure {
-    pub(crate) entry: usize,
-    pub(crate) n_locals: usize,
-    pub(crate) module: Rc<ByteCodeModule>,
-    pub(crate) upvalues: RefCell<Vec<Value>>,
-}
-impl Traceable for Closure {
-    fn trace(&self, gc: &Gc) {
-        todo!()
-    }
-}
 
 pub struct Managed<T> {
     pub data: T,
 }
 
-impl<T: Traceable + 'static> Traceable for Managed<T> {
-    fn trace(&self, gc: &Gc) {}
+impl<T> Traceable for Managed<T> {
+    fn trace(&self, _gc: &Gc) {}
 }
 pub type ManagedCell<T> = Managed<RefCell<T>>;
+
+/*
+function f(x) return 1,2 end
+function g(x) return tuple(1,2) end
+
+x,y = f(x) -- x:1, y:2
+x,y = g(x) -- x:tuple(1,2), y:nil
+x,y = tuple.unpack(f(x)) -- x:1,y:2
+x,y = tuple.unpack(g(x)) -- x:1,y:2
+
+x,y = tuple(1,2) -- x: tuple(1,2), y:nil
+x,y= tuple.unpack(tuple(1, 2)) -- good
+x = tuple.unpack(tuple(1,2)) --error
+
+Exact unpack:
+Upon assignment and paremeter passing, tuple is treated as in Python
+tuple(args...) is always Exact
+args, ... = tuple.unpack(values, ...) is always Exact
+
+TruncateFill:
+Upon assignment and paremeter passing, tuple is treated as in Lua
+args... is always TruncateFill
+args, ... = values, ... is always TruncateFill
+
+unpack(tuple) does unpacking as if tuple were TruncateFill
+
+tuple.unpack(tuple) does unpacking as if tuple were Exact
+
+*/
+#[derive(Clone, Copy)]
+pub enum TupleUnpack {
+    Exact,
+    TruncateFill,
+}
+pub struct Tuple {
+    pub values: Vec<Value>,
+    pub unpack: TupleUnpack,
+}
 #[derive(Clone, Copy, Hash, PartialEq, Eq)]
 pub enum ValueData {
     Nil,
@@ -49,6 +70,8 @@ pub enum ValueData {
     Table(*const ManagedCell<Table>),
     String(*const Managed<String>),
     Closure(*const Managed<Closure>),
+    Callable(*const Managed<Box<dyn Callable>>),
+    Tuple(*const Managed<Tuple>),
 }
 #[derive(Clone, Copy, Hash, PartialEq, Eq)]
 pub struct Value {
@@ -60,7 +83,7 @@ impl Value {
     pub fn nil() -> Self {
         Default::default()
     }
-    pub fn from_bool(x:bool) -> Self {
+    pub fn from_bool(x: bool) -> Self {
         Self {
             data: ValueData::Bool(x),
             metatable: std::ptr::null(),
@@ -85,6 +108,12 @@ impl Value {
             _ => None,
         }
     }
+    pub(crate) fn as_string<'a>(&'a self) -> Option<&'a String> {
+        match self.data {
+            ValueData::String(s) => unsafe { Some(&(*s).data) },
+            _ => None,
+        }
+    }
     pub fn as_i64(&self) -> Option<i64> {
         let x = self.number()?;
         let fract = x.fract();
@@ -102,6 +131,8 @@ impl Value {
             ValueData::Table(_) => "table",
             ValueData::String(_) => "string",
             ValueData::Closure(_) => "function",
+            ValueData::Callable(_) => "function",
+            ValueData::Tuple(_) => "tuple",
         }
     }
     pub fn print(&self) -> String {
@@ -121,6 +152,20 @@ impl Value {
             ValueData::String(s) => unsafe { (*s).data.clone() },
             ValueData::Closure(closure) => {
                 format!("function: {:0x}", closure as u64)
+            }
+            ValueData::Callable(callable) => {
+                format!("function: {:0x}", callable as u64)
+            }
+            ValueData::Tuple(tuple) => {
+                let mut s = String::from("(");
+                for (i, v) in unsafe { (*tuple).data.values.iter().enumerate() } {
+                    if i > 0 {
+                        s.push(',');
+                    }
+                    s.push_str(&format!("{}", v.print()));
+                }
+                s.push(')');
+                s
             }
         }
     }

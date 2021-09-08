@@ -76,7 +76,8 @@ pub enum TableField {
 }
 #[derive(Clone, Debug)]
 pub enum Expr {
-    Const { // nil, true, false
+    Const {
+        // nil, true, false
         token: Token,
     },
     Literal {
@@ -172,7 +173,7 @@ pub enum FunctionName {
 pub enum Stmt {
     Return {
         loc: SourceLocation,
-        expr: Rc<Expr>,
+        expr: Option<Rc<Expr>>,
     },
     LocalVar {
         loc: SourceLocation,
@@ -1100,8 +1101,12 @@ impl Parser {
         assert!(self.has("return"));
         let loc = self.peek().loc().clone();
         self.advance(1);
-        let expr = self.parse_expr()?;
-        Ok(Rc::new(Stmt::Return { loc, expr }))
+        if self.has("end") {
+            Ok(Rc::new(Stmt::Return { loc, expr:None }))
+        } else {
+            let expr = self.parse_expr()?;
+            Ok(Rc::new(Stmt::Return { loc, expr:Some(expr) }))
+        }
     }
     fn parse_for_stmt(&mut self) -> Result<Rc<Stmt>, ParseError> {
         assert!(self.has("for"));
@@ -1427,7 +1432,7 @@ impl Parser {
             self.parse_function()
         } else if self.has("local") {
             self.parse_local()
-        }else {
+        } else {
             self.parse_assignment_stmt()
         }
     }

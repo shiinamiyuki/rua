@@ -16,6 +16,8 @@ pub enum OpCode {
     Pow,
     And,
     Or,
+    Pop,
+    Return,
 
     LoadGlobal,// TOS = name
     StoreGlobal,// TOS~1=name TOS=value global[name]= value
@@ -30,6 +32,7 @@ pub enum OpCode {
     LoadStr,
     LoadLocal, // PUSH  local[i]
     StoreLocal, // local[i] = TOS;POP
+    Unpack, // Unpack TOS to n values, 
     
     LoadUpvalue, // TOS=upvalue, push upvalue[i]
     StoreUpvalue,// TOS~1=upvalue, TOS=value upvalue[i] = value
@@ -41,9 +44,9 @@ pub enum OpCode {
     LoadNumber,
     BranchIfFalse,
     Jump,
-    Call, // Call{n_args:u8,}, TOS = func, TOS~[1..=n_args] = args
+    Call, // Call{n_args:u8,}, TOS = func, TOS~[1..=n_args] = args, pop func
     TailCall,
-    Return,
+    
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -68,4 +71,12 @@ mod test {
         println!("{}", size_of::<ByteCode>());
         assert!(size_of::<ByteCode>() == 5);
     }
+}
+pub(crate) fn get_3xu8(i: u32) -> [u8; 3] {
+    let bytes = i.to_le_bytes();
+    assert!(bytes[3] == 0);
+    [bytes[0], bytes[1], bytes[2]]
+}
+pub(crate) fn u32_from_3xu8(bytes:[u8; 3]) -> u32 {
+    u32::from_le_bytes([bytes[0], bytes[1], bytes[2], 0])
 }
