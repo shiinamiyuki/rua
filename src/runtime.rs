@@ -93,6 +93,7 @@ impl Runtime {
             println!("{}", arg.print());
         });
         self.add_function("assert".into(), |ctx| {
+            println!("assert!");
             let v = ctx.arg(0).unwrap();
             assert!(v.as_bool());
         });
