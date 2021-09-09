@@ -2,7 +2,6 @@ use crate::{
     bytecode::ByteCode,
     closure::Closure,
     gc::Gc,
-    runtime::Globals,
     runtime::{ErrorKind, RuntimeError},
     table::Table,
     value::{Managed, ManagedCell, Tuple, TupleUnpack, Value, ValueData},

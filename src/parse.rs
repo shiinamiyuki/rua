@@ -6,40 +6,7 @@ pub struct SourceLocation {
     pub line: usize,
     pub col: usize,
 }
-// #[derive(Clone, Copy, Debug)]
-// pub enum Symbol {
-//     Add,
-//     Sub,
-//     Mul,
-//     Div,
-//     Not,
-//     And,
-//     Or,
-//     Assign,
-//     Comma,
-//     Colon,
-//     SemiColon,
-//     LessThan,
-//     LessThanEqual,
-//     GreaterThan,
-//     GreaterThanEqual,
-//     NotEqual,
-//     Equal,
-// }
-// #[derive(Clone, Copy, Debug)]
-// pub enum Keyword {
-//     If,
-//     While,
-//     Repeat,
-//     Until,
-//     End,
-//     Else,
-//     Function,
-//     Return,
-//     Not,
-//     And,
-//     Or,
-// }
+
 #[derive(Clone, Debug)]
 pub enum Token {
     Number { value: f64, loc: SourceLocation },
@@ -743,6 +710,25 @@ impl Parser {
         }
         Ok(args)
     }
+    fn parse_primary_expr(&mut self) -> Result<Rc<Expr>, ParseError> {
+        if self.has("("){
+            self.advance(1);
+            let e = self.parse_expr()?;
+            if !self.has(")"){
+                return Err(self.error(ErrorKind::SyntaxError, "expected ')'", loc.clone()));
+            }
+            self.advance(1);
+            Ok(e)
+        }else{
+
+        }
+    }
+    // binary = prefix op prefix
+    // prefix = ('-' | '#' | '~') (posftix | funcdef | literal)
+    // expr = atom | binary 
+    // prim = name | '(' expr ')'
+    // postfix = prim (('[' expr ']') | func_args)*
+    // 
 
     fn parse_postfix_expr(&mut self) -> Result<Rc<Expr>, ParseError> {
         let prefix = self.parse_prefix_expr()?;
@@ -976,8 +962,8 @@ impl Parser {
     fn parse_pow_expr(&mut self) -> Result<Rc<Expr>, ParseError> {
         gen_parse_binary_expr!(
             self,
-            self.parse_postfix_expr(),
-            self.parse_postfix_expr(),
+            self.parse_prefix_expr(),
+            self.parse_prefix_expr(),
             "^"
         )
     }
@@ -1010,7 +996,7 @@ impl Parser {
         )
     }
     fn parse_prefix_expr(&mut self) -> Result<Rc<Expr>, ParseError> {
-        if self.has("not") || self.has("-") || self.has("~") {
+        if self.has("not") || self.has("-") || self.has("~")|| self.has("#") {
             let op = self.peek().clone();
             self.advance(1);
             let expr = self.parse_atom()?;

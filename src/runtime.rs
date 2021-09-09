@@ -1,8 +1,6 @@
 use std::{
     cell::{Ref, RefCell},
     collections::HashMap,
-    marker::PhantomData,
-    ops::Deref,
     rc::Rc,
 };
 
@@ -15,7 +13,6 @@ use crate::{
     vm::Instance,
 };
 
-pub(crate) type Globals = RefCell<HashMap<String, Value>>;
 
 #[derive(Clone, Copy, Debug)]
 pub enum ErrorKind {
