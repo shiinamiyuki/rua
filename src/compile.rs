@@ -32,6 +32,7 @@ pub struct CompileError {
 struct VarInfo {
     func_scope: usize,
     location: u32,
+    need_move: bool,
     on_stack: bool, // is false, then on upvalue
 }
 struct SymbolTable {
@@ -153,8 +154,25 @@ impl Compiler {
                 };
                 if let Some(info) = self.symbols.get(name).map(|x| *x) {
                     if info.on_stack {
-                        self.emit(ByteCode::Op3U8(OpCode::LoadLocal, get_3xu8(info.location)));
+                        if info.func_scope != self.funcs.len() {
+                            // this is an upvalue
+                            // println!("upvalue {}", name);
+                            self.emit(ByteCode::Op3U8(
+                                OpCode::LoadUpvalue,
+                                get_3xu8(info.location),
+                            ));
+                            {
+                                let info = self.symbols.get_mut(name).unwrap();
+                                info.on_stack = false;
+                                info.need_move = true;
+                            }
+                        } else {
+                            self.emit(ByteCode::Op3U8(OpCode::LoadLocal, get_3xu8(info.location)));
+                        }
                     } else {
+                        // if info.need_move && info.func_scope == self.funcs.len() {
+                        //     self.move_to_upvalue(name);
+                        // }
                         self.emit(ByteCode::Op3U8(
                             OpCode::LoadUpvalue,
                             get_3xu8(info.location),
@@ -306,6 +324,7 @@ impl Compiler {
             var,
             VarInfo {
                 on_stack: true,
+                need_move: false,
                 func_scope: self.funcs.len(),
                 location: self.symbols.n_locals as u32,
             },
@@ -474,7 +493,7 @@ impl Compiler {
                 for stmt in stmts {
                     self.compile_stmt(&**stmt)?;
                 }
-                self.leave_scope();
+                self.leave_scope(false);
                 Ok(())
             }
             Stmt::Function { name, args, body } => {
@@ -482,7 +501,17 @@ impl Compiler {
             }
         }
     }
-
+    // fn move_to_upvalue(&mut self, name: &String) {
+    //     println!("moving {} to up value", name);
+    //     let loc = {
+    //         let info = self.symbols.get_mut(name).unwrap();
+    //         assert!(info.func_scope == self.funcs.len() && info.need_move);
+    //         info.need_move = false;
+    //         info.location
+    //     };
+    //     self.funcs.last_mut().unwrap().upvalues.push(loc);
+    //     self.emit(ByteCode::Op3U8(OpCode::MoveToUpvalue, get_3xu8(loc)));
+    // }
     fn compile_function(
         &mut self,
         name: Option<&FunctionName>,
@@ -502,6 +531,7 @@ impl Compiler {
             self.symbols.set(
                 name.clone(),
                 VarInfo {
+                    need_move: false,
                     func_scope: self.funcs.len(),
                     location: i as u32,
                     on_stack: true,
@@ -512,12 +542,12 @@ impl Compiler {
         self.compile_stmt(body)?;
         self.emit(ByteCode::Op(OpCode::LoadNil));
         self.emit(ByteCode::Op(OpCode::Return));
-        self.leave_scope();
         let proto = ClosurePrototype {
             n_args: args.len(),
-            upvalues: vec![],
+            upvalues: std::mem::replace(&mut self.funcs.last_mut().unwrap().upvalues, vec![]),
             entry: entry as usize,
         };
+        self.leave_scope(true);
         let proto_idx = self.module.protypes.len() as u32;
         self.module.protypes.push(proto);
         let end = self.emit(ByteCode::Op3U8(OpCode::NewClosure, get_3xu8(proto_idx))) as u32;
@@ -543,8 +573,23 @@ impl Compiler {
                 } => {
                     let info = *self.symbols.get(value).unwrap();
                     if info.on_stack {
-                        self.emit(ByteCode::Op3U8(OpCode::StoreLocal, get_3xu8(info.location)));
+                        if info.func_scope != self.funcs.len() {
+                            {
+                                let info = self.symbols.get_mut(value).unwrap();
+                                info.on_stack = false;
+                                info.need_move = true;
+                            }
+                            self.emit(ByteCode::Op3U8(
+                                OpCode::StoreUpvalue,
+                                get_3xu8(info.location),
+                            ));
+                        } else {
+                            self.emit(ByteCode::Op3U8(OpCode::StoreLocal, get_3xu8(info.location)));
+                        }
                     } else {
+                        // if info.need_move && info.func_scope == self.funcs.len() {
+                        //     self.move_to_upvalue(value);
+                        // }
                         self.emit(ByteCode::Op3U8(
                             OpCode::StoreUpvalue,
                             get_3xu8(info.location),
@@ -555,6 +600,22 @@ impl Compiler {
             },
             FunctionLocation::Stack => {}
         };
+        unsafe {
+            let mut p = &mut self.symbols as *mut SymbolTable;
+            while let Some(table) = p.as_mut() {
+                for info in table.vars.values_mut() {
+                    if info.func_scope == self.funcs.len() && info.need_move {
+                        info.need_move = false;
+                        self.funcs.last_mut().unwrap().upvalues.push(info.location);
+                        self.emit(ByteCode::Op3U8(
+                            OpCode::MoveToUpvalue,
+                            get_3xu8(info.location),
+                        ));
+                    }
+                }
+                p = table.parent;
+            }
+        }
         Ok(())
     }
 
@@ -569,7 +630,29 @@ impl Compiler {
                 };
                 let info = self.symbols.get(name).map(|x| *x);
                 if let Some(info) = info {
-                    self.emit(ByteCode::Op3U8(OpCode::StoreLocal, get_3xu8(info.location)));
+                    if info.on_stack {
+                        if info.func_scope != self.funcs.len() {
+                            {
+                                let info = self.symbols.get_mut(name).unwrap();
+                                info.on_stack = false;
+                                info.need_move = true;
+                            }
+                            self.emit(ByteCode::Op3U8(
+                                OpCode::StoreUpvalue,
+                                get_3xu8(info.location),
+                            ));
+                        } else {
+                            self.emit(ByteCode::Op3U8(OpCode::StoreLocal, get_3xu8(info.location)));
+                        }
+                    } else {
+                        // if info.need_move && info.func_scope == self.funcs.len() {
+                        //     self.move_to_upvalue(value);
+                        // }
+                        self.emit(ByteCode::Op3U8(
+                            OpCode::StoreUpvalue,
+                            get_3xu8(info.location),
+                        ));
+                    }
                 } else {
                     self.push_string(name);
                     self.emit(ByteCode::Op(OpCode::StoreGlobal));
@@ -621,13 +704,18 @@ impl Compiler {
         let old = std::mem::replace(&mut self.symbols, new);
         let old = Box::into_raw(Box::new(old));
         self.symbols.parent = old;
-        self.funcs.push(FuncInfo { upvalues: vec![] });
+        if function_scope {
+            self.funcs.push(FuncInfo { upvalues: vec![] });
+        }
     }
-    fn leave_scope(&mut self) {
+    fn leave_scope(&mut self, function_scope: bool) {
         unsafe {
             let parent = self.symbols.parent;
             std::mem::swap(&mut self.symbols, parent.as_mut().unwrap());
             Box::from_raw(parent);
+        }
+        if function_scope {
+            self.funcs.pop().unwrap();
         }
     }
 }

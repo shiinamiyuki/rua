@@ -192,6 +192,29 @@ impl Instance {
                         eval_stack
                             .push(state.create_string(module.string_pool[idx as usize].clone()));
                     }
+                    OpCode::StoreUpvalue => {
+                        let idx = u32_from_3xu8(operands);
+                        let v = eval_stack.pop().unwrap();
+                        unsafe {
+                            let c = &frame.closure.as_ref().unwrap().data;
+                            c.set_upvalue(idx, v);
+                        }
+                    }
+                    OpCode::LoadUpvalue => {
+                        let idx = u32_from_3xu8(operands);
+                        unsafe {
+                            let c = &frame.closure.as_ref().unwrap().data;
+                            eval_stack.push(c.get_upvalue(idx));
+                        }
+                    }
+                    OpCode::MoveToUpvalue => {
+                        let idx = u32_from_3xu8(operands);
+                        let local = frame.locals[idx as usize];
+                        unsafe {
+                            let c = &frame.closure.as_ref().unwrap().data;
+                            c.insert_upvalue(idx, local);
+                        }
+                    }
                     OpCode::LoadLocal => {
                         let idx = operands[0];
                         eval_stack.push(frame.locals[idx as usize]);
@@ -294,10 +317,8 @@ impl Instance {
                             entry: entry as usize,
                             module: unsafe { (*frame.closure).data.module.clone() },
                             upvalues: self.gc.manage(UpValue {
-                                values: RefCell::new(
-                                    proto.upvalues.iter().map(|i| (*i, Value::nil())).collect(),
-                                ),
-                                parent: std::ptr::null(),
+                                values: RefCell::new(HashMap::new()),
+                                parent: unsafe { (*frame.closure).data.upvalues },
                             }),
                         });
                         eval_stack.push(closure);

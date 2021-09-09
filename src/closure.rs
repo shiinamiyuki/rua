@@ -32,7 +32,9 @@ impl UpValue {
     pub(crate) fn get(&self, i: u32) -> Value {
         let mut p = self as *const UpValue;
         unsafe {
+        //     println!("get upvalue {} {:?}", i, p);
             while let Some(uv) = p.as_ref() {
+                // println!("{:?}", p);
                 let values = uv.values.borrow();
                 if let Some(v) = values.get(&i) {
                     return *v;
@@ -43,13 +45,20 @@ impl UpValue {
             panic!("upvalue index {} does not exist", i)
         }
     }
+    pub(crate) fn insert(&self, i: u32, v: Value) {
+        let mut values = self.values.borrow_mut();
+        values.insert(i, v);
+    }
     pub(crate) fn set(&self, i: u32, v: Value) {
         let mut p = self as *const UpValue;
         unsafe {
+            // println!("set upvalue {} {:?}", i, p);
             while let Some(uv) = p.as_ref() {
+                // println!("{:?}", p);
                 let mut values = uv.values.borrow_mut();
                 if let Some(u) = values.get_mut(&i) {
                     *u = v;
+                    return;
                 } else {
                     p = uv.parent;
                 }
@@ -81,12 +90,32 @@ pub struct Closure {
     pub(crate) upvalues: *const UpValue,
 }
 impl Closure {
-    const UPVALUE_ENV: usize = 0;
     pub(crate) fn set_upvalue(&self, i: u32, value: Value) {
-        unsafe { self.upvalues.as_ref().unwrap().set(i, value) }
+        unsafe {
+            if let Some(p) = self.upvalues.as_ref() {
+                p.set(i, value)
+            } else {
+                unreachable!()
+            }
+        }
+    }
+    pub(crate) fn insert_upvalue(&self, i: u32, value: Value) {
+        unsafe {
+            if let Some(p) = self.upvalues.as_ref() {
+                p.insert(i, value)
+            } else {
+                unreachable!()
+            }
+        }
     }
     pub(crate) fn get_upvalue(&self, i: u32) -> Value {
-        unsafe { self.upvalues.as_ref().unwrap().get(i) }
+        unsafe {
+            if let Some(p) = self.upvalues.as_ref() {
+                p.get(i)
+            } else {
+                unreachable!()
+            }
+        }
     }
 }
 impl Traceable for Closure {
