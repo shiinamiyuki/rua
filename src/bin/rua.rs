@@ -29,7 +29,7 @@ fn main(){
     };
     // println!("{:#?}", expr);
     let module = compile(expr).unwrap();
-    // println!("{:#?}", module);
+    println!("{:#?}", module);
     let mut runtime = Runtime::new();
     
     let instance = runtime.create_instance();

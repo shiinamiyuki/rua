@@ -543,9 +543,10 @@ impl Tokenizer {
     }
     fn run(&mut self) -> Result<Vec<Token>, TokenizeError> {
         let mut tokens = vec![];
-        while self.peek().is_some() {
-            self.skip_space();
+        self.skip_space();
+        while self.peek().is_some() {            
             tokens.push(self.next_token()?);
+            self.skip_space();
         }
         tokens.push(Token::EOF {
             loc: self.loc.clone(),

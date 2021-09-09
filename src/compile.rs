@@ -1,13 +1,15 @@
 use std::{
     cell::{Ref, RefCell},
     collections::HashMap,
+    convert::TryInto,
     rc::Rc,
     vec,
 };
 
 use crate::{
     bytecode::*,
-    parse::{Expr, SourceLocation, Stmt, Token},
+    log_2,
+    parse::{Expr, SourceLocation, Stmt, TableField, Token},
     state::MAX_LOCALS,
 };
 
@@ -197,7 +199,12 @@ impl Compiler {
                 Ok(())
             }
             Expr::UnaryExpr { op, arg } => todo!(),
-            Expr::IndexExpr { loc, lhs, rhs } => todo!(),
+            Expr::IndexExpr { loc:_, lhs, rhs } => {
+                self.compile_expr(rhs)?;
+                self.compile_expr(lhs)?;
+                self.emit(ByteCode::Op(OpCode::LoadTable));
+                Ok(())
+            },
             Expr::DotExpr { loc, lhs, rhs } => todo!(),
             Expr::CallExpr { callee, args } => {
                 for arg in args {
@@ -213,7 +220,51 @@ impl Compiler {
                 args,
             } => todo!(),
             Expr::FunctionExpr { loc, args, body } => todo!(),
-            Expr::Table { loc, fields } => todo!(),
+            Expr::Table { loc: _, fields } => {
+                let n_arrays = fields
+                    .iter()
+                    .filter(|f| match f {
+                        TableField::ArrayEntry(_) => true,
+                        _ => false,
+                    })
+                    .count();
+                let n_hash = fields.len() - n_arrays;
+                let n_arrays: u16 = n_arrays.min(u16::MAX as usize).try_into().unwrap();
+                self.emit(ByteCode::Op3U8(
+                    OpCode::NewTable,
+                    [
+                        n_arrays.to_le_bytes()[0],
+                        n_arrays.to_le_bytes()[1],
+                        log_2(n_hash).unwrap_or(0).try_into().unwrap(),
+                    ],
+                ));
+                let mut array_entry_cnt = 0;
+                for field in fields {
+                    self.emit(ByteCode::Op(OpCode::Dup));
+                    match field {
+                        TableField::ExprPair(k, v) => {
+                            self.compile_expr(v)?;
+                            self.compile_expr(k)?;
+                        }
+                        TableField::NamePair(k, v) => {
+                            let name = match k {
+                                Token::Identifier { value, .. } => value,
+                                _ => unreachable!(),
+                            };
+                            self.push_string(name);
+                            self.compile_expr(v)?;
+                        }
+                        TableField::ArrayEntry(x) => {
+                            self.push_number(array_entry_cnt as f64);
+                            self.compile_expr(x)?;
+                            array_entry_cnt += 1;
+                        }
+                    }
+                    self.emit(ByteCode::Op(OpCode::RotBCA));
+                    self.emit(ByteCode::Op(OpCode::StoreTable));
+                }
+                Ok(())
+            }
         }
     }
     fn compile_stmt(&mut self, block: &Stmt) -> Result<(), CompileError> {
@@ -380,7 +431,8 @@ impl Compiler {
                     Token::Identifier { value, .. } => value,
                     _ => unreachable!(),
                 };
-                if let Some(info) = self.symbols.get(name) {
+                let info = self.symbols.get(name).map(|x| *x);
+                if let Some(info) = info {
                     self.emit(ByteCode::Op3U8(OpCode::StoreLocal, get_3xu8(info.location)));
                 } else {
                     self.push_string(name);
@@ -390,7 +442,12 @@ impl Compiler {
             }
             // Expr::BinaryExpr { op, lhs, rhs } => todo!(),
             // Expr::UnaryExpr { op, arg } => todo!(),
-            Expr::IndexExpr { loc, lhs, rhs } => todo!(),
+            Expr::IndexExpr { loc, lhs, rhs } => {
+                self.compile_expr(rhs)?;
+                self.compile_expr(lhs)?;
+                self.emit(ByteCode::Op(OpCode::StoreTable));
+                Ok(())
+            }
             Expr::DotExpr { loc, lhs, rhs } => todo!(),
             // Expr::CallExpr { callee, args } => todo!(),
             // Expr::MethodCallExpr { callee, method, args } => todo!(),

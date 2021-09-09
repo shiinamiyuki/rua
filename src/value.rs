@@ -20,7 +20,11 @@ pub trait UserData {}
 pub struct Managed<T> {
     pub data: T,
 }
-
+impl<T> Managed<T> {
+    pub fn new(data: T) -> Self {
+        Self { data }
+    }
+}
 impl<T> Traceable for Managed<T> {
     fn trace(&self, _gc: &Gc) {}
 }
@@ -115,7 +119,7 @@ impl Hash for ValueData {
         }
     }
 }
-impl Eq for ValueData{}
+impl Eq for ValueData {}
 #[derive(Clone, Copy, Hash, PartialEq, Eq)]
 pub struct Value {
     pub data: ValueData,
@@ -123,10 +127,10 @@ pub struct Value {
 }
 
 impl Value {
-    pub fn is_nil(&self)->bool{
-        match self.data{
-            ValueData::Nil=>true,
-            _=>false,
+    pub fn is_nil(&self) -> bool {
+        match self.data {
+            ValueData::Nil => true,
+            _ => false,
         }
     }
     pub fn nil() -> Self {
@@ -157,12 +161,12 @@ impl Value {
             _ => None,
         }
     }
-    pub fn as_bool(&self)->bool{
-        match self.data{
-            ValueData::Number(x)=>{x!=0.0},
-            ValueData::Bool(x)=>x,
-            ValueData::Nil=>false,
-            _=>true,
+    pub fn as_bool(&self) -> bool {
+        match self.data {
+            ValueData::Number(x) => x != 0.0,
+            ValueData::Bool(x) => x,
+            ValueData::Nil => false,
+            _ => true,
         }
     }
     pub(crate) fn as_string<'a>(&'a self) -> Option<&'a String> {

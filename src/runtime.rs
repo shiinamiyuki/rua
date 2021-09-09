@@ -6,7 +6,14 @@ use std::{
     rc::Rc,
 };
 
-use crate::{closure::{Callable, NativeFunction}, gc::{Gc, Traceable}, state::{CallContext, State}, table::Table, value::{Managed, ManagedCell, Value, ValueData}, vm::Instance};
+use crate::{
+    closure::{Callable, NativeFunction},
+    gc::{Gc, Traceable},
+    state::{CallContext, State},
+    table::Table,
+    value::{Managed, ManagedCell, Value, ValueData},
+    vm::Instance,
+};
 
 pub(crate) type Globals = RefCell<HashMap<String, Value>>;
 
@@ -89,13 +96,19 @@ impl Runtime {
     }
     fn add_std_lib(&mut self) {
         self.add_function("print".into(), |ctx| {
-            let arg = ctx.arg(0).unwrap();
-            println!("{}", arg.print());
+            for i in 0..ctx.get_arg_count() {
+                let arg = ctx.arg(i);
+                print!("{}", arg.print());
+            }
+            print!("\n");
         });
         self.add_function("assert".into(), |ctx| {
-            println!("assert!");
-            let v = ctx.arg(0).unwrap();
+            let v = ctx.arg(0);
             assert!(v.as_bool());
+        });
+        self.add_function("type".into(), |ctx| {
+            let v = ctx.arg(0);
+            ctx.ret(0, ctx.state.create_string(String::from(v.type_of())));
         });
     }
     pub fn new() -> Self {

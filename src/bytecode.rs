@@ -24,9 +24,11 @@ pub enum OpCode {
     NotEqual,
     Pop,
     Return,
+    Dup,
+    RotBCA, // stack: A B C -> B C A
 
     LoadGlobal,// TOS = name
-    StoreGlobal,// TOS~1=name TOS=value global[name]= value
+    StoreGlobal,// TOS~1=value TOS=name global[name]= value
 
     // 3xu8 operand 
     /*union _3xu8{
@@ -35,13 +37,14 @@ pub enum OpCode {
     };
 
     }*/
+    NewTable, //NewTable array len, hash len
     LoadStr,
     LoadLocal, // PUSH  local[i]
     StoreLocal, // local[i] = TOS;POP
     Unpack, // Unpack TOS to n values, 
     
-    LoadTable,// TOS~1 = table, TOS = key
-    StoreTable, // TOS~2 = table, key, value
+    LoadTable,// TOS = key, table
+    StoreTable, // TOS = value, key, table
     LoadUpvalue, // TOS=upvalue, push upvalue[i]
     StoreUpvalue,// TOS~1=upvalue, TOS=value upvalue[i] = value
 

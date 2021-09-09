@@ -4,7 +4,8 @@ use crate::{
     gc::Gc,
     runtime::Globals,
     runtime::{ErrorKind, RuntimeError},
-    value::{Managed, Tuple, TupleUnpack, Value, ValueData},
+    table::Table,
+    value::{Managed, ManagedCell, Tuple, TupleUnpack, Value, ValueData},
     vm::Instance,
 };
 use std::{cell::RefCell, cmp::Ordering, rc::Rc};
@@ -99,25 +100,32 @@ macro_rules! int_binary_op_impl {
 }
 pub struct CallContext<'a> {
     pub(crate) state: &'a State,
-    pub(crate) ret_values: Vec<Value>,
+    pub(crate) ret_values: RefCell<Vec<Value>>,
 }
 impl<'a> CallContext<'a> {
     pub fn get_arg_count(&self) -> usize {
         self.state.get_arg_count()
     }
-    pub fn arg(&self, i: usize) -> Option<Value> {
+    pub fn arg(&self, i: usize) -> Value {
         self.state.arg(i)
     }
-    pub fn ret(&mut self, i: usize, value: Value) {}
+    pub fn ret(&self, i: usize, value: Value) {
+        let mut ret_values = self.ret_values.borrow_mut();
+        if i >= ret_values.len() {
+            ret_values.resize(i + 1, Value::nil());
+        }
+        ret_values[i] = value;
+    }
 }
 impl<'a> Drop for CallContext<'a> {
     fn drop(&mut self) {
-        let ret = if self.ret_values.is_empty() {
+        let mut ret_values = self.ret_values.borrow_mut();
+        let ret = if ret_values.is_empty() {
             Value::nil()
-        } else if self.ret_values.len() == 1 {
-            self.ret_values[0]
+        } else if ret_values.len() == 1 {
+            ret_values[0]
         } else {
-            let rv = std::mem::replace(&mut self.ret_values, vec![]);
+            let rv = std::mem::replace(&mut *ret_values, vec![]);
             Value {
                 data: ValueData::Tuple(self.state.gc.manage(Managed {
                     data: Tuple {
@@ -133,7 +141,7 @@ impl<'a> Drop for CallContext<'a> {
     }
 }
 impl State {
-    pub fn get_global(&self, name: Value) -> Option<Value> {
+    pub fn get_global(&self, name: Value) -> Value {
         let globals = self.globals.as_table().unwrap();
         let globals = globals.borrow();
         globals.get(name)
@@ -148,20 +156,27 @@ impl State {
         let frame = frames.last().unwrap();
         frame.n_args
     }
-    fn arg(&self, i: usize) -> Option<Value> {
+    fn arg(&self, i: usize) -> Value {
         let frames = self.frames.borrow();
         let frame = frames.last().unwrap();
         if i < frame.n_args {
-            Some(frame.locals[i])
+            frame.locals[i]
             // Some(self.eval_stack.borrow()[frame.frame_bottom + i])
         } else {
-            None
+            Value::nil()
         }
     }
     pub fn create_string(&self, s: String) -> Value {
         let s = self.gc.manage(Managed { data: s });
         Value {
             data: ValueData::String(s),
+            metatable: std::ptr::null(),
+        }
+    }
+    pub fn create_table(&self, t: Table) -> Value {
+        let t = self.gc.manage(ManagedCell::new(RefCell::new(t)));
+        Value {
+            data: ValueData::Table(t),
             metatable: std::ptr::null(),
         }
     }

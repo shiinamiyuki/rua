@@ -37,21 +37,14 @@ struct LinkedHashMap {
     // tail:usize,
 }
 
-const fn num_bits<T>() -> usize {
-    std::mem::size_of::<T>() * 8
-}
 
-fn log_2(x: usize) -> u32 {
-    assert!(x > 0);
-    num_bits::<usize>() as u32 - x.leading_zeros() - 1
-}
 
 mod test {
     #[test]
     fn test_log() {
-        use crate::table::log_2;
+        use crate::log_2;
         for i in 0..62usize {
-            assert_eq!(i as u32, log_2(1 << i));
+            assert_eq!(i as u32, log_2(1 << i).unwrap());
         }
     }
 }
@@ -68,12 +61,17 @@ impl LinkedHashMap {
             during_rehash: false,
         }
     }
+    pub fn with_len(len:usize) -> Self {
+        let mut m = Self::new();
+        m.reset(len);
+        m
+    }
     fn reset(&mut self, len: usize) -> Vec<Entry> {
         assert!(len.is_power_of_two());
         self.len = 0;
         let old = std::mem::replace(&mut self.table, vec![Default::default(); len]);
         self.mod_mask = len - 1;
-        println!("{:0x} {:0x}", len, self.mod_mask);
+        // println!("{:0x} {:0x}", len, self.mod_mask);
         self.head = usize::MAX;
         old
     }
@@ -104,7 +102,7 @@ impl LinkedHashMap {
             let h = (hk + i as u64 / 2 + (i * i) as u64 / 2) & self.mod_mask as u64;
             let entry = &self.table[h as usize];
             // println!("entry {} has {} {}", h, entry.key.print(), entry.value.print());
-            if entry.value.is_nil() || entry.key == *k  {
+            if entry.value.is_nil() || entry.key == *k {
                 return Some(h as usize);
             }
         }
@@ -127,14 +125,12 @@ impl LinkedHashMap {
         self.table[idx].value = Value::nil();
         self.len -= 1;
     }
-    fn get(&self, key: Value) -> Option<Value> {
+    fn get(&self, key: Value) -> Value {
         // println!("get {}", key.print());
-        let idx = self.get_index(&key)?;
-        if self.table[idx].value.is_nil() {
-            None
+        if let Some(idx) = self.get_index(&key) {
+            self.table[idx].value
         } else {
-            // println!("got {} at {}", self.table[idx].value.print(), idx);
-            Some(self.table[idx].value)
+            Value::nil()
         }
     }
     fn insert(&mut self, k: Value, v: Value) {
@@ -177,7 +173,6 @@ impl LinkedHashMap {
 pub struct Table {
     array: Vec<Value>,
     map: LinkedHashMap,
-    free_pos: u32,
 }
 fn is_int(x: f64) -> bool {
     x.fract() == 0.0
@@ -187,16 +182,20 @@ impl Table {
         Self {
             array: vec![],
             map: LinkedHashMap::new(),
-            free_pos: 0,
         }
     }
-
-    pub fn get(&self, key: Value) -> Option<Value> {
+    pub fn new_with(array_part_len:usize, hash_part_len:usize) -> Self {
+        Self {
+            array: vec![Value::nil();array_part_len],
+            map: LinkedHashMap::with_len(hash_part_len),
+        }
+    }
+    pub fn get(&self, key: Value) -> Value {
         match key.data {
             ValueData::Number(x) if is_int(x.0) => {
                 let i = x.trunc() as i64;
                 if i >= 1 && i <= self.array.len() as i64 {
-                    return Some(self.array[(i - 1) as usize]);
+                    return self.array[(i - 1) as usize];
                 }
             }
             _ => {}
@@ -210,9 +209,8 @@ impl Table {
                 if i >= 1 && i <= self.array.len() as i64 {
                     self.array[(i - 1) as usize] = value;
                     return;
-                } else if i >= 1 && (i < self.array.len() as i64 + 4 || i <= 17) {
-                    self.array.resize(i as usize, Value::nil());
-                    self.array[(i - 1) as usize] = value;
+                } else if i == 1 + (self.array.len() as i64) {
+                    self.array.push(value);
                     return;
                 }
             }

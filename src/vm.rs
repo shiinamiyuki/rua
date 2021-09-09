@@ -9,7 +9,8 @@ use crate::{
     gc::Gc,
     runtime::{ErrorKind, RuntimeError},
     state::{CallContext, Frame, State},
-    value::{Managed, Value, ValueData},
+    table::Table,
+    value::{Managed, ManagedCell, Value, ValueData},
 };
 
 /*
@@ -51,6 +52,17 @@ impl Instance {
             match instruction {
                 ByteCode::Op(op) => match op {
                     OpCode::Nop => {}
+                    OpCode::Dup => {
+                        let top = *eval_stack.last().unwrap();
+                        eval_stack.push(top);
+                    }
+                    OpCode::RotBCA => {
+                        let i = eval_stack.len() - 1;
+                        let (a, b, c) = (eval_stack[i - 2], eval_stack[i - 1], eval_stack[i]);
+                        eval_stack[i - 2] = b;
+                        eval_stack[i - 1] = c;
+                        eval_stack[i] = a;
+                    }
                     OpCode::LoadNumber => {
                         ip_modified = true;
                         let lo = match module.code[*ip + 1] {
@@ -67,14 +79,22 @@ impl Instance {
                     }
                     OpCode::LoadGlobal => {
                         let name = eval_stack.pop().unwrap();
-                        if let Some(v) = self.state.get_global(name) {
-                            eval_stack.push(v);
-                        } else {
-                            return Err(RuntimeError {
-                                msg: format!("name {} is not defined", name.as_string().unwrap()),
-                                kind: ErrorKind::NameError,
-                            });
-                        }
+                        eval_stack.push(self.state.get_global(name));
+                    }
+                    OpCode::LoadTable => {
+                        let table = eval_stack.pop().unwrap();
+                        let key = eval_stack.pop().unwrap();
+                        let table = table.as_table().unwrap();
+                        let table = table.borrow();
+                        eval_stack.push(table.get(key));
+                    }
+                    OpCode::StoreTable => {
+                        let table = eval_stack.pop().unwrap();
+                        let key = eval_stack.pop().unwrap();
+                        let value = eval_stack.pop().unwrap();
+                        let table = table.as_table().unwrap();
+                        let mut table = table.borrow_mut();
+                        table.set(key, value);
                     }
                     OpCode::StoreGlobal => {
                         let name = eval_stack.pop().unwrap();
@@ -146,6 +166,17 @@ impl Instance {
                     _ => panic!("unreachable, instruction is {:#?}", instruction),
                 },
                 ByteCode::Op3U8(op, operands) => match op {
+                    OpCode::NewTable => {
+                        let n_array = u16::from_le_bytes([operands[0], operands[1]]) as usize;
+                        let n_hash = operands[2] as usize;
+                        if n_array == 0 && n_hash == 0 {
+                            eval_stack.push(state.create_table(Table::new()));
+                        } else {
+                            eval_stack.push(
+                                state.create_table(Table::new_with(n_array, (1 << n_hash).max(16))),
+                            );
+                        }
+                    }
                     OpCode::LoadStr => {
                         let idx = u32_from_3xu8(operands);
                         eval_stack
@@ -248,7 +279,7 @@ impl Instance {
                     let func = unsafe { &(*callable).data };
                     let ctx = CallContext {
                         state: &self.state,
-                        ret_values: vec![],
+                        ret_values: RefCell::new(vec![]),
                     };
                     func.call(&ctx);
                     {
