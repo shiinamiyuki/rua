@@ -1,5 +1,5 @@
 #[repr(u8)]
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OpCode {
     Nop,
     
@@ -78,7 +78,7 @@ end
 
 */
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ByteCode {
     Op(OpCode),
     Op3U8(OpCode, [u8; 3]),

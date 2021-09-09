@@ -97,7 +97,7 @@ impl PartialEq for ValueData {
         }
     }
 }
-impl Eq for ValueData {}
+
 impl Hash for ValueData {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         match self {
@@ -115,6 +115,7 @@ impl Hash for ValueData {
         }
     }
 }
+impl Eq for ValueData{}
 #[derive(Clone, Copy, Hash, PartialEq, Eq)]
 pub struct Value {
     pub data: ValueData,
@@ -122,6 +123,12 @@ pub struct Value {
 }
 
 impl Value {
+    pub fn is_nil(&self)->bool{
+        match self.data{
+            ValueData::Nil=>true,
+            _=>false,
+        }
+    }
     pub fn nil() -> Self {
         Default::default()
     }

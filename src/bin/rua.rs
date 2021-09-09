@@ -14,9 +14,9 @@ fn main(){
             exit(1);
         }
     };
-    for tok in &tokens{
-        println!("{:?}", tok);
-    }
+    // for tok in &tokens{
+    //     println!("{:?}", tok);
+    // }
     let expr = parse_impl(tokens);
     let expr = match expr {
         Ok(expr)=>{
@@ -27,10 +27,11 @@ fn main(){
             exit(1);
         }
     };
-    println!("{:#?}", expr);
+    // println!("{:#?}", expr);
     let module = compile(expr).unwrap();
-    println!("{:#?}", module);
+    // println!("{:#?}", module);
     let mut runtime = Runtime::new();
+    
     let instance = runtime.create_instance();
     instance.exec(module).unwrap();
 }

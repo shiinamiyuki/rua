@@ -92,6 +92,10 @@ impl Runtime {
             let arg = ctx.arg(0).unwrap();
             println!("{}", arg.print());
         });
+        self.add_function("assert".into(), |ctx| {
+            let v = ctx.arg(0).unwrap();
+            assert!(v.as_bool());
+        });
     }
     pub fn new() -> Self {
         let gc = Rc::new(Gc::new());

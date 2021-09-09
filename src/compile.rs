@@ -148,19 +148,7 @@ impl Compiler {
             }
             Expr::BinaryExpr { op, lhs, rhs } => {
                 let opcode = match op {
-                    Token::Symbol { value, .. } => match value.as_str() {
-                        "+" => OpCode::Add,
-                        "-" => OpCode::Sub,
-                        "*" => OpCode::Mul,
-                        "/" => OpCode::Div,
-                        "%" => OpCode::Mod,
-                        "^" => OpCode::Pow,
-                        "&" => OpCode::And,
-                        "|" => OpCode::Or,
-                        "<" => OpCode::LessThan,
-                        "<=" => OpCode::LessThanEqual,
-                        ">=" => OpCode::GreaterThanEqual,
-                        ">" => OpCode::GreaterThan,
+                    Token::Keyword { value, .. } => match value.as_str() {
                         "and" => {
                             self.compile_expr(lhs)?;
                             self.emit(ByteCode::Op3U8(OpCode::TestJump, [0, 0, 1]));
@@ -181,6 +169,23 @@ impl Compiler {
                             );
                             return Ok(());
                         }
+                        _ => unreachable!(),
+                    },
+                    Token::Symbol { value, .. } => match value.as_str() {
+                        "+" => OpCode::Add,
+                        "-" => OpCode::Sub,
+                        "*" => OpCode::Mul,
+                        "/" => OpCode::Div,
+                        "%" => OpCode::Mod,
+                        "^" => OpCode::Pow,
+                        "&" => OpCode::And,
+                        "|" => OpCode::Or,
+                        "<" => OpCode::LessThan,
+                        "<=" => OpCode::LessThanEqual,
+                        ">=" => OpCode::GreaterThanEqual,
+                        ">" => OpCode::GreaterThan,
+                        "==" => OpCode::Equal,
+                        "!=" => OpCode::NotEqual,
                         _ => unreachable!(),
                     },
                     _ => unreachable!(),
@@ -294,9 +299,33 @@ impl Compiler {
                 else_,
             } => {
                 self.compile_expr(cond)?;
-                let jmp = self.module.code.len();
                 self.emit(ByteCode::Op3U8(OpCode::TestJump, [0, 1, 1]));
-                self.compile_stmt(&**then)?;
+                let mut jmp_end = vec![];
+                let jmp = self.emit(ByteCode::Address([0; 4]));
+                self.compile_stmt(then)?;
+                for (cond, then) in else_ifs {
+                    self.compile_expr(cond)?;
+                    self.emit(ByteCode::Op3U8(OpCode::TestJump, [0, 1, 1]));
+                    let jmp_then_end = self.emit(ByteCode::Address([0; 4]));
+                    self.compile_stmt(then)?;
+                    self.emit(ByteCode::Op(OpCode::Jump));
+                    let jmp = self.emit(ByteCode::Address([0; 4]));
+                    jmp_end.push(jmp);
+                    self.module.code[jmp_then_end] =
+                        ByteCode::Address((self.module.code.len() as u32).to_le_bytes());
+                }
+                self.module.code[jmp] =
+                    ByteCode::Address((self.module.code.len() as u32).to_le_bytes());
+                if let Some(else_) = else_ {
+                    self.compile_stmt(else_)?;
+                }
+                {
+                    let end = self.module.code.len() as u32;
+                    for jmp in jmp_end {
+                        assert!(self.module.code[jmp] == ByteCode::Address([0; 4]));
+                        self.module.code[jmp] = ByteCode::Address(end.to_le_bytes());
+                    }
+                }
                 Ok(())
             }
             Stmt::While { loc, cond, body } => {

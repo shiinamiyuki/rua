@@ -1145,11 +1145,13 @@ impl Parser {
             if !self.has("do") {
                 return Err(self.error(ErrorKind::SyntaxError, "expected 'do' in for", loc));
             }
+            self.advance(1);
             let body = self.parse_block()?;
             let loc = self.peek().loc().clone();
             if !self.has("end") {
                 return Err(self.error(ErrorKind::SyntaxError, "expected 'end' in for", loc));
             }
+            self.advance(1);
             Ok(Rc::new(Stmt::For {
                 name,
                 init,
@@ -1164,11 +1166,13 @@ impl Parser {
             if !self.has("do") {
                 return Err(self.error(ErrorKind::SyntaxError, "expected 'do' in for", loc));
             }
+            self.advance(1);
             let body = self.parse_block()?;
             let loc = self.peek().loc().clone();
             if !self.has("end") {
                 return Err(self.error(ErrorKind::SyntaxError, "expected 'end' in for", loc));
             }
+            self.advance(1);
             Ok(Rc::new(Stmt::ForIn { range, body, name }))
         } else {
             let loc = self.peek().loc().clone();
@@ -1192,6 +1196,7 @@ impl Parser {
         if !self.has("end") {
             return Err(self.error(ErrorKind::SyntaxError, "expected 'end' in while", loc));
         }
+        self.advance(1);
         Ok(Rc::new(Stmt::While { loc, cond, body }))
     }
     fn parse_if_stmt(&mut self) -> Result<Rc<Stmt>, ParseError> {
@@ -1225,6 +1230,7 @@ impl Parser {
         if !self.has("end") {
             return Err(self.error(ErrorKind::SyntaxError, "expected 'end' in if", loc));
         }
+        self.advance(1);
         Ok(Rc::new(Stmt::If {
             loc,
             cond,
@@ -1475,7 +1481,9 @@ impl Parser {
         }
     }
     fn run(&mut self) -> Result<Rc<Stmt>, ParseError> {
-        self.parse_block()
+        let ret = self.parse_block()?;
+        assert!(self.peek().is_eof());
+        Ok(ret)
     }
 }
 

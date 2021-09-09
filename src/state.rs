@@ -4,7 +4,7 @@ use crate::{
     gc::Gc,
     runtime::Globals,
     runtime::{ErrorKind, RuntimeError},
-    value::{Managed, Value, ValueData},
+    value::{Managed, Tuple, TupleUnpack, Value, ValueData},
     vm::Instance,
 };
 use std::{cell::RefCell, cmp::Ordering, rc::Rc};
@@ -112,9 +112,24 @@ impl<'a> CallContext<'a> {
 }
 impl<'a> Drop for CallContext<'a> {
     fn drop(&mut self) {
-        if self.ret_values.is_empty() {
+        let ret = if self.ret_values.is_empty() {
+            Value::nil()
+        } else if self.ret_values.len() == 1 {
+            self.ret_values[0]
         } else {
-        }
+            let rv = std::mem::replace(&mut self.ret_values, vec![]);
+            Value {
+                data: ValueData::Tuple(self.state.gc.manage(Managed {
+                    data: Tuple {
+                        values: rv,
+                        unpack: TupleUnpack::TruncateFill,
+                    },
+                })),
+                metatable: std::ptr::null(),
+            }
+        };
+        let mut st = self.state.eval_stack.borrow_mut();
+        st.push(ret);
     }
 }
 impl State {
@@ -137,7 +152,8 @@ impl State {
         let frames = self.frames.borrow();
         let frame = frames.last().unwrap();
         if i < frame.n_args {
-            Some(self.eval_stack.borrow()[frame.frame_bottom + i])
+            Some(frame.locals[i])
+            // Some(self.eval_stack.borrow()[frame.frame_bottom + i])
         } else {
             None
         }
@@ -186,7 +202,7 @@ impl State {
     }
 
     pub fn cmp(&self, a: Value, b: Value) -> Result<Ordering, RuntimeError> {
-        match (a.data, b.data) {
+        let res = match (a.data, b.data) {
             (ValueData::Nil, ValueData::Nil) => Ok(Ordering::Equal),
             (ValueData::Bool(a), ValueData::Bool(b)) => Ok(a.cmp(&b)),
             (ValueData::Number(a), ValueData::Number(b)) => Ok(a.cmp(&b)),
@@ -203,7 +219,21 @@ impl State {
                     b.type_of()
                 ),
             }),
+        };
+        #[cfg(debug_assertions)]
+        {
+            match res {
+                Ok(ordering) => {
+                    if ordering == Ordering::Equal {
+                        debug_assert!(a == b);
+                    } else {
+                        debug_assert!(a != b);
+                    }
+                }
+                _ => {}
+            }
         }
+        res
     }
     pub fn lt(&self, a: Value, b: Value) -> Result<Value, RuntimeError> {
         let ordering = self.cmp(a, b)?;

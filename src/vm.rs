@@ -165,13 +165,24 @@ impl Instance {
                         match func.data {
                             ValueData::Closure(closure) => {
                                 *ip += 1;
-                                let frame = Frame::new(eval_stack.len() - n_args, n_args, closure);
+                                let mut frame =
+                                    Frame::new(eval_stack.len() - n_args, n_args, closure);
+                                for i in 0..n_args {
+                                    frame.locals[i] = eval_stack[eval_stack.len() - n_args + i];
+                                }
+                                let len = eval_stack.len();
+                                eval_stack.resize(len - n_args, Value::nil());
                                 return Ok(Continue::NewFrame(frame));
                             }
                             ValueData::Callable(callable) => {
                                 *ip += 1;
-                                let frame =
+                                let mut frame =
                                     Frame::new(eval_stack.len() - n_args, n_args, std::ptr::null());
+                                for i in 0..n_args {
+                                    frame.locals[i] = eval_stack[eval_stack.len() - n_args + i];
+                                }
+                                let len = eval_stack.len();
+                                eval_stack.resize(len - n_args, Value::nil());
                                 return Ok(Continue::CallExt(callable, frame));
                             }
                             _ => {
