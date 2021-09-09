@@ -27,7 +27,7 @@ fn main(){
             exit(1);
         }
     };
-    // println!("{:#?}", expr);
+    println!("{:#?}", expr);
     let module = compile(expr).unwrap();
     println!("{:#?}", module);
     let mut runtime = Runtime::new();

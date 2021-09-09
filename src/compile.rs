@@ -205,7 +205,23 @@ impl Compiler {
                 self.emit(ByteCode::Op(OpCode::LoadTable));
                 Ok(())
             },
-            Expr::DotExpr { loc, lhs, rhs } => todo!(),
+            Expr::DotExpr { loc:_, lhs, rhs } => {
+                match &**rhs {
+                    Expr::Identifier { token }=>{
+                        let name = match token{
+                            Token::Identifier{value,..}=>{
+                                value
+                            }
+                            _=>unreachable!()
+                        };
+                        self.push_string(name);
+                    }
+                    _=>unreachable!()
+                }
+                self.compile_expr(lhs)?;
+                self.emit(ByteCode::Op(OpCode::LoadTable));
+                Ok(())
+            },
             Expr::CallExpr { callee, args } => {
                 for arg in args {
                     self.compile_expr(&**arg)?;
@@ -251,15 +267,15 @@ impl Compiler {
                                 Token::Identifier { value, .. } => value,
                                 _ => unreachable!(),
                             };
-                            self.push_string(name);
                             self.compile_expr(v)?;
+                            self.push_string(name);                            
                         }
-                        TableField::ArrayEntry(x) => {
-                            self.push_number(array_entry_cnt as f64);
+                        TableField::ArrayEntry(x) => {                            
                             self.compile_expr(x)?;
+                            self.push_number(array_entry_cnt as f64);
                             array_entry_cnt += 1;
                         }
-                    }
+                    };
                     self.emit(ByteCode::Op(OpCode::RotBCA));
                     self.emit(ByteCode::Op(OpCode::StoreTable));
                 }

@@ -98,6 +98,9 @@ impl Runtime {
         self.add_function("print".into(), |ctx| {
             for i in 0..ctx.get_arg_count() {
                 let arg = ctx.arg(i);
+                if i > 0 {
+                    print!(" ");
+                }
                 print!("{}", arg.print());
             }
             print!("\n");
