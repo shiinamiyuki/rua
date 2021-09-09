@@ -1,11 +1,13 @@
 use std::{
     cell::{RefCell, RefMut},
+    collections::HashMap,
+    iter::FromIterator,
     rc::Rc,
 };
 
 use crate::{
     bytecode::{u32_from_3xu8, ByteCode, ByteCodeModule, OpCode},
-    closure::{Callable, Closure},
+    closure::{Callable, Closure, UpValue},
     gc::Gc,
     runtime::{ErrorKind, RuntimeError},
     state::{CallContext, Frame, State},
@@ -291,7 +293,12 @@ impl Instance {
                             n_args: proto.n_args,
                             entry: entry as usize,
                             module: unsafe { (*frame.closure).data.module.clone() },
-                            upvalues: RefCell::new(vec![Value::nil(); proto.n_upvalues]),
+                            upvalues: self.gc.manage(UpValue {
+                                values: RefCell::new(
+                                    proto.upvalues.iter().map(|i| (*i, Value::nil())).collect(),
+                                ),
+                                parent: std::ptr::null(),
+                            }),
                         });
                         eval_stack.push(closure);
                         *ip += 2;
@@ -315,7 +322,10 @@ impl Instance {
                 n_args: 0,
                 // n_locals: 0,
                 module: Rc::new(module),
-                upvalues: RefCell::new(vec![]),
+                upvalues: self.gc.manage(UpValue {
+                    values: RefCell::new(HashMap::new()),
+                    parent: std::ptr::null(),
+                }),
             },
         });
         {

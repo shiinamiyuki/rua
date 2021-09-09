@@ -30,6 +30,7 @@ pub struct CompileError {
 }
 #[derive(Clone, Copy, Debug)]
 struct VarInfo {
+    func_scope: usize,
     location: u32,
     on_stack: bool, // is false, then on upvalue
 }
@@ -69,8 +70,17 @@ impl SymbolTable {
         }
     }
 }
+enum FunctionLocation {
+    Local,
+    Global,
+    Stack,
+}
+struct FuncInfo {
+    upvalues: Vec<u32>,
+}
 struct Compiler {
     symbols: SymbolTable,
+    funcs: Vec<FuncInfo>,
     module: ByteCodeModule,
     str_map: HashMap<String, usize>,
 }
@@ -141,8 +151,15 @@ impl Compiler {
                     Token::Identifier { value, .. } => value,
                     _ => unreachable!(),
                 };
-                if let Some(info) = self.symbols.get(name) {
-                    self.emit(ByteCode::Op3U8(OpCode::LoadLocal, get_3xu8(info.location)));
+                if let Some(info) = self.symbols.get(name).map(|x| *x) {
+                    if info.on_stack {
+                        self.emit(ByteCode::Op3U8(OpCode::LoadLocal, get_3xu8(info.location)));
+                    } else {
+                        self.emit(ByteCode::Op3U8(
+                            OpCode::LoadUpvalue,
+                            get_3xu8(info.location),
+                        ));
+                    }
                 } else {
                     self.push_string(name);
                     self.emit(ByteCode::Op(OpCode::LoadGlobal));
@@ -234,7 +251,9 @@ impl Compiler {
                 method,
                 args,
             } => todo!(),
-            Expr::FunctionExpr { loc, args, body } => todo!(),
+            Expr::FunctionExpr { loc, args, body } => {
+                self.compile_function(None, args, body, FunctionLocation::Stack)
+            }
             Expr::Table { loc: _, fields } => {
                 let n_arrays = fields
                     .iter()
@@ -282,6 +301,17 @@ impl Compiler {
             }
         }
     }
+    fn add_var(&mut self, var: String) {
+        self.symbols.set(
+            var,
+            VarInfo {
+                on_stack: true,
+                func_scope: self.funcs.len(),
+                location: self.symbols.n_locals as u32,
+            },
+        );
+        self.symbols.n_locals += 1;
+    }
     fn compile_stmt(&mut self, block: &Stmt) -> Result<(), CompileError> {
         match &*block {
             Stmt::Return { loc: _, expr } => {
@@ -320,14 +350,7 @@ impl Compiler {
                                     _ => unreachable!(),
                                 };
                                 if let None = self.symbols.get(name) {
-                                    self.symbols.set(
-                                        name.clone(),
-                                        VarInfo {
-                                            on_stack: true,
-                                            location: self.symbols.n_locals as u32,
-                                        },
-                                    );
-                                    self.symbols.n_locals += 1;
+                                    self.add_var(name.clone());
                                 }
                             }
                             _ => unreachable!(),
@@ -352,14 +375,7 @@ impl Compiler {
                                     ),
                                 });
                             }
-                            self.symbols.set(
-                                name.clone(),
-                                VarInfo {
-                                    on_stack: true,
-                                    location: self.symbols.n_locals as u32,
-                                },
-                            );
-                            self.symbols.n_locals += 1;
+                            self.add_var(name.clone());
                         }
                         Ok(())
                     }
@@ -371,7 +387,20 @@ impl Compiler {
                 },
                 _ => unreachable!(),
             },
-            Stmt::LocalFunction { name, args, body } => todo!(),
+            Stmt::LocalFunction { name, args, body } => {
+                match name {
+                    Token::Identifier { value, .. } => {
+                        self.add_var(value.clone());
+                    }
+                    _ => unreachable!(),
+                }
+                self.compile_function(
+                    Some(&FunctionName::Function { name: name.clone() }),
+                    args,
+                    body,
+                    FunctionLocation::Local,
+                )
+            }
             Stmt::If {
                 loc,
                 cond,
@@ -449,56 +478,84 @@ impl Compiler {
                 Ok(())
             }
             Stmt::Function { name, args, body } => {
-                self.emit(ByteCode::Op(OpCode::Jump));
-                let jmp = self.emit(ByteCode::Address([0; 4]));
-                let entry = self.module.code.len() as u32;
-                self.enter_scope(true);
-                for (i, arg) in args.iter().enumerate() {
-                    let name = match arg {
-                        Token::Identifier { value, .. } => value,
-                        _ => unreachable!(),
-                    };
-                    self.symbols.set(
-                        name.clone(),
-                        VarInfo {
-                            location: i as u32,
-                            on_stack: true,
-                        },
-                    );
-                }
-                self.symbols.n_locals = args.len();
-                self.compile_stmt(body)?;
-                self.emit(ByteCode::Op(OpCode::LoadNil));
-                self.emit(ByteCode::Op(OpCode::Return));
-                self.leave_scope();
-                let proto = ClosurePrototype {
-                    n_args: args.len(),
-                    n_upvalues: 0,
-                    entry: entry as usize,
-                };
-                let proto_idx = self.module.protypes.len() as u32;
-                self.module.protypes.push(proto);
-                let end =
-                    self.emit(ByteCode::Op3U8(OpCode::NewClosure, get_3xu8(proto_idx))) as u32;
-                self.emit(ByteCode::Address(entry.to_le_bytes()));
-                self.module.code[jmp] = ByteCode::Address(end.to_le_bytes());
-                match name {
-                    FunctionName::Method {
-                        access_chain: _,
-                        method: _,
-                    } => todo!(),
-                    FunctionName::Function { name } => match name {
-                        Token::Identifier { value, .. } => {
-                            self.push_string(value);
-                            self.emit(ByteCode::Op(OpCode::StoreGlobal));
-                        }
-                        _ => unreachable!(),
-                    },
-                }
-
-                Ok(())
+                self.compile_function(Some(name), args, body, FunctionLocation::Global)
             }
         }
+    }
+
+    fn compile_function(
+        &mut self,
+        name: Option<&FunctionName>,
+        args: &Vec<Token>,
+        body: &Stmt,
+        location: FunctionLocation,
+    ) -> Result<(), CompileError> {
+        self.emit(ByteCode::Op(OpCode::Jump));
+        let jmp = self.emit(ByteCode::Address([0; 4]));
+        let entry = self.module.code.len() as u32;
+        self.enter_scope(true);
+        for (i, arg) in args.iter().enumerate() {
+            let name = match arg {
+                Token::Identifier { value, .. } => value,
+                _ => unreachable!(),
+            };
+            self.symbols.set(
+                name.clone(),
+                VarInfo {
+                    func_scope: self.funcs.len(),
+                    location: i as u32,
+                    on_stack: true,
+                },
+            );
+        }
+        self.symbols.n_locals = args.len();
+        self.compile_stmt(body)?;
+        self.emit(ByteCode::Op(OpCode::LoadNil));
+        self.emit(ByteCode::Op(OpCode::Return));
+        self.leave_scope();
+        let proto = ClosurePrototype {
+            n_args: args.len(),
+            upvalues: vec![],
+            entry: entry as usize,
+        };
+        let proto_idx = self.module.protypes.len() as u32;
+        self.module.protypes.push(proto);
+        let end = self.emit(ByteCode::Op3U8(OpCode::NewClosure, get_3xu8(proto_idx))) as u32;
+        self.emit(ByteCode::Address(entry.to_le_bytes()));
+        self.module.code[jmp] = ByteCode::Address(end.to_le_bytes());
+        match location {
+            FunctionLocation::Global => match name.unwrap() {
+                FunctionName::Method {
+                    access_chain: _,
+                    method: _,
+                } => todo!(),
+                FunctionName::Function { name } => match name {
+                    Token::Identifier { value, .. } => {
+                        self.push_string(value);
+                        self.emit(ByteCode::Op(OpCode::StoreGlobal));
+                    }
+                    _ => unreachable!(),
+                },
+            },
+            FunctionLocation::Local => match name.unwrap() {
+                FunctionName::Function {
+                    name: Token::Identifier { value, .. },
+                } => {
+                    let info = *self.symbols.get(value).unwrap();
+                    if info.on_stack {
+                        self.emit(ByteCode::Op3U8(OpCode::StoreLocal, get_3xu8(info.location)));
+                    } else {
+                        self.emit(ByteCode::Op3U8(
+                            OpCode::StoreUpvalue,
+                            get_3xu8(info.location),
+                        ));
+                    }
+                }
+                _ => unreachable!(),
+            },
+            FunctionLocation::Stack => {}
+        };
+        Ok(())
     }
 
     fn emit_store(&mut self, expr: &Expr) -> Result<(), CompileError> {
@@ -530,7 +587,7 @@ impl Compiler {
             Expr::DotExpr { loc, lhs, rhs } => todo!(),
             // Expr::CallExpr { callee, args } => todo!(),
             // Expr::MethodCallExpr { callee, method, args } => todo!(),
-            // Expr::FunctionExpr { loc, args, body } => todo!(),
+            // Expr::FunctionExpr { loc, args, body } => ,
             // Expr::Table { loc, fields } => todo!(),
             _ => Err(CompileError {
                 loc: expr.loc().clone(),
@@ -564,6 +621,7 @@ impl Compiler {
         let old = std::mem::replace(&mut self.symbols, new);
         let old = Box::into_raw(Box::new(old));
         self.symbols.parent = old;
+        self.funcs.push(FuncInfo { upvalues: vec![] });
     }
     fn leave_scope(&mut self) {
         unsafe {
@@ -576,6 +634,7 @@ impl Compiler {
 
 pub fn compile(block: Rc<Stmt>) -> Result<ByteCodeModule, CompileError> {
     let mut compiler = Compiler {
+        funcs: vec![],
         symbols: SymbolTable {
             vars: HashMap::new(),
             parent: std::ptr::null_mut(),

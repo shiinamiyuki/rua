@@ -36,6 +36,12 @@ impl Gc {
             p
         }
     }
+    pub fn trace_ptr<T:Traceable>(&self, obj:*const T){
+        todo!()
+    }
+    pub fn trace<T:Traceable>(&self, obj:&T){
+        todo!()
+    }
     pub fn new() -> Self {
         Self {
             inner: RefCell::new(GcInner { head: None }),

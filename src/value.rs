@@ -125,7 +125,19 @@ pub struct Value {
     pub data: ValueData,
     pub metatable: *const ManagedCell<Table>,
 }
-
+impl Traceable for Value {
+    fn trace(&self, gc: &Gc) {
+        match self.data {
+            ValueData::Table(x) => gc.trace_ptr(x),
+            ValueData::String(x) => gc.trace_ptr(x),
+            ValueData::Closure(x) => gc.trace_ptr(x),
+            ValueData::Callable(x) => gc.trace_ptr(x),
+            ValueData::Tuple(x) => gc.trace_ptr(x),
+            _ => {}
+        }
+        gc.trace_ptr(self.metatable);
+    }
+}
 impl Value {
     pub fn is_nil(&self) -> bool {
         match self.data {

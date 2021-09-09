@@ -6,7 +6,10 @@ use std::{
     hash::{BuildHasher, Hash, Hasher},
 };
 
-use crate::value::{Value, ValueData};
+use crate::{
+    gc::Traceable,
+    value::{Value, ValueData},
+};
 
 #[derive(Clone, Copy)]
 struct Entry {
@@ -37,8 +40,6 @@ struct LinkedHashMap {
     // tail:usize,
 }
 
-
-
 mod test {
     #[test]
     fn test_log() {
@@ -48,8 +49,30 @@ mod test {
         }
     }
 }
+struct LinkedHashMapIter<'a> {
+    map: &'a LinkedHashMap,
+    i: usize,
+}
+impl<'a> Iterator for LinkedHashMapIter<'a> {
+    type Item = (Value, Value);
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.i == usize::MAX {
+            None
+        } else {
+            let e = self.map.table[self.i];
+            self.i = e.next;
+            Some((e.key, e.value))
+        }
+    }
+}
 
 impl LinkedHashMap {
+    pub fn iter<'a>(&'a self) -> LinkedHashMapIter<'a> {
+        LinkedHashMapIter::<'a> {
+            map: self,
+            i: self.head,
+        }
+    }
     pub fn new() -> Self {
         Self {
             table: vec![],
@@ -61,7 +84,7 @@ impl LinkedHashMap {
             during_rehash: false,
         }
     }
-    pub fn with_len(len:usize) -> Self {
+    pub fn with_len(len: usize) -> Self {
         let mut m = Self::new();
         m.reset(len);
         m
@@ -184,9 +207,9 @@ impl Table {
             map: LinkedHashMap::new(),
         }
     }
-    pub fn new_with(array_part_len:usize, hash_part_len:usize) -> Self {
+    pub fn new_with(array_part_len: usize, hash_part_len: usize) -> Self {
         Self {
-            array: vec![Value::nil();array_part_len],
+            array: vec![Value::nil(); array_part_len],
             map: LinkedHashMap::with_len(hash_part_len),
         }
     }
@@ -217,5 +240,17 @@ impl Table {
             _ => {}
         }
         self.map.insert(key, value);
+    }
+}
+
+impl Traceable for Table {
+    fn trace(&self, gc: &crate::gc::Gc) {
+        for i in &self.array {
+            gc.trace(i);
+        }
+        for (k, v) in self.map.iter() {
+            gc.trace(&k);
+            gc.trace(&v);
+        }
     }
 }
