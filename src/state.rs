@@ -19,6 +19,9 @@ pub(crate) struct Frame {
     pub(crate) n_args: usize,
 }
 impl Frame {
+    pub(crate) fn get_ip(closure: *const Managed<Closure>) -> usize {
+        unsafe { closure.as_ref().map_or(0, |c| c.data.entry) }
+    }
     pub(crate) fn new(
         frame_bottom: usize,
         n_args: usize,
@@ -28,7 +31,7 @@ impl Frame {
             locals: [Value::default(); MAX_LOCALS],
             frame_bottom,
             closure,
-            ip: 0,
+            ip: Self::get_ip(closure),
             n_args,
         }
     }
@@ -177,6 +180,13 @@ impl State {
         let t = self.gc.manage(ManagedCell::new(RefCell::new(t)));
         Value {
             data: ValueData::Table(t),
+            metatable: std::ptr::null(),
+        }
+    }
+    pub fn create_closure(&self, c: Closure) -> Value {
+        let c = self.gc.manage(Managed::new(c));
+        Value {
+            data: ValueData::Closure(c),
             metatable: std::ptr::null(),
         }
     }

@@ -48,6 +48,14 @@ impl Instance {
                 }};
             }
             let instruction = module.code[*ip];
+            #[cfg(debug_assertions)]
+            {
+                if let Ok(s) = std::env::var("PRINT_INST") {
+                    if s == "1" {
+                        println!("{} {:?}", *ip, instruction);
+                    }
+                }
+            }
             let mut ip_modified = false;
             match instruction {
                 ByteCode::Op(op) => match op {
@@ -190,6 +198,34 @@ impl Instance {
                         let idx = operands[0];
                         frame.locals[idx as usize] = eval_stack.pop().unwrap();
                     }
+                    OpCode::TailCall => {
+                        let n_args = operands[0] as usize;
+                        let func = eval_stack.pop().unwrap();
+                        match func.data {
+                            ValueData::Closure(closure) => {
+                                ip_modified = true;
+                                *ip = Frame::get_ip(closure);
+                                for i in 0..n_args {
+                                    frame.locals[i] = eval_stack[eval_stack.len() - n_args + i];
+                                }
+                                frame.n_args = n_args;
+                                let len = eval_stack.len();
+                                eval_stack.resize(len - n_args, Value::nil());
+                            }
+                            ValueData::Callable(callable) => {
+                                *ip += 1;
+                                let mut frame =
+                                    Frame::new(eval_stack.len() - n_args, n_args, std::ptr::null());
+                                for i in 0..n_args {
+                                    frame.locals[i] = eval_stack[eval_stack.len() - n_args + i];
+                                }
+                                let len = eval_stack.len();
+                                eval_stack.resize(len - n_args, Value::nil());
+                                return Ok(Continue::CallExt(callable, frame));
+                            }
+                            _ => unreachable!(),
+                        }
+                    }
                     OpCode::Call => {
                         let n_args = operands[0] as usize;
                         let func = eval_stack.pop().unwrap();
@@ -243,6 +279,23 @@ impl Instance {
                             }
                         }
                     }
+                    OpCode::NewClosure => {
+                        ip_modified = true;
+                        let proto_idx = u32_from_3xu8(operands);
+                        let proto = &module.protypes[proto_idx as usize];
+                        let entry = match module.code[*ip + 1] {
+                            ByteCode::Address(bytes) => u32::from_le_bytes(bytes),
+                            _ => unreachable!(),
+                        };
+                        let closure = state.create_closure(Closure {
+                            n_args: proto.n_args,
+                            entry: entry as usize,
+                            module: unsafe { (*frame.closure).data.module.clone() },
+                            upvalues: RefCell::new(vec![Value::nil(); proto.n_upvalues]),
+                        });
+                        eval_stack.push(closure);
+                        *ip += 2;
+                    }
                     _ => unreachable!(),
                 },
                 _ => unreachable!(),
@@ -259,7 +312,8 @@ impl Instance {
         let closure = self.gc.manage(Managed::<Closure> {
             data: Closure {
                 entry: 0,
-                n_locals: 0,
+                n_args: 0,
+                // n_locals: 0,
                 module: Rc::new(module),
                 upvalues: RefCell::new(vec![]),
             },

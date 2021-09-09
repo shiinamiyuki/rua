@@ -1,3 +1,5 @@
+use crate::closure::ClosurePrototype;
+
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OpCode {
@@ -38,6 +40,7 @@ pub enum OpCode {
 
     }*/
     NewTable, //NewTable array len, hash len
+    NewClosure,
     LoadStr,
     LoadLocal, // PUSH  local[i]
     StoreLocal, // local[i] = TOS;POP
@@ -91,6 +94,7 @@ pub enum ByteCode {
 }
 #[derive(Clone, Debug)]
 pub struct ByteCodeModule {
+    pub(crate) protypes:Vec<ClosurePrototype>,
     pub(crate) string_pool:Vec<String>,
     pub(crate) code: Vec<ByteCode>,
 }

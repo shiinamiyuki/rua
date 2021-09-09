@@ -8,8 +8,9 @@ use std::{
 
 use crate::{
     bytecode::*,
+    closure::ClosurePrototype,
     log_2,
-    parse::{Expr, SourceLocation, Stmt, TableField, Token},
+    parse::{Expr, FunctionName, SourceLocation, Stmt, TableField, Token},
     state::MAX_LOCALS,
 };
 
@@ -199,29 +200,27 @@ impl Compiler {
                 Ok(())
             }
             Expr::UnaryExpr { op, arg } => todo!(),
-            Expr::IndexExpr { loc:_, lhs, rhs } => {
+            Expr::IndexExpr { loc: _, lhs, rhs } => {
                 self.compile_expr(rhs)?;
                 self.compile_expr(lhs)?;
                 self.emit(ByteCode::Op(OpCode::LoadTable));
                 Ok(())
-            },
-            Expr::DotExpr { loc:_, lhs, rhs } => {
+            }
+            Expr::DotExpr { loc: _, lhs, rhs } => {
                 match &**rhs {
-                    Expr::Identifier { token }=>{
-                        let name = match token{
-                            Token::Identifier{value,..}=>{
-                                value
-                            }
-                            _=>unreachable!()
+                    Expr::Identifier { token } => {
+                        let name = match token {
+                            Token::Identifier { value, .. } => value,
+                            _ => unreachable!(),
                         };
                         self.push_string(name);
                     }
-                    _=>unreachable!()
+                    _ => unreachable!(),
                 }
                 self.compile_expr(lhs)?;
                 self.emit(ByteCode::Op(OpCode::LoadTable));
                 Ok(())
-            },
+            }
             Expr::CallExpr { callee, args } => {
                 for arg in args {
                     self.compile_expr(&**arg)?;
@@ -268,9 +267,9 @@ impl Compiler {
                                 _ => unreachable!(),
                             };
                             self.compile_expr(v)?;
-                            self.push_string(name);                            
+                            self.push_string(name);
                         }
-                        TableField::ArrayEntry(x) => {                            
+                        TableField::ArrayEntry(x) => {
                             self.compile_expr(x)?;
                             self.push_number(array_entry_cnt as f64);
                             array_entry_cnt += 1;
@@ -285,16 +284,31 @@ impl Compiler {
     }
     fn compile_stmt(&mut self, block: &Stmt) -> Result<(), CompileError> {
         match &*block {
-            Stmt::Return { loc, expr } => {
+            Stmt::Return { loc: _, expr } => {
                 if let Some(expr) = expr {
                     self.compile_expr(&*expr)?;
+                    match &**expr {
+                        Expr::CallExpr { .. } => {
+                            let last = *self.module.code.last().unwrap();
+                            match last {
+                                ByteCode::Op3U8(OpCode::Call, operands) => {
+                                    *self.module.code.last_mut().unwrap() =
+                                        ByteCode::Op3U8(OpCode::TailCall, operands);
+                                    self.emit(ByteCode::Op(OpCode::Return));
+                                    return Ok(());
+                                }
+                                _ => panic!("expected call instruction"),
+                            }
+                        }
+                        _ => {}
+                    }
                 } else {
                     self.emit(ByteCode::Op(OpCode::LoadNil));
                 }
                 self.emit(ByteCode::Op(OpCode::Return));
                 Ok(())
             }
-            Stmt::LocalVar { loc, vars } => match &**vars {
+            Stmt::LocalVar { loc: _, vars } => match &**vars {
                 Stmt::Assign { lhs, rhs, .. } => {
                     assert!(lhs.len() == 1 && rhs.len() == 1);
                     self.compile_expr(&*rhs[0])?;
@@ -434,7 +448,56 @@ impl Compiler {
                 self.leave_scope();
                 Ok(())
             }
-            Stmt::Function { name, args, body } => todo!(),
+            Stmt::Function { name, args, body } => {
+                self.emit(ByteCode::Op(OpCode::Jump));
+                let jmp = self.emit(ByteCode::Address([0; 4]));
+                let entry = self.module.code.len() as u32;
+                self.enter_scope(true);
+                for (i, arg) in args.iter().enumerate() {
+                    let name = match arg {
+                        Token::Identifier { value, .. } => value,
+                        _ => unreachable!(),
+                    };
+                    self.symbols.set(
+                        name.clone(),
+                        VarInfo {
+                            location: i as u32,
+                            on_stack: true,
+                        },
+                    );
+                }
+                self.symbols.n_locals = args.len();
+                self.compile_stmt(body)?;
+                self.emit(ByteCode::Op(OpCode::LoadNil));
+                self.emit(ByteCode::Op(OpCode::Return));
+                self.leave_scope();
+                let proto = ClosurePrototype {
+                    n_args: args.len(),
+                    n_upvalues: 0,
+                    entry: entry as usize,
+                };
+                let proto_idx = self.module.protypes.len() as u32;
+                self.module.protypes.push(proto);
+                let end =
+                    self.emit(ByteCode::Op3U8(OpCode::NewClosure, get_3xu8(proto_idx))) as u32;
+                self.emit(ByteCode::Address(entry.to_le_bytes()));
+                self.module.code[jmp] = ByteCode::Address(end.to_le_bytes());
+                match name {
+                    FunctionName::Method {
+                        access_chain: _,
+                        method: _,
+                    } => todo!(),
+                    FunctionName::Function { name } => match name {
+                        Token::Identifier { value, .. } => {
+                            self.push_string(value);
+                            self.emit(ByteCode::Op(OpCode::StoreGlobal));
+                        }
+                        _ => unreachable!(),
+                    },
+                }
+
+                Ok(())
+            }
         }
     }
 
@@ -481,6 +544,7 @@ impl Compiler {
         let module = std::mem::replace(
             &mut self.module,
             ByteCodeModule {
+                protypes: vec![],
                 code: vec![],
                 string_pool: vec![],
             },
@@ -518,6 +582,7 @@ pub fn compile(block: Rc<Stmt>) -> Result<ByteCodeModule, CompileError> {
             n_locals: 0,
         },
         module: ByteCodeModule {
+            protypes: vec![],
             code: vec![],
             string_pool: vec![],
         },

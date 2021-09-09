@@ -544,7 +544,7 @@ impl Tokenizer {
     fn run(&mut self) -> Result<Vec<Token>, TokenizeError> {
         let mut tokens = vec![];
         self.skip_space();
-        while self.peek().is_some() {            
+        while self.peek().is_some() {
             tokens.push(self.next_token()?);
             self.skip_space();
         }
@@ -819,13 +819,50 @@ impl Parser {
                     }
                 }
                 self.advance(1);
-                let args = self.parse_expr_list(false)?;
+                let args: Vec<Rc<Expr>> = {
+                    if self.has("{") {
+                        vec![self.parse_table()?]
+                    } else if self.has("(") {
+                        self.parse_expr_list(false)?
+                    } else {
+                        match self.peek() {
+                            Token::String { .. } => {
+                                vec![self.parse_atom()?]
+                            }
+                            _ => {
+                                return Err(self.error(
+                                    ErrorKind::SyntaxError,
+                                    "expected object:method(args...) or object:method'arg' or  object:method{args..} ",
+                                    method.loc().clone(),
+                                ));
+                            }
+                        }
+                    }
+                };
                 expr = Rc::new(Expr::MethodCallExpr {
                     callee,
                     method,
                     args,
                 });
+            } else if self.has("{") {
+                let callee = expr.clone();
+                let args = self.parse_table()?;
+                expr = Rc::new(Expr::CallExpr {
+                    callee,
+                    args: vec![args],
+                });
             } else {
+                match self.peek() {
+                    Token::String { .. } => {
+                        let callee = expr.clone();
+                        let args = self.parse_atom()?;
+                        expr = Rc::new(Expr::CallExpr {
+                            callee,
+                            args: vec![args],
+                        });
+                    }
+                    _ => {}
+                }
                 break;
             }
         }
@@ -1103,10 +1140,13 @@ impl Parser {
         let loc = self.peek().loc().clone();
         self.advance(1);
         if self.has("end") {
-            Ok(Rc::new(Stmt::Return { loc, expr:None }))
+            Ok(Rc::new(Stmt::Return { loc, expr: None }))
         } else {
             let expr = self.parse_expr()?;
-            Ok(Rc::new(Stmt::Return { loc, expr:Some(expr) }))
+            Ok(Rc::new(Stmt::Return {
+                loc,
+                expr: Some(expr),
+            }))
         }
     }
     fn parse_for_stmt(&mut self) -> Result<Rc<Stmt>, ParseError> {

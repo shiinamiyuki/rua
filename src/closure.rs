@@ -23,9 +23,17 @@ impl Callable for NativeFunction {
         (self.func)(ctx)
     }
 }
+#[derive(Clone, Copy,Debug, PartialEq, Eq, Hash)]
+pub struct ClosurePrototype {
+    pub(crate) entry: usize,
+    pub(crate) n_args:usize,
+    // pub(crate) n_locals: usize,
+    pub(crate) n_upvalues:usize,
+}
 pub struct Closure {
     pub(crate) entry: usize,
-    pub(crate) n_locals: usize,
+    pub(crate) n_args:usize,
+    // pub(crate) n_locals: usize,
     pub(crate) module: Rc<ByteCodeModule>,
     pub(crate) upvalues: RefCell<Vec<Value>>,
 }
