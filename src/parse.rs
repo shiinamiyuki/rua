@@ -711,27 +711,43 @@ impl Parser {
         Ok(args)
     }
     fn parse_primary_expr(&mut self) -> Result<Rc<Expr>, ParseError> {
-        if self.has("("){
+        if self.has("(") {
             self.advance(1);
             let e = self.parse_expr()?;
-            if !self.has(")"){
-                return Err(self.error(ErrorKind::SyntaxError, "expected ')'", loc.clone()));
+            let loc = self.peek().loc().clone();
+            if !self.has(")") {
+                return Err(self.error(ErrorKind::SyntaxError, "expected ')'", loc));
             }
             self.advance(1);
             Ok(e)
-        }else{
-
+        } else {
+            let token = self.peek().clone();
+            match token {
+                Token::Identifier { .. } => {
+                    self.advance(1);
+                    Ok(Rc::new(Expr::Identifier {
+                        token: token.clone(),
+                    }))
+                }
+                _ => {
+                    return Err(self.error(
+                        ErrorKind::SyntaxError,
+                        "expected NAME in primary expression",
+                        token.loc().clone(),
+                    ));
+                }
+            }
         }
     }
     // binary = prefix op prefix
     // prefix = ('-' | '#' | '~') (posftix | funcdef | literal)
-    // expr = atom | binary 
+    // expr = binary
     // prim = name | '(' expr ')'
     // postfix = prim (('[' expr ']') | func_args)*
-    // 
+    //
 
     fn parse_postfix_expr(&mut self) -> Result<Rc<Expr>, ParseError> {
-        let prefix = self.parse_prefix_expr()?;
+        let prefix = self.parse_primary_expr()?;
         let mut expr = prefix;
         loop {
             if self.has(".") {
@@ -893,14 +909,6 @@ impl Parser {
     }
     fn parse_atom(&mut self) -> Result<Rc<Expr>, ParseError> {
         let token = self.peek();
-        if token.is_eof() {
-            let loc = self.eof_loc();
-            return Err(self.error(
-                ErrorKind::UnexpectedEOF,
-                "unexpected EOF when parsing atom '('",
-                loc,
-            ));
-        }
         let token = token.clone();
         match token {
             Token::Number { .. } => {
@@ -915,12 +923,12 @@ impl Parser {
                     token: token.clone(),
                 }))
             }
-            Token::Identifier { .. } => {
-                self.advance(1);
-                Ok(Rc::new(Expr::Identifier {
-                    token: token.clone(),
-                }))
-            }
+            // Token::Identifier { .. } => {
+            //     self.advance(1);
+            //     Ok(Rc::new(Expr::Identifier {
+            //         token: token.clone(),
+            //     }))
+            // }
             Token::Keyword { ref value, .. }
                 if value == "nil" || value == "true" || value == "false" =>
             {
@@ -930,18 +938,8 @@ impl Parser {
                 }))
             }
             Token::Symbol { value, .. } if value == "{" => self.parse_table(),
-            Token::Symbol { value, loc } if value == "(" => {
-                self.advance(1);
-                let expr = if self.has("function") {
-                    self.parse_function_expr()?
-                } else {
-                    self.parse_expr()?
-                };
-
-                if !self.has(")") {
-                    return Err(self.error(ErrorKind::SyntaxError, "expected ')'", loc.clone()));
-                }
-                self.advance(1);
+            Token::Keyword { value, loc:_ } if value == "function" => {
+                let expr = self.parse_function_expr()?;
                 Ok(expr)
             }
             Token::EOF { loc } => Err(self.error(
@@ -949,14 +947,17 @@ impl Parser {
                 "unexpected EOF when parsing atom",
                 loc.clone(),
             )),
-            t @ _ => Err(self.error(
-                ErrorKind::UnexpectedEOF,
-                &format!(
-                    "expected literals or identifiers when parsing atom but found {:?}",
-                    t
-                ),
-                t.loc().clone(),
-            )),
+            _=>{
+                self.parse_postfix_expr()
+            }
+            // t @ _ => Err(self.error(
+            //     ErrorKind::UnexpectedEOF,
+            //     &format!(
+            //         "expected literals or identifiers when parsing atom but found {:?}",
+            //         t
+            //     ),
+            //     t.loc().clone(),
+            // )),
         }
     }
     fn parse_pow_expr(&mut self) -> Result<Rc<Expr>, ParseError> {
@@ -996,7 +997,7 @@ impl Parser {
         )
     }
     fn parse_prefix_expr(&mut self) -> Result<Rc<Expr>, ParseError> {
-        if self.has("not") || self.has("-") || self.has("~")|| self.has("#") {
+        if self.has("not") || self.has("-") || self.has("~") || self.has("#") {
             let op = self.peek().clone();
             self.advance(1);
             let expr = self.parse_atom()?;
