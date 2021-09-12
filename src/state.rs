@@ -1,12 +1,4 @@
-use crate::{
-    bytecode::ByteCode,
-    closure::Closure,
-    gc::Gc,
-    runtime::{ErrorKind, RuntimeError},
-    table::Table,
-    value::{Managed, ManagedCell, Tuple, TupleUnpack, Value, ValueData},
-    vm::Instance,
-};
+use crate::{Stack, bytecode::ByteCode, closure::Closure, gc::Gc, runtime::{ErrorKind, RuntimeError}, table::Table, value::{Managed, ManagedCell, Tuple, TupleUnpack, Value, ValueData}, vm::Instance};
 use std::{cell::RefCell, cmp::Ordering, rc::Rc};
 
 pub const MAX_LOCALS: usize = 256;
@@ -43,7 +35,7 @@ A runtime has multiple instances
 pub struct State {
     pub(crate) gc: Rc<Gc>,
     pub(crate) globals: Value,
-    pub(crate) frames: RefCell<Vec<Frame>>,
+    pub(crate) frames: RefCell<Stack<Frame>>,
     pub(crate) eval_stack: RefCell<Vec<Value>>,
 }
 

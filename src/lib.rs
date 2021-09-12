@@ -20,3 +20,68 @@ pub(crate) fn log_2(x: usize) -> Option<u32> {
         Some(num_bits::<usize>() as u32 - x.leading_zeros() - 1)
     }
 }
+
+struct StackNode<T> {
+    data: T,
+    prev: *mut StackNode<T>,
+}
+pub(crate) struct Stack<T> {
+    last: *mut StackNode<T>,
+}
+impl<T> Stack<T> {
+    pub(crate) fn new() -> Self {
+        Self {
+            last: std::ptr::null_mut(),
+        }
+    }
+    pub(crate) fn push(&mut self, value: T) {
+        let node = Box::into_raw(Box::new(StackNode {
+            data: value,
+            prev: self.last,
+        }));
+        self.last = node;
+    }
+    pub(crate) fn last<'a>(&'a self) -> Option<&'a T> {
+        unsafe {
+            if self.last.is_null() {
+                None
+            } else {
+                Some(&(*self.last).data)
+            }
+        }
+    }
+    pub(crate) fn last_mut<'a>(&'a mut self) -> Option<&'a mut T> {
+        unsafe {
+            if self.last.is_null() {
+                None
+            } else {
+                Some(&mut (*self.last).data)
+            }
+        }
+    }
+    pub(crate) fn pop(&mut self) -> Option<T> {
+        unsafe {
+            if self.last.is_null() {
+                None
+            } else {
+                let p = self.last;
+                let ret = (*self.last).data;
+                self.last = (*self.last).prev;
+                Box::from_raw(p);
+                Some(ret)
+            }
+        }
+    }
+}
+impl<T> Drop for Stack<T> {
+    fn drop(&mut self) {
+        unsafe {
+            let mut p = self.last;
+            while p.is_null() {
+                let prev = (*p).prev;
+                Box::from_raw(p);
+                p = prev;
+            }
+        }
+    }
+}

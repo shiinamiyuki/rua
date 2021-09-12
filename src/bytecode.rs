@@ -50,7 +50,6 @@ pub enum OpCode {
     StoreTable, // TOS = value, key, table
     LoadUpvalue, // TOS=upvalue, push upvalue[i]
     StoreUpvalue,// TOS~1=upvalue, TOS=value upvalue[i] = value
-    MoveToUpvalue,
 
     Scatter, // Scatter{n, table_idx} local[scatter_table[table_idx]..] = stack[TOP-n-1..TOP-n]
     Gather,

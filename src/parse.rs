@@ -950,14 +950,6 @@ impl Parser {
             _=>{
                 self.parse_postfix_expr()
             }
-            // t @ _ => Err(self.error(
-            //     ErrorKind::UnexpectedEOF,
-            //     &format!(
-            //         "expected literals or identifiers when parsing atom but found {:?}",
-            //         t
-            //     ),
-            //     t.loc().clone(),
-            // )),
         }
     }
     fn parse_pow_expr(&mut self) -> Result<Rc<Expr>, ParseError> {

@@ -4,14 +4,7 @@ use std::{
     rc::Rc,
 };
 
-use crate::{
-    closure::{Callable, NativeFunction},
-    gc::{Gc, Traceable},
-    state::{CallContext, State},
-    table::Table,
-    value::{Managed, ManagedCell, Value, ValueData},
-    vm::Instance,
-};
+use crate::{Stack, closure::{Callable, NativeFunction}, gc::{Gc, Traceable}, state::{CallContext, State}, table::Table, value::{Managed, ManagedCell, Value, ValueData}, vm::Instance};
 
 
 #[derive(Clone, Copy, Debug)]
@@ -84,7 +77,7 @@ impl Runtime {
             state: State {
                 gc: self.gc.clone(),
                 globals: self.globals,
-                frames: RefCell::new(vec![]),
+                frames: RefCell::new(Stack::new()),
                 eval_stack: RefCell::new(vec![]),
             },
         });

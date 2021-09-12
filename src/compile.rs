@@ -1,6 +1,6 @@
 use std::{
     cell::{Ref, RefCell},
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     convert::TryInto,
     rc::Rc,
     vec,
@@ -32,17 +32,22 @@ pub struct CompileError {
 struct VarInfo {
     func_scope: usize,
     location: u32,
-    need_move: bool,
-    on_stack: bool, // is false, then on upvalue
+    uid: u32,
+    // is_on_stack: bool,
+    is_upvalue: bool,
 }
 struct SymbolTable {
     vars: HashMap<String, VarInfo>,
     n_locals: usize,
+    func_scope: usize,
     parent: *mut SymbolTable,
 }
 impl SymbolTable {
     fn set(&mut self, var: String, info: VarInfo) {
         self.vars.insert(var, info);
+    }
+    fn get_cur<'a>(&'a mut self, var: &String) -> Option<&'a mut VarInfo> {
+        self.vars.get_mut(var)
     }
     fn get<'a>(&'a self, var: &String) -> Option<&'a VarInfo> {
         if let Some(info) = self.vars.get(var) {
@@ -76,14 +81,22 @@ enum FunctionLocation {
     Global,
     Stack,
 }
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct UpValueInfo {
+    pub(crate) from_parent: bool,
+    pub(crate) id: u32,
+    pub(crate) uid: u32,
+    pub(crate) location: u32,
+}
 struct FuncInfo {
-    upvalues: Vec<u32>,
+    upvalues: HashMap<u32, UpValueInfo>,
 }
 struct Compiler {
     symbols: SymbolTable,
     funcs: Vec<FuncInfo>,
     module: ByteCodeModule,
     str_map: HashMap<String, usize>,
+    var_uid_gen: u32,
 }
 
 impl Compiler {
@@ -114,6 +127,77 @@ impl Compiler {
             OpCode::LoadStr,
             [bytes[0], bytes[1], bytes[2]],
         ));
+    }
+    fn resolve_upvalue(&mut self, name: &String) {
+        if let Some(info) = self.symbols.get(name).map(|x| *x) {
+            if info.func_scope != self.funcs.len() {
+                // is a upvalue
+                let p = &mut self.symbols as *mut SymbolTable;
+                let mut tables = vec![];
+                unsafe {
+                    while let Some(tab) = p.as_mut() {
+                        tables.push(p);
+                        if tab.func_scope < info.func_scope {
+                            break;
+                        }
+
+                        if tab.func_scope == info.func_scope {
+                            // the locals of that function
+                            let func = &mut self.funcs[tab.func_scope];
+                            if !func.upvalues.contains_key(&info.uid) {
+                                let id = func.upvalues.len() as u32;
+                                let info = tab.get_cur(name).unwrap();
+                                func.upvalues.insert(
+                                    info.uid,
+                                    UpValueInfo {
+                                        from_parent: false,
+                                        id,
+                                        uid: info.uid,
+                                        location: info.location,
+                                    },
+                                );
+                            }
+                            break;
+                        }
+
+                        p = tab.parent;
+                    }
+                    tables.reverse();
+                    for p in tables {
+                        let tab = p.as_mut().unwrap();
+                        if tab.func_scope > info.func_scope {
+                            let func = &mut self.funcs[tab.func_scope];
+
+                            if !func.upvalues.contains_key(&info.uid) {
+                                let prev_func = &mut self.funcs[tab.func_scope - 1];
+                                let id = func.upvalues.len() as u32;
+                                let info = tab.get_cur(name).unwrap();
+                                let location = prev_func.upvalues.get(&info.uid).unwrap().id;
+                                func.upvalues.insert(
+                                    info.uid,
+                                    UpValueInfo {
+                                        from_parent: true,
+                                        id,
+                                        uid: info.uid,
+                                        location: info.location,
+                                    },
+                                );
+                                tab.set(
+                                    name.clone(),
+                                    VarInfo {
+                                        func_scope: tab.func_scope,
+                                        location,
+                                        uid: info.uid,
+                                        // is_on_stack: false,
+                                        is_upvalue: true,
+                                    },
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     fn compile_expr(&mut self, expr: &Expr) -> Result<(), CompileError> {
@@ -153,26 +237,12 @@ impl Compiler {
                     _ => unreachable!(),
                 };
                 if let Some(info) = self.symbols.get(name).map(|x| *x) {
-                    if info.on_stack {
-                        if info.func_scope != self.funcs.len() {
-                            // this is an upvalue
-                            // println!("upvalue {}", name);
-                            self.emit(ByteCode::Op3U8(
-                                OpCode::LoadUpvalue,
-                                get_3xu8(info.location),
-                            ));
-                            {
-                                let info = self.symbols.get_mut(name).unwrap();
-                                info.on_stack = false;
-                                info.need_move = true;
-                            }
-                        } else {
-                            self.emit(ByteCode::Op3U8(OpCode::LoadLocal, get_3xu8(info.location)));
-                        }
+                    if info.is_upvalue {
+                        self.emit(ByteCode::Op3U8(
+                            OpCode::LoadUpvalue,
+                            get_3xu8(info.location),
+                        ));
                     } else {
-                        // if info.need_move && info.func_scope == self.funcs.len() {
-                        //     self.move_to_upvalue(name);
-                        // }
                         self.emit(ByteCode::Op3U8(
                             OpCode::LoadUpvalue,
                             get_3xu8(info.location),
@@ -323,10 +393,11 @@ impl Compiler {
         self.symbols.set(
             var,
             VarInfo {
-                on_stack: true,
-                need_move: false,
                 func_scope: self.funcs.len(),
                 location: self.symbols.n_locals as u32,
+                is_upvalue: false,
+                uid: self.new_var_uid(),
+                // is_on_stack: true,
             },
         );
         self.symbols.n_locals += 1;
@@ -501,17 +572,11 @@ impl Compiler {
             }
         }
     }
-    // fn move_to_upvalue(&mut self, name: &String) {
-    //     println!("moving {} to up value", name);
-    //     let loc = {
-    //         let info = self.symbols.get_mut(name).unwrap();
-    //         assert!(info.func_scope == self.funcs.len() && info.need_move);
-    //         info.need_move = false;
-    //         info.location
-    //     };
-    //     self.funcs.last_mut().unwrap().upvalues.push(loc);
-    //     self.emit(ByteCode::Op3U8(OpCode::MoveToUpvalue, get_3xu8(loc)));
-    // }
+    fn new_var_uid(&mut self) -> u32 {
+        let id = self.var_uid_gen;
+        self.var_uid_gen += 1;
+        id
+    }
     fn compile_function(
         &mut self,
         name: Option<&FunctionName>,
@@ -531,10 +596,10 @@ impl Compiler {
             self.symbols.set(
                 name.clone(),
                 VarInfo {
-                    need_move: false,
                     func_scope: self.funcs.len(),
                     location: i as u32,
-                    on_stack: true,
+                    uid: self.new_var_uid(),
+                    is_upvalue: false,
                 },
             );
         }
@@ -544,7 +609,18 @@ impl Compiler {
         self.emit(ByteCode::Op(OpCode::Return));
         let proto = ClosurePrototype {
             n_args: args.len(),
-            upvalues: std::mem::replace(&mut self.funcs.last_mut().unwrap().upvalues, vec![]),
+            upvalues: {
+                let mut tmp: Vec<_> = self
+                    .funcs
+                    .last()
+                    .unwrap()
+                    .upvalues
+                    .iter()
+                    .map(|(uid, info)| *info)
+                    .collect();
+                tmp.sort_by(|a, b| a.id.partial_cmp(&b.id).unwrap());
+                tmp
+            },
             entry: entry as usize,
         };
         self.leave_scope(true);
@@ -572,50 +648,19 @@ impl Compiler {
                     name: Token::Identifier { value, .. },
                 } => {
                     let info = *self.symbols.get(value).unwrap();
-                    if info.on_stack {
-                        if info.func_scope != self.funcs.len() {
-                            {
-                                let info = self.symbols.get_mut(value).unwrap();
-                                info.on_stack = false;
-                                info.need_move = true;
-                            }
-                            self.emit(ByteCode::Op3U8(
-                                OpCode::StoreUpvalue,
-                                get_3xu8(info.location),
-                            ));
-                        } else {
-                            self.emit(ByteCode::Op3U8(OpCode::StoreLocal, get_3xu8(info.location)));
-                        }
-                    } else {
-                        // if info.need_move && info.func_scope == self.funcs.len() {
-                        //     self.move_to_upvalue(value);
-                        // }
+                    if info.is_upvalue {
                         self.emit(ByteCode::Op3U8(
                             OpCode::StoreUpvalue,
                             get_3xu8(info.location),
                         ));
+                    } else {
+                        self.emit(ByteCode::Op3U8(OpCode::StoreLocal, get_3xu8(info.location)));
                     }
                 }
                 _ => unreachable!(),
             },
             FunctionLocation::Stack => {}
         };
-        unsafe {
-            let mut p = &mut self.symbols as *mut SymbolTable;
-            while let Some(table) = p.as_mut() {
-                for info in table.vars.values_mut() {
-                    if info.func_scope == self.funcs.len() && info.need_move {
-                        info.need_move = false;
-                        self.funcs.last_mut().unwrap().upvalues.push(info.location);
-                        self.emit(ByteCode::Op3U8(
-                            OpCode::MoveToUpvalue,
-                            get_3xu8(info.location),
-                        ));
-                    }
-                }
-                p = table.parent;
-            }
-        }
         Ok(())
     }
 
@@ -630,28 +675,13 @@ impl Compiler {
                 };
                 let info = self.symbols.get(name).map(|x| *x);
                 if let Some(info) = info {
-                    if info.on_stack {
-                        if info.func_scope != self.funcs.len() {
-                            {
-                                let info = self.symbols.get_mut(name).unwrap();
-                                info.on_stack = false;
-                                info.need_move = true;
-                            }
-                            self.emit(ByteCode::Op3U8(
-                                OpCode::StoreUpvalue,
-                                get_3xu8(info.location),
-                            ));
-                        } else {
-                            self.emit(ByteCode::Op3U8(OpCode::StoreLocal, get_3xu8(info.location)));
-                        }
-                    } else {
-                        // if info.need_move && info.func_scope == self.funcs.len() {
-                        //     self.move_to_upvalue(value);
-                        // }
+                    if info.is_upvalue {
                         self.emit(ByteCode::Op3U8(
                             OpCode::StoreUpvalue,
                             get_3xu8(info.location),
                         ));
+                    } else {
+                        self.emit(ByteCode::Op3U8(OpCode::StoreLocal, get_3xu8(info.location)));
                     }
                 } else {
                     self.push_string(name);
@@ -695,6 +725,11 @@ impl Compiler {
         let new = SymbolTable {
             vars: HashMap::new(),
             parent: std::ptr::null_mut(),
+            func_scope: if function_scope {
+                self.funcs.len() + 1
+            } else {
+                self.funcs.len()
+            },
             n_locals: if function_scope {
                 0
             } else {
@@ -705,7 +740,9 @@ impl Compiler {
         let old = Box::into_raw(Box::new(old));
         self.symbols.parent = old;
         if function_scope {
-            self.funcs.push(FuncInfo { upvalues: vec![] });
+            self.funcs.push(FuncInfo {
+                upvalues: HashMap::new(),
+            });
         }
     }
     fn leave_scope(&mut self, function_scope: bool) {
@@ -723,9 +760,11 @@ impl Compiler {
 pub fn compile(block: Rc<Stmt>) -> Result<ByteCodeModule, CompileError> {
     let mut compiler = Compiler {
         funcs: vec![],
+        var_uid_gen: 0,
         symbols: SymbolTable {
             vars: HashMap::new(),
             parent: std::ptr::null_mut(),
+            func_scope: 0,
             n_locals: 0,
         },
         module: ByteCodeModule {

@@ -5,15 +5,7 @@ use std::{
     rc::Rc,
 };
 
-use crate::{
-    bytecode::{u32_from_3xu8, ByteCode, ByteCodeModule, OpCode},
-    closure::{Callable, Closure, UpValue},
-    gc::Gc,
-    runtime::{ErrorKind, RuntimeError},
-    state::{CallContext, Frame, State},
-    table::Table,
-    value::{Managed, ManagedCell, Value, ValueData},
-};
+use crate::{bytecode::{u32_from_3xu8, ByteCode, ByteCodeModule, OpCode}, closure::{Callable, Closure, UpValue, UpValueInner}, gc::Gc, runtime::{ErrorKind, RuntimeError}, state::{CallContext, Frame, State}, table::Table, value::{Managed, ManagedCell, Value, ValueData}};
 
 /*
 The instances represents a thread
@@ -207,14 +199,6 @@ impl Instance {
                             eval_stack.push(c.get_upvalue(idx));
                         }
                     }
-                    OpCode::MoveToUpvalue => {
-                        let idx = u32_from_3xu8(operands);
-                        let local = frame.locals[idx as usize];
-                        unsafe {
-                            let c = &frame.closure.as_ref().unwrap().data;
-                            c.insert_upvalue(idx, local);
-                        }
-                    }
                     OpCode::LoadLocal => {
                         let idx = operands[0];
                         eval_stack.push(frame.locals[idx as usize]);
@@ -312,14 +296,22 @@ impl Instance {
                             ByteCode::Address(bytes) => u32::from_le_bytes(bytes),
                             _ => unreachable!(),
                         };
+                        let parent = unsafe{
+                            (*frame.closure).data
+                        };
+                        let upvalues = proto.upvalues.iter().enumerate().map(|(i,info)|{
+                            debug_assert!(i == info.id as usize);
+                            if info.from_parent {
+                                
+                            }else{
+
+                            }
+                        }).collect();
                         let closure = state.create_closure(Closure {
                             n_args: proto.n_args,
                             entry: entry as usize,
                             module: unsafe { (*frame.closure).data.module.clone() },
-                            upvalues: self.gc.manage(UpValue {
-                                values: RefCell::new(HashMap::new()),
-                                parent: unsafe { (*frame.closure).data.upvalues },
-                            }),
+                            upvalues,
                         });
                         eval_stack.push(closure);
                         *ip += 2;
