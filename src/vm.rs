@@ -86,6 +86,22 @@ impl Instance {
                         eval_stack[i - 1] = c;
                         eval_stack[i] = a;
                     }
+                    OpCode::Not => {
+                        let top = eval_stack.last_mut().unwrap();
+                        *top = state.not(*top)?;
+                    }
+                    OpCode::BitwiseNot => {
+                        let top = eval_stack.last_mut().unwrap();
+                        *top = state.bitwise_not(*top)?;
+                    }
+                    OpCode::Neg => {
+                        let top = eval_stack.last_mut().unwrap();
+                        *top = state.neg(*top)?;
+                    }
+                    OpCode::Len => {
+                        let top = eval_stack.last_mut().unwrap();
+                        *top = state.len(*top)?;
+                    }
                     OpCode::LoadNumber => {
                         ip_modified = true;
                         let lo = match module.code[*ip + 1] {

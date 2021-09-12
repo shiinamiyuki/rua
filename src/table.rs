@@ -30,7 +30,7 @@ impl Default for Entry {
     }
 }
 
-struct LinkedHashMap {
+pub(crate) struct LinkedHashMap {
     table: Vec<Entry>,
     len: usize,
     mod_mask: usize,
@@ -49,7 +49,7 @@ mod test {
         }
     }
 }
-struct LinkedHashMapIter<'a> {
+pub(crate) struct LinkedHashMapIter<'a> {
     map: &'a LinkedHashMap,
     i: usize,
 }
@@ -67,13 +67,13 @@ impl<'a> Iterator for LinkedHashMapIter<'a> {
 }
 
 impl LinkedHashMap {
-    pub fn iter<'a>(&'a self) -> LinkedHashMapIter<'a> {
+    pub(crate) fn iter<'a>(&'a self) -> LinkedHashMapIter<'a> {
         LinkedHashMapIter::<'a> {
             map: self,
             i: self.head,
         }
     }
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             table: vec![],
             len: 0,
@@ -84,7 +84,7 @@ impl LinkedHashMap {
             during_rehash: false,
         }
     }
-    pub fn with_len(len: usize) -> Self {
+    pub(crate) fn with_len(len: usize) -> Self {
         let mut m = Self::new();
         m.reset(len);
         m
@@ -194,8 +194,8 @@ impl LinkedHashMap {
 }
 
 pub struct Table {
-    array: Vec<Value>,
-    map: LinkedHashMap,
+    pub(crate) array: Vec<Value>,
+    pub(crate) map: LinkedHashMap,
 }
 fn is_int(x: f64) -> bool {
     x.fract() == 0.0

@@ -1,4 +1,13 @@
-use crate::{Stack, bytecode::ByteCode, closure::Closure, gc::Gc, runtime::{ErrorKind, RuntimeError}, table::Table, value::{Managed, ManagedCell, Tuple, TupleUnpack, Value, ValueData}, vm::Instance};
+use crate::{
+    bytecode::ByteCode,
+    closure::Closure,
+    gc::Gc,
+    runtime::{ErrorKind, RuntimeError},
+    table::Table,
+    value::{Managed, ManagedCell, Tuple, TupleUnpack, Value, ValueData},
+    vm::Instance,
+    Stack,
+};
 use std::{cell::RefCell, cmp::Ordering, rc::Rc};
 
 pub const MAX_LOCALS: usize = 256;
@@ -251,6 +260,7 @@ impl State {
         }
         res
     }
+
     pub fn lt(&self, a: Value, b: Value) -> Result<Value, RuntimeError> {
         let ordering = self.cmp(a, b)?;
         Ok(Value::from_bool(ordering == Ordering::Less))
@@ -291,6 +301,59 @@ impl State {
                     b.type_of()
                 ),
             })
+        }
+    }
+    pub fn len(&self, a: Value) -> Result<Value, RuntimeError> {
+        match a.data {
+            // ValueData::Nil => todo!(),
+            // ValueData::Bool(_) => todo!(),
+            // ValueData::Number(_) => todo!(),
+            ValueData::Table(x) => unsafe {
+                Ok(Value::from_number((*x).data.borrow().array.len() as f64))
+            },
+            ValueData::String(x) => unsafe { Ok(Value::from_number((*x).data.len() as f64)) },
+            // ValueData::Closure(_) => todo!(),
+            // ValueData::Callable(_) => todo!(),
+            ValueData::Tuple(x) => unsafe { Ok(Value::from_number((*x).data.values.len() as f64)) },
+            _ => Err(RuntimeError {
+                kind: ErrorKind::ArithmeticError,
+                msg: format!(" attempt to get length of a {} value", a.type_of(),),
+            }),
+        }
+    }
+    pub fn not(&self, a: Value) -> Result<Value, RuntimeError> {
+        Ok(Value::from_bool(!a.as_bool()))
+    }
+    pub fn bitwise_not(&self, a: Value) -> Result<Value, RuntimeError> {
+        match a.data {
+            // ValueData::Nil => todo!(),
+            // ValueData::Bool(_) => todo!(),
+            ValueData::Number(_) => {
+                let i = a.as_i64();
+                if let Some(i) = i {
+                    Ok(Value::from_number((!i) as f64))
+                }else{
+                    Err(RuntimeError {
+                        kind: ErrorKind::ArithmeticError,
+                        msg: "number has no integer representation".into(),
+                    })
+                }
+            },
+            _ => Err(RuntimeError {
+                kind: ErrorKind::ArithmeticError,
+                msg: format!(" attempt to get length of a {} value", a.type_of(),),
+            }),
+        }
+    }
+    pub fn neg(&self, a: Value) -> Result<Value, RuntimeError> {
+        match a.data {
+            // ValueData::Nil => todo!(),
+            // ValueData::Bool(_) => todo!(),
+            ValueData::Number(x) => Ok(Value::from_number(*-x)),
+            _ => Err(RuntimeError {
+                kind: ErrorKind::ArithmeticError,
+                msg: format!(" attempt to get length of a {} value", a.type_of(),),
+            }),
         }
     }
 }

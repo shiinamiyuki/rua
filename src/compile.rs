@@ -63,20 +63,20 @@ impl SymbolTable {
             }
         }
     }
-    fn get_prev<'a>(&'a mut self, var: &String) -> Option<&'a mut VarInfo> {    
+    fn get_prev<'a>(&'a mut self, var: &String) -> Option<&'a mut VarInfo> {
         unsafe {
             if let Some(parent) = self.parent.as_mut() {
                 if parent.func_scope == self.func_scope {
                     parent.get_prev(var)
-                } else if parent.func_scope == self.func_scope  - 1{
+                } else if parent.func_scope == self.func_scope - 1 {
                     parent.get_cur(var)
-                } else{
+                } else {
                     None
                 }
             } else {
                 None
             }
-        }        
+        }
     }
     fn get<'a>(&'a self, var: &String) -> Option<&'a VarInfo> {
         if let Some(info) = self.vars.get(var) {
@@ -339,7 +339,21 @@ impl Compiler {
                 self.emit(ByteCode::Op(opcode));
                 Ok(())
             }
-            Expr::UnaryExpr { op, arg } => todo!(),
+            Expr::UnaryExpr { op, arg } => {
+                self.compile_expr(arg)?;
+                let opcode = match op {
+                    Token::Symbol { value, .. } => match value.as_str() {
+                        "~" => OpCode::BitwiseNot,
+                        "-" => OpCode::Neg,
+                        "#" => OpCode::Len,
+                        _ => unreachable!(),
+                    },
+                    Token::Keyword { value, .. } if value == "not" => OpCode::Not,
+                    _ => unreachable!(),
+                };
+                self.emit(ByteCode::Op(opcode));
+                Ok(())
+            }
             Expr::IndexExpr { loc: _, lhs, rhs } => {
                 self.compile_expr(rhs)?;
                 self.compile_expr(lhs)?;
