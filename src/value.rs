@@ -17,7 +17,7 @@ use crate::{
 
 pub trait UserData {}
 
-pub struct Managed<T> {
+pub struct Managed<T: ?Sized + 'static> {
     pub data: T,
 }
 impl<T> Managed<T> {
@@ -77,6 +77,7 @@ pub enum ValueData {
     Closure(*const Managed<Closure>),
     Callable(*const Managed<Box<dyn Callable>>),
     Tuple(*const Managed<Tuple>),
+    UserData(*const Managed<dyn UserData>),
 }
 impl PartialEq for ValueData {
     fn eq(&self, other: &Self) -> bool {
@@ -116,6 +117,7 @@ impl Hash for ValueData {
             ValueData::Closure(x) => std::ptr::hash(*x, state),
             ValueData::Callable(x) => std::ptr::hash(*x, state),
             ValueData::Tuple(x) => std::ptr::hash(*x, state),
+            ValueData::UserData(x) => std::ptr::hash(*x, state),
         }
     }
 }
@@ -212,6 +214,7 @@ impl Value {
             ValueData::Closure(_) => "function",
             ValueData::Callable(_) => "function",
             ValueData::Tuple(_) => "tuple",
+            ValueData::UserData(_) => "userdata",
         }
     }
     pub fn print(&self) -> String {
@@ -234,6 +237,9 @@ impl Value {
             }
             ValueData::Callable(callable) => {
                 format!("function: {:0x}", callable as u64)
+            }
+            ValueData::UserData(p) => {
+                format!("userdata: {:0x}", p.cast::<()>() as u64)
             }
             ValueData::Tuple(tuple) => {
                 let mut s = String::from("(");

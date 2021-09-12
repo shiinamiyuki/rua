@@ -360,17 +360,17 @@ impl Compiler {
                 self.emit(ByteCode::Op(OpCode::LoadTable));
                 Ok(())
             }
-            Expr::DotExpr { loc: _, lhs, rhs } => {
-                match &**rhs {
-                    Expr::Identifier { token } => {
-                        let name = match token {
-                            Token::Identifier { value, .. } => value,
-                            _ => unreachable!(),
-                        };
-                        self.push_string(name);
-                    }
+            Expr::DotExpr {
+                loc: _,
+                lhs,
+                rhs: token,
+            } => {
+                let name = match token {
+                    Token::Identifier { value, .. } => value,
                     _ => unreachable!(),
-                }
+                };
+                self.push_string(name);
+
                 self.compile_expr(lhs)?;
                 self.emit(ByteCode::Op(OpCode::LoadTable));
                 Ok(())
@@ -744,13 +744,27 @@ impl Compiler {
             }
             // Expr::BinaryExpr { op, lhs, rhs } => todo!(),
             // Expr::UnaryExpr { op, arg } => todo!(),
-            Expr::IndexExpr { loc, lhs, rhs } => {
+            Expr::IndexExpr { loc:_, lhs, rhs } => {
                 self.compile_expr(rhs)?;
                 self.compile_expr(lhs)?;
                 self.emit(ByteCode::Op(OpCode::StoreTable));
                 Ok(())
             }
-            Expr::DotExpr { loc, lhs, rhs } => todo!(),
+            Expr::DotExpr {
+                loc:_,
+                lhs,
+                rhs: token,
+            } => {
+                let name = match token {
+                    Token::Identifier { value, .. } => value,
+                    _ => unreachable!(),
+                };
+                self.push_string(name);
+
+                self.compile_expr(lhs)?;
+                self.emit(ByteCode::Op(OpCode::StoreTable));
+                Ok(())
+            }
             // Expr::CallExpr { callee, args } => todo!(),
             // Expr::MethodCallExpr { callee, method, args } => todo!(),
             // Expr::FunctionExpr { loc, args, body } => ,

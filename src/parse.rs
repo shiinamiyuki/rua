@@ -70,7 +70,7 @@ pub enum Expr {
     DotExpr {
         loc: SourceLocation,
         lhs: Rc<Expr>,
-        rhs: Rc<Expr>,
+        rhs: Token,
     },
     CallExpr {
         callee: Rc<Expr>,
@@ -753,20 +753,21 @@ impl Parser {
             if self.has(".") {
                 let loc = self.peek().loc().clone();
                 self.advance(1);
-                let rhs = self.parse_atom()?;
-                match &*rhs {
-                    Expr::Identifier { .. } => {}
+                let field = self.peek().clone();
+                self.advance(1);
+                match &field {
+                    Token::Identifier { .. } => {}
                     _ => {
                         return Err(self.error(
                             ErrorKind::SyntaxError,
-                            &format!("expected dot expr"),
+                            &format!("unexpected token {:?} in dot expr", field),
                             loc,
                         ));
                     }
                 }
                 expr = Rc::new(Expr::DotExpr {
                     loc,
-                    rhs,
+                    rhs: field,
                     lhs: expr,
                 });
             } else if self.has("[") {
@@ -935,7 +936,7 @@ impl Parser {
                 }))
             }
             Token::Symbol { value, .. } if value == "{" => self.parse_table(),
-            Token::Keyword { value, loc:_ } if value == "function" => {
+            Token::Keyword { value, loc: _ } if value == "function" => {
                 let expr = self.parse_function_expr()?;
                 Ok(expr)
             }
@@ -944,9 +945,7 @@ impl Parser {
                 "unexpected EOF when parsing atom",
                 loc.clone(),
             )),
-            _=>{
-                self.parse_postfix_expr()
-            }
+            _ => self.parse_postfix_expr(),
         }
     }
     fn parse_pow_expr(&mut self) -> Result<Rc<Expr>, ParseError> {
