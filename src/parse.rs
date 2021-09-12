@@ -564,7 +564,7 @@ pub fn tokenize(filename: &str, source: &str) -> Result<Vec<Token>, TokenizeErro
     tokenizer.run()
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ErrorKind {
     UnexpectedEOF,
     SyntaxError,
@@ -870,9 +870,6 @@ impl Parser {
         }
 
         Ok(expr)
-    }
-    fn eof_loc(&mut self) -> SourceLocation {
-        self.tokens.last().unwrap().loc().clone()
     }
     fn parse_function_expr(&mut self) -> Result<Rc<Expr>, ParseError> {
         assert!(self.has("function"));

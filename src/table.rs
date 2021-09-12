@@ -196,6 +196,9 @@ impl LinkedHashMap {
 pub struct Table {
     pub(crate) array: Vec<Value>,
     pub(crate) map: LinkedHashMap,
+    largest_uint: u64,
+    len: usize,
+    need_recompute_len: bool,
 }
 fn is_int(x: f64) -> bool {
     x.fract() == 0.0
@@ -205,12 +208,40 @@ impl Table {
         Self {
             array: vec![],
             map: LinkedHashMap::new(),
+            largest_uint: 0,
+            len: 0,
+            need_recompute_len: false,
         }
     }
     pub fn new_with(array_part_len: usize, hash_part_len: usize) -> Self {
         Self {
             array: vec![Value::nil(); array_part_len],
             map: LinkedHashMap::with_len(hash_part_len),
+            largest_uint: array_part_len as u64,
+            len: array_part_len,
+            need_recompute_len: false,
+        }
+    }
+    pub fn len(&mut self) -> usize {
+        if !self.need_recompute_len {
+            self.len
+        } else {
+            self.need_recompute_len = false;
+            for (i, v) in self.array.iter().enumerate() {
+                if v.is_nil() {
+                    self.len = i + 1;
+                    return self.len;
+                }
+            }
+            for i in (self.array.len() + 1) as u64..=self.largest_uint {
+                let v = Value::from_number(i as f64);
+                if self.get(v).is_nil() {
+                    self.len = i as usize;
+                    return self.len;
+                }
+            }
+            self.len = self.largest_uint as usize;
+            self.len
         }
     }
     pub fn get(&self, key: Value) -> Value {
@@ -229,12 +260,21 @@ impl Table {
         match key.data {
             ValueData::Number(x) if is_int(x.0) => {
                 let i = x.trunc() as i64;
+                if !value.is_nil() {
+                    self.largest_uint = self.largest_uint.max(i as u64);
+                }
                 if i >= 1 && i <= self.array.len() as i64 {
+                    if value.is_nil() {
+                        self.need_recompute_len = true;
+                    }
                     self.array[(i - 1) as usize] = value;
                     return;
-                } else if i == 1 + (self.array.len() as i64) {
+                } else if i == 1 + (self.array.len() as i64) && !value.is_nil() {
                     self.array.push(value);
+                    self.need_recompute_len = true;
                     return;
+                } else {
+                    self.need_recompute_len = true;
                 }
             }
             _ => {}

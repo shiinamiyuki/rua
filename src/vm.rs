@@ -1,9 +1,4 @@
-use std::{
-    cell::{Cell, RefCell, RefMut},
-    collections::HashMap,
-    iter::FromIterator,
-    rc::Rc,
-};
+use std::{borrow::Borrow, cell::{Cell, RefCell, RefMut}, collections::HashMap, iter::FromIterator, rc::Rc};
 
 use crate::{
     bytecode::{u32_from_3xu8, ByteCode, ByteCodeModule, OpCode},
@@ -373,8 +368,23 @@ impl Instance {
         // println!("{}", eval_stack.last().unwrap().print());
         Ok(Continue::Return)
     }
-    // top level
     pub fn exec(&self, module: ByteCodeModule) -> Result<(), RuntimeError> {
+        self.exec_impl(module)?;
+        assert!(self.state.borrow().eval_stack.borrow().is_empty());
+        Ok(())
+    }
+    pub fn eval_repl(&self, module: ByteCodeModule) -> Result<(), RuntimeError> {
+        self.exec_impl(module)?;
+        assert!(self.state.borrow().eval_stack.borrow().len()<=1);
+        if self.state.borrow().eval_stack.borrow().len() == 1 {
+            let mut st =  self.state.borrow().eval_stack.borrow_mut();
+            let v = st.pop().unwrap();
+            println!("{}", v.print());
+        }
+        Ok(())
+    }
+    // top level
+    fn exec_impl(&self, module: ByteCodeModule) -> Result<(), RuntimeError> {
         let closure = self.gc.manage(Managed::<Closure> {
             data: Closure {
                 entry: 0,
@@ -438,7 +448,7 @@ impl Instance {
                 }
             }
         }
-
+       
         Ok(())
     }
 }

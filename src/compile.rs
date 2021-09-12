@@ -409,7 +409,7 @@ impl Compiler {
                         log_2(n_hash).unwrap_or(0).try_into().unwrap(),
                     ],
                 ));
-                let mut array_entry_cnt = 0;
+                let mut array_entry_cnt = 1;
                 for field in fields {
                     self.emit(ByteCode::Op(OpCode::Dup));
                     match field {
@@ -828,4 +828,31 @@ pub fn compile(block: Rc<Stmt>) -> Result<ByteCodeModule, CompileError> {
         str_map: HashMap::new(),
     };
     compiler.run(block)
+}
+
+pub fn compile_repl(block: Rc<Stmt>) -> Result<ByteCodeModule, CompileError> {
+    let mut compiler = Compiler {
+        funcs: vec![],
+        var_uid_gen: 0,
+        symbols: SymbolTable {
+            vars: HashMap::new(),
+            parent: std::ptr::null_mut(),
+            func_scope: 0,
+            n_locals: 0,
+        },
+        module: ByteCodeModule {
+            protypes: vec![],
+            code: vec![],
+            string_pool: vec![],
+        },
+        str_map: HashMap::new(),
+    };
+    let mut module = compiler.run(block)?;
+    match *module.code.last().unwrap() {
+        ByteCode::Op(OpCode::Pop) => {
+            module.code.pop().unwrap();
+        }
+        _ => {}
+    }
+    Ok(module)
 }

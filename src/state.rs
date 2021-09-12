@@ -291,6 +291,12 @@ impl State {
     }
     pub fn idiv(&self, a: Value, b: Value) -> Result<Value, RuntimeError> {
         if let (Some(a), Some(b)) = (a.number(), b.number()) {
+            if b == 0.0 {
+                return Err(RuntimeError {
+                    kind: ErrorKind::ArithmeticError,
+                    msg: "attempt to divide by zero".into(),
+                });
+            }
             Ok(Value::from_number((a / b).floor()))
         } else {
             Err(RuntimeError {
@@ -309,7 +315,7 @@ impl State {
             // ValueData::Bool(_) => todo!(),
             // ValueData::Number(_) => todo!(),
             ValueData::Table(x) => unsafe {
-                Ok(Value::from_number((*x).data.borrow().array.len() as f64))
+                Ok(Value::from_number((*x).data.borrow_mut().len() as f64))
             },
             ValueData::String(x) => unsafe { Ok(Value::from_number((*x).data.len() as f64)) },
             // ValueData::Closure(_) => todo!(),
@@ -332,13 +338,13 @@ impl State {
                 let i = a.as_i64();
                 if let Some(i) = i {
                     Ok(Value::from_number((!i) as f64))
-                }else{
+                } else {
                     Err(RuntimeError {
                         kind: ErrorKind::ArithmeticError,
                         msg: "number has no integer representation".into(),
                     })
                 }
-            },
+            }
             _ => Err(RuntimeError {
                 kind: ErrorKind::ArithmeticError,
                 msg: format!(" attempt to get length of a {} value", a.type_of(),),
