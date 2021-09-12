@@ -1,11 +1,19 @@
 use std::{
-    cell::{RefCell, RefMut},
+    cell::{Cell, RefCell, RefMut},
     collections::HashMap,
     iter::FromIterator,
     rc::Rc,
 };
 
-use crate::{bytecode::{u32_from_3xu8, ByteCode, ByteCodeModule, OpCode}, closure::{Callable, Closure, UpValue, UpValueInner}, gc::Gc, runtime::{ErrorKind, RuntimeError}, state::{CallContext, Frame, State}, table::Table, value::{Managed, ManagedCell, Value, ValueData}};
+use crate::{
+    bytecode::{u32_from_3xu8, ByteCode, ByteCodeModule, OpCode},
+    closure::{Callable, Closure, UpValue, UpValueInner},
+    gc::Gc,
+    runtime::{ErrorKind, RuntimeError},
+    state::{CallContext, Frame, State},
+    table::Table,
+    value::{Managed, ManagedCell, Value, ValueData},
+};
 
 /*
 The instances represents a thread
@@ -32,6 +40,19 @@ impl Instance {
         let frame = frames.last_mut().unwrap();
         let ip = &mut frame.ip;
         let module = unsafe { &*(*frame.closure).data.module };
+        unsafe {
+            let closure = &(*frame.closure).data;
+            for (i, v) in closure.upvalues.iter().enumerate() {
+                let proto = &(*closure.module).protypes[closure.proto_idx];
+                let info = &proto.upvalues[i];
+                if !info.from_parent {
+                    let mut v = v.inner.borrow_mut();
+                    *v = Rc::new(Cell::new(UpValueInner::Open(
+                        &mut frame.locals[info.location as usize] as *mut Value,
+                    )));
+                }
+            }
+        }
         let mut eval_stack = state.eval_stack.borrow_mut();
         while *ip < module.code.len() {
             macro_rules! binary_op_impl {
@@ -296,22 +317,31 @@ impl Instance {
                             ByteCode::Address(bytes) => u32::from_le_bytes(bytes),
                             _ => unreachable!(),
                         };
-                        let parent = unsafe{
-                            (*frame.closure).data
-                        };
-                        let upvalues = proto.upvalues.iter().enumerate().map(|(i,info)|{
-                            debug_assert!(i == info.id as usize);
-                            if info.from_parent {
-                                
-                            }else{
-
-                            }
-                        }).collect();
+                        let parent = unsafe { &(*frame.closure).data };
+                        let upvalues = proto
+                            .upvalues
+                            .iter()
+                            .enumerate()
+                            .map(|(i, info)| {
+                                debug_assert!(i == info.id as usize);
+                                if info.from_parent {
+                                    parent.upvalues[info.location as usize].clone()
+                                } else {
+                                    UpValue {
+                                        inner: RefCell::new(Rc::new(Cell::new(
+                                            UpValueInner::Empty,
+                                        ))),
+                                    }
+                                }
+                            })
+                            .collect();
                         let closure = state.create_closure(Closure {
+                            proto_idx: proto_idx as usize,
                             n_args: proto.n_args,
                             entry: entry as usize,
                             module: unsafe { (*frame.closure).data.module.clone() },
                             upvalues,
+                            called: Cell::new(false),
                         });
                         eval_stack.push(closure);
                         *ip += 2;
@@ -335,10 +365,9 @@ impl Instance {
                 n_args: 0,
                 // n_locals: 0,
                 module: Rc::new(module),
-                upvalues: self.gc.manage(UpValue {
-                    values: RefCell::new(HashMap::new()),
-                    parent: std::ptr::null(),
-                }),
+                upvalues: vec![],
+                called: Cell::new(false),
+                proto_idx: usize::MAX,
             },
         });
         {
@@ -370,6 +399,22 @@ impl Instance {
                 }
                 Continue::Return => {
                     let mut frames = self.state.frames.borrow_mut();
+                    unsafe {
+                        let closure = &frames.last().unwrap().closure.as_ref().unwrap().data;
+                        for v in &closure.upvalues {
+                            let v = v.inner.borrow();
+                            let inner = v.get();
+                            match inner {
+                                UpValueInner::Open(p) => {
+                                    v.set(UpValueInner::Closed(*p));
+                                }
+                                UpValueInner::Empty => {
+                                    unreachable!()
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
                     frames.pop().unwrap();
                     if frames.is_empty() {
                         break;

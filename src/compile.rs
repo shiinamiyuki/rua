@@ -47,7 +47,36 @@ impl SymbolTable {
         self.vars.insert(var, info);
     }
     fn get_cur<'a>(&'a mut self, var: &String) -> Option<&'a mut VarInfo> {
-        self.vars.get_mut(var)
+        if let Some(info) = self.vars.get_mut(var) {
+            Some(info)
+        } else {
+            unsafe {
+                if let Some(parent) = self.parent.as_mut() {
+                    if parent.func_scope == self.func_scope {
+                        parent.get_cur(var)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            }
+        }
+    }
+    fn get_prev<'a>(&'a mut self, var: &String) -> Option<&'a mut VarInfo> {    
+        unsafe {
+            if let Some(parent) = self.parent.as_mut() {
+                if parent.func_scope == self.func_scope {
+                    parent.get_prev(var)
+                } else if parent.func_scope == self.func_scope  - 1{
+                    parent.get_cur(var)
+                } else{
+                    None
+                }
+            } else {
+                None
+            }
+        }        
     }
     fn get<'a>(&'a self, var: &String) -> Option<&'a VarInfo> {
         if let Some(info) = self.vars.get(var) {
@@ -62,19 +91,23 @@ impl SymbolTable {
             }
         }
     }
-    fn get_mut<'a>(&'a mut self, var: &String) -> Option<&'a mut VarInfo> {
-        if let Some(info) = self.vars.get_mut(var) {
-            Some(info)
-        } else {
-            unsafe {
-                if let Some(parent) = self.parent.as_mut() {
-                    parent.get_mut(var)
-                } else {
-                    None
-                }
-            }
-        }
-    }
+    // fn get_mut<'a>(&'a mut self, var: &String) -> Option<&'a mut VarInfo> {
+    //     if let Some(info) = self.vars.get_mut(var) {
+    //         Some(info)
+    //     } else {
+    //         unsafe {
+    //             if let Some(parent) = self.parent.as_mut() {
+    //                 if parent.func_scope == self.func_scope {
+    //                     parent.get_mut(var)
+    //                 } else {
+    //                     None
+    //                 }
+    //             } else {
+    //                 None
+    //             }
+    //         }
+    //     }
+    // }
 }
 enum FunctionLocation {
     Local,
@@ -131,8 +164,9 @@ impl Compiler {
     fn resolve_upvalue(&mut self, name: &String) {
         if let Some(info) = self.symbols.get(name).map(|x| *x) {
             if info.func_scope != self.funcs.len() {
+                // println!("{} is upvalue", name);
                 // is a upvalue
-                let p = &mut self.symbols as *mut SymbolTable;
+                let mut p = &mut self.symbols as *mut SymbolTable;
                 let mut tables = vec![];
                 unsafe {
                     while let Some(tab) = p.as_mut() {
@@ -143,10 +177,12 @@ impl Compiler {
 
                         if tab.func_scope == info.func_scope {
                             // the locals of that function
-                            let func = &mut self.funcs[tab.func_scope];
+                            let func = &mut self.funcs[tab.func_scope - 1];
                             if !func.upvalues.contains_key(&info.uid) {
                                 let id = func.upvalues.len() as u32;
-                                let info = tab.get_cur(name).unwrap();
+                                let info = tab.get_cur(name).unwrap_or_else(|| {
+                                    panic!("{}", name);
+                                });
                                 func.upvalues.insert(
                                     info.uid,
                                     UpValueInfo {
@@ -166,12 +202,13 @@ impl Compiler {
                     for p in tables {
                         let tab = p.as_mut().unwrap();
                         if tab.func_scope > info.func_scope {
-                            let func = &mut self.funcs[tab.func_scope];
+                            assert!(tab.func_scope <= self.funcs.len());
+                            let func = &mut *self.funcs.as_mut_ptr().add(tab.func_scope - 1);
 
                             if !func.upvalues.contains_key(&info.uid) {
-                                let prev_func = &mut self.funcs[tab.func_scope - 1];
+                                let prev_func = &mut self.funcs[tab.func_scope - 2];
                                 let id = func.upvalues.len() as u32;
-                                let info = tab.get_cur(name).unwrap();
+                                let info = *tab.get_prev(name).unwrap();
                                 let location = prev_func.upvalues.get(&info.uid).unwrap().id;
                                 func.upvalues.insert(
                                     info.uid,
@@ -179,7 +216,7 @@ impl Compiler {
                                         from_parent: true,
                                         id,
                                         uid: info.uid,
-                                        location: info.location,
+                                        location,
                                     },
                                 );
                                 tab.set(
@@ -236,6 +273,7 @@ impl Compiler {
                     Token::Identifier { value, .. } => value,
                     _ => unreachable!(),
                 };
+                self.resolve_upvalue(name);
                 if let Some(info) = self.symbols.get(name).map(|x| *x) {
                     if info.is_upvalue {
                         self.emit(ByteCode::Op3U8(
@@ -243,10 +281,7 @@ impl Compiler {
                             get_3xu8(info.location),
                         ));
                     } else {
-                        self.emit(ByteCode::Op3U8(
-                            OpCode::LoadUpvalue,
-                            get_3xu8(info.location),
-                        ));
+                        self.emit(ByteCode::Op3U8(OpCode::LoadLocal, get_3xu8(info.location)));
                     }
                 } else {
                     self.push_string(name);
@@ -390,13 +425,14 @@ impl Compiler {
         }
     }
     fn add_var(&mut self, var: String) {
+        let uid = self.new_var_uid();
         self.symbols.set(
             var,
             VarInfo {
                 func_scope: self.funcs.len(),
                 location: self.symbols.n_locals as u32,
                 is_upvalue: false,
-                uid: self.new_var_uid(),
+                uid,
                 // is_on_stack: true,
             },
         );
@@ -593,12 +629,13 @@ impl Compiler {
                 Token::Identifier { value, .. } => value,
                 _ => unreachable!(),
             };
+            let uid = self.new_var_uid();
             self.symbols.set(
                 name.clone(),
                 VarInfo {
                     func_scope: self.funcs.len(),
                     location: i as u32,
-                    uid: self.new_var_uid(),
+                    uid,
                     is_upvalue: false,
                 },
             );
@@ -616,7 +653,7 @@ impl Compiler {
                     .unwrap()
                     .upvalues
                     .iter()
-                    .map(|(uid, info)| *info)
+                    .map(|(_, info)| *info)
                     .collect();
                 tmp.sort_by(|a, b| a.id.partial_cmp(&b.id).unwrap());
                 tmp
@@ -647,6 +684,7 @@ impl Compiler {
                 FunctionName::Function {
                     name: Token::Identifier { value, .. },
                 } => {
+                    self.resolve_upvalue(&value);
                     let info = *self.symbols.get(value).unwrap();
                     if info.is_upvalue {
                         self.emit(ByteCode::Op3U8(
@@ -674,6 +712,7 @@ impl Compiler {
                     _ => unreachable!(),
                 };
                 let info = self.symbols.get(name).map(|x| *x);
+                self.resolve_upvalue(name);
                 if let Some(info) = info {
                     if info.is_upvalue {
                         self.emit(ByteCode::Op3U8(

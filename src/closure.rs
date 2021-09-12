@@ -1,6 +1,17 @@
-use std::{cell::RefCell, collections::HashMap, rc::Rc};
+use std::{
+    borrow::Borrow,
+    cell::{Cell, RefCell},
+    collections::HashMap,
+    rc::Rc,
+};
 
-use crate::{bytecode::ByteCodeModule, compile::UpValueInfo, gc::{Gc, Traceable}, state::CallContext, value::Value};
+use crate::{
+    bytecode::ByteCodeModule,
+    compile::UpValueInfo,
+    gc::{Gc, Traceable},
+    state::CallContext,
+    value::Value,
+};
 
 pub trait Callable {
     fn call<'a>(&self, ctx: &CallContext<'a>);
@@ -19,15 +30,16 @@ impl Callable for NativeFunction {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Copy)]
 pub(crate) enum UpValueInner {
+    Empty,
     Open(*mut Value),
-    Closed(RefCell<Value>),
+    Closed(Value),
 }
 
 #[derive(Clone)]
 pub(crate) struct UpValue {
-    pub(crate) inner: Rc<UpValueInner>, // Rc or Gc?
+    pub(crate) inner: RefCell<Rc<Cell<UpValueInner>>>, // Rc or Gc?
 }
 
 #[derive(Clone, Debug)]
@@ -38,6 +50,8 @@ pub struct ClosurePrototype {
     pub(crate) upvalues: Vec<UpValueInfo>,
 }
 pub struct Closure {
+    pub(crate) proto_idx: usize,
+    pub(crate) called: Cell<bool>,
     pub(crate) entry: usize,
     pub(crate) n_args: usize,
     // pub(crate) n_locals: usize,
@@ -48,13 +62,14 @@ pub struct Closure {
 impl Closure {
     pub(crate) fn set_upvalue(&self, i: u32, value: Value) {
         unsafe {
-            match *self.upvalues.get(&i).unwrap().inner {
+            let v = self.upvalues[i as usize].inner.borrow();
+            match (**v).get() {
                 UpValueInner::Open(p) => {
                     *p.as_mut().unwrap() = value;
                 }
-                UpValueInner::Closed(p) => {
-                    let mut v = p.borrow_mut();
-                    *v = value;
+                UpValueInner::Closed(_) => (**v).set(UpValueInner::Closed(value)),
+                UpValueInner::Empty => {
+                    unreachable!()
                 }
             }
         }
@@ -70,11 +85,13 @@ impl Closure {
     // }
     pub(crate) fn get_upvalue(&self, i: u32) -> Value {
         unsafe {
-            match *self.upvalues.get(&i).unwrap().inner {
+            // let v = (*self.upvalues[i as usize].inner).borrow();
+            let v = self.upvalues[i as usize].inner.borrow();
+            match (**v).get() {
                 UpValueInner::Open(p) => *p.as_ref().unwrap(),
-                UpValueInner::Closed(p) => {
-                    let v = p.borrow();
-                    *v
+                UpValueInner::Closed(v) => v,
+                UpValueInner::Empty => {
+                    unreachable!()
                 }
             }
         }
@@ -82,12 +99,15 @@ impl Closure {
 }
 impl Traceable for Closure {
     fn trace(&self, gc: &Gc) {
-        for (i, v) in &self.upvalues {
-            match *v.inner {
+        for v in &self.upvalues {
+            let v = v.inner.borrow();
+            match (**v).get() {
                 UpValueInner::Open(p) => gc.trace_ptr(p),
-                UpValueInner::Closed(p) => {
-                    let v = p.borrow();
-                    gc.trace(&*v);
+                UpValueInner::Closed(v) => {
+                    gc.trace(&v);
+                }
+                UpValueInner::Empty => {
+                    unreachable!()
                 }
             }
         }

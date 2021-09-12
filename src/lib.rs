@@ -22,7 +22,7 @@ pub(crate) fn log_2(x: usize) -> Option<u32> {
 }
 
 struct StackNode<T> {
-    data: T,
+    data: Option<T>,
     prev: *mut StackNode<T>,
 }
 pub(crate) struct Stack<T> {
@@ -34,9 +34,12 @@ impl<T> Stack<T> {
             last: std::ptr::null_mut(),
         }
     }
+    pub(crate) fn is_empty(&self) -> bool {
+        self.last.is_null()
+    }
     pub(crate) fn push(&mut self, value: T) {
         let node = Box::into_raw(Box::new(StackNode {
-            data: value,
+            data: Some(value),
             prev: self.last,
         }));
         self.last = node;
@@ -46,7 +49,7 @@ impl<T> Stack<T> {
             if self.last.is_null() {
                 None
             } else {
-                Some(&(*self.last).data)
+                (*self.last).data.as_ref()
             }
         }
     }
@@ -55,7 +58,7 @@ impl<T> Stack<T> {
             if self.last.is_null() {
                 None
             } else {
-                Some(&mut (*self.last).data)
+                (*self.last).data.as_mut()
             }
         }
     }
@@ -65,7 +68,7 @@ impl<T> Stack<T> {
                 None
             } else {
                 let p = self.last;
-                let ret = (*self.last).data;
+                let ret = std::mem::replace(&mut (*p).data, None).unwrap();
                 self.last = (*self.last).prev;
                 Box::from_raw(p);
                 Some(ret)
@@ -77,7 +80,7 @@ impl<T> Drop for Stack<T> {
     fn drop(&mut self) {
         unsafe {
             let mut p = self.last;
-            while p.is_null() {
+            while !p.is_null() {
                 let prev = (*p).prev;
                 Box::from_raw(p);
                 p = prev;
