@@ -1369,7 +1369,7 @@ impl Parser {
                     method: Some(name),
                 },
                 FunctionName::Function { name: first } => FunctionName::Method {
-                    access_chain: vec![first, name.clone()],
+                    access_chain: vec![first],
                     method: Some(name),
                 },
             };

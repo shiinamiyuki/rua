@@ -1,10 +1,12 @@
-use crate::closure::ClosurePrototype;
+use std::fmt::Debug;
+
+use crate::{closure::ClosurePrototype, value::Value};
 
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OpCode {
     Nop,
-    
+
     // No operands
     LoadNil,
     LoadTrue,
@@ -33,10 +35,10 @@ pub enum OpCode {
     Dup,
     RotBCA, // stack: A B C -> B C A
 
-    LoadGlobal,// TOS = name
-    StoreGlobal,// TOS~1=value TOS=name global[name]= value
+    LoadGlobal,  // TOS = name
+    StoreGlobal, // TOS~1=value TOS=name global[name]= value
 
-    // 3xu8 operand 
+    // 3xu8 operand
     /*union _3xu8{
         u8 s[3];
         u24 i;
@@ -46,14 +48,14 @@ pub enum OpCode {
     NewTable, //NewTable array len, hash len
     NewClosure,
     LoadStr,
-    LoadLocal, // PUSH  local[i]
+    LoadLocal,  // PUSH  local[i]
     StoreLocal, // local[i] = TOS;POP
-    Unpack, // Unpack TOS to n values, 
-    
-    LoadTable,// TOS = key, table
-    StoreTable, // TOS = value, key, table
-    LoadUpvalue, // TOS=upvalue, push upvalue[i]
-    StoreUpvalue,// TOS~1=upvalue, TOS=value upvalue[i] = value
+    Unpack,     // Unpack TOS to n values,
+
+    LoadTable,    // TOS = key, table
+    StoreTable,   // TOS = value, key, table
+    LoadUpvalue,  // TOS=upvalue, push upvalue[i]
+    StoreUpvalue, // TOS~1=upvalue, TOS=value upvalue[i] = value
 
     Scatter, // Scatter{n, table_idx} local[scatter_table[table_idx]..] = stack[TOP-n-1..TOP-n]
     Gather,
@@ -61,10 +63,10 @@ pub enum OpCode {
     // with extended bytes
     LoadNumber,
     Jump,
+    Self_,
     Call, // Call{n_args:u8,}, TOS = func, TOS~[1..=n_args] = args, pop func
     TailCall,
     TestJump, // TestJump b, pop_t, pop_f, addr;  if TOS==b, if pop_t{pop} jmp addr, else {if pop_f pop}
-    
 }
 /*
 a or b
@@ -95,13 +97,23 @@ pub enum ByteCode {
     FloatHi([u8; 4]),
     FloatLo([u8; 4]),
     Address([u8; 4]),
-    Label([u8;4]), // used only during compilation
+    Label([u8; 4]), // used only during compilation
 }
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct ByteCodeModule {
-    pub(crate) protypes:Vec<ClosurePrototype>,
-    pub(crate) string_pool:Vec<String>,
+    pub(crate) protypes: Vec<ClosurePrototype>,
+    pub(crate) string_pool: Vec<String>,
+    pub(crate) string_pool_cache: Vec<Value>,
     pub(crate) code: Vec<ByteCode>,
+}
+impl Debug for ByteCodeModule {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ByteCodeModule")
+            .field("protypes", &self.protypes)
+            .field("string_pool", &self.string_pool)
+            .field("code", &self.code)
+            .finish()
+    }
 }
 mod test {
     #[test]
@@ -117,6 +129,6 @@ pub(crate) fn get_3xu8(i: u32) -> [u8; 3] {
     assert!(bytes[3] == 0);
     [bytes[0], bytes[1], bytes[2]]
 }
-pub(crate) fn u32_from_3xu8(bytes:[u8; 3]) -> u32 {
+pub(crate) fn u32_from_3xu8(bytes: [u8; 3]) -> u32 {
     u32::from_le_bytes([bytes[0], bytes[1], bytes[2], 0])
 }

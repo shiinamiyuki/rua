@@ -240,7 +240,7 @@ impl State {
             None => {
                 return Err(RuntimeError {
                     kind: ErrorKind::TypeError,
-                    msg: format!(" attempt to index a {} value", table.type_of()),
+                    msg: format!(" attempt to index a {} value, key:{}", table.type_of(), key.print()),
                 })
             }
         };
@@ -258,7 +258,12 @@ impl State {
             None => {
                 return Err(RuntimeError {
                     kind: ErrorKind::TypeError,
-                    msg: format!(" attempt to index a {} value", table.type_of()),
+                    msg: format!(
+                        " attempt to index a {} value, key:{}, value:{}",
+                        table.type_of(),
+                        key.print(),
+                        value.print()
+                    ),
                 })
             }
         };

@@ -8,8 +8,11 @@ use std::{
 };
 
 use crate::{
+    bytecode::ByteCodeModule,
     closure::{Callable, NativeFunction},
+    compile::{compile, CompileError},
     gc::{GcState, Traceable},
+    parse::{parse_impl, tokenize},
     state::{CallContext, State},
     stdlib,
     table::Table,
@@ -25,6 +28,7 @@ pub enum ErrorKind {
     NameError,
     ExternalError,
     ArgumentArityError,
+    CompileError,
 }
 #[derive(Debug, Clone)]
 pub struct RuntimeError {
@@ -32,10 +36,11 @@ pub struct RuntimeError {
     pub msg: String,
 }
 
-struct RuntimeInner {
-    gc: Rc<GcState>,
-    globals: Value,
-    instances: Vec<Rc<Instance>>,
+pub(crate) struct RuntimeInner {
+    pub(crate) gc: Rc<GcState>,
+    pub(crate) globals: Value,
+    pub(crate) instances: Vec<Rc<Instance>>,
+    pub(crate) string_pool: HashMap<String, Value>,
 }
 pub struct ValueRef<'a> {
     pub(crate) value: Value,
@@ -284,7 +289,7 @@ impl Runtime {
         r
     }
     pub fn create_instance(&self) -> Rc<Instance> {
-        self.inner.borrow_mut().create_instance()
+        self.inner.borrow_mut().create_instance(self.inner.clone())
     }
     pub fn create_module(&self) -> Module {
         let gc = self.inner.borrow().gc.clone();
@@ -298,6 +303,48 @@ impl Runtime {
     }
     pub fn add_module(&self, name: String, module: Module) {
         self.inner.borrow_mut().add_module(name, module)
+    }
+    pub fn compile(&self, filename: &str, source: &str) -> Result<ByteCodeModule, CompileError> {
+        let show_ast = std::env::var("PRINT_AST").map_or(false, |x| x == "1");
+        let show_module = std::env::var("PRINT_BYTECODE").map_or(false, |x| x == "1");
+        let tokens = tokenize(filename, &source);
+        let tokens = match tokens {
+            Ok(tokens) => tokens,
+            Err(err) => {
+                return Err(CompileError {
+                    loc: err.loc.clone(),
+                    kind: crate::compile::ErrorKind::ParseOrTokenizeError,
+                    msg: format!(
+                        "error: {}\n  --> {}:{}:{}",
+                        err.msg, *err.loc.file, err.loc.line, err.loc.col
+                    ),
+                })
+            }
+        };
+
+        let expr = parse_impl(tokens);
+        let expr = match expr {
+            Ok(expr) => expr,
+            Err(err) => {
+                return Err(CompileError {
+                    loc: err.loc.clone(),
+                    kind: crate::compile::ErrorKind::ParseOrTokenizeError,
+                    msg: format!(
+                        "error: {}\n  --> {}:{}:{}",
+                        err.msg, *err.loc.file, err.loc.line, err.loc.col
+                    ),
+                });
+            }
+        };
+        if show_ast {
+            println!("{:#?}", expr);
+        }
+
+        let module = compile(expr)?;
+        if show_module {
+            println!("{:#?}", module);
+        }
+        Ok(module)
     }
 }
 
@@ -340,9 +387,10 @@ impl RuntimeInner {
         //     phantom:PhantomData{},
         // })
     }
-    fn create_instance(&mut self) -> Rc<Instance> {
+    fn create_instance(&mut self, pself: Rc<RefCell<RuntimeInner>>) -> Rc<Instance> {
         let instance = Rc::new(Instance {
             gc: self.gc.clone(),
+            runtime: pself.clone(),
             state: State {
                 gc: self.gc.clone(),
                 globals: self.globals,
@@ -390,6 +438,7 @@ impl RuntimeInner {
         let gc = Rc::new(GcState::new());
         let runtime = Self {
             gc: gc.clone(),
+            string_pool: HashMap::new(),
             globals: Value {
                 data: ValueData::Table(gc.allocate(RefCell::new(Table::new()))),
                 metatable: None,
@@ -404,6 +453,9 @@ impl Traceable for RuntimeInner {
         gc.trace(&self.globals);
         for instance in &self.instances {
             gc.trace(instance.as_ref());
+        }
+        for (_, s) in &self.string_pool {
+            gc.trace(s);
         }
     }
 }

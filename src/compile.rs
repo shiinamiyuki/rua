@@ -16,6 +16,7 @@ use crate::{
 
 #[derive(Clone, Copy, Debug)]
 pub enum ErrorKind {
+    ParseOrTokenizeError,
     TooManyLocals,
     OutOfMemoryError,
     SemanticError,
@@ -383,7 +384,7 @@ impl Compiler {
                 Ok(())
             }
             Expr::CallExpr { callee, args } => {
-                for arg in args {
+                for arg in args.iter().rev() {
                     self.compile_expr(&**arg)?;
                 }
                 self.compile_expr(&*callee)?;
@@ -394,7 +395,21 @@ impl Compiler {
                 callee,
                 method,
                 args,
-            } => todo!(),
+            } => {
+                // todo!()
+                for arg in args.iter().rev() {
+                    self.compile_expr(&**arg)?;
+                }
+                self.compile_expr(callee)?;
+                let method = match method {
+                    Token::Identifier { value, .. } => value,
+                    _ => unreachable!(),
+                };
+                self.push_string(method);
+                self.emit(ByteCode::Op(OpCode::Self_));
+                self.emit(ByteCode::Op3U8(OpCode::Call, [args.len() as u8 + 1, 0, 0]));
+                Ok(())
+            }
             Expr::FunctionExpr { loc, args, body } => {
                 self.compile_function(None, args, body, FunctionLocation::Stack)
             }
@@ -645,6 +660,31 @@ impl Compiler {
         self.emit(ByteCode::Label(end.to_le_bytes()));
         let entry = self.module.code.len() as u32;
         self.enter_scope(true);
+        let mut arg_offset = 0;
+        match location {
+            FunctionLocation::Global => match name.unwrap() {
+                FunctionName::Method {
+                    access_chain:_,
+                    method,
+                } => {
+                    if method.is_some() {
+                        arg_offset = 1;
+                        let uid = self.new_var_uid();
+                        self.symbols.set(
+                            "self".into(),
+                            VarInfo {
+                                func_scope: self.funcs.len(),
+                                location: 0,
+                                uid,
+                                is_upvalue: false,
+                            },
+                        );
+                    }
+                }
+                _ => {}
+            },
+            _ => {}
+        }
         for (i, arg) in args.iter().enumerate() {
             let name = match arg {
                 Token::Identifier { value, .. } => value,
@@ -655,7 +695,7 @@ impl Compiler {
                 name.clone(),
                 VarInfo {
                     func_scope: self.funcs.len(),
-                    location: i as u32,
+                    location: i as u32 + arg_offset,
                     uid,
                     is_upvalue: false,
                 },
@@ -690,9 +730,47 @@ impl Compiler {
         match location {
             FunctionLocation::Global => match name.unwrap() {
                 FunctionName::Method {
-                    access_chain: _,
-                    method: _,
-                } => todo!(),
+                    access_chain,
+                    method,
+                } => {
+                    let access_chain: Vec<_> = access_chain
+                        .iter()
+                        .map(|x| match x {
+                            Token::Identifier { value, .. } => value,
+                            _ => unreachable!(),
+                        })
+                        .collect();
+                    let method = method.as_ref().map(|x| match x {
+                        Token::Identifier { value, .. } => value,
+                        _ => unreachable!(),
+                    });
+                    if let Some(method) = method {
+                        self.push_string(method);
+                    }
+                    for (_i, acc) in access_chain.iter().enumerate().rev() {
+                        self.push_string(acc);
+                    }
+                    if let Some(_method) = method {
+                        for (i, _acc) in access_chain.iter().enumerate() {
+                            if i == 0 {
+                                self.emit(ByteCode::Op(OpCode::LoadGlobal));
+                            } else {
+                                self.emit(ByteCode::Op(OpCode::LoadTable));
+                            }
+                        }
+                        self.emit(ByteCode::Op(OpCode::StoreTable));
+                    } else {
+                        for (i, _acc) in access_chain.iter().enumerate() {
+                            if i == 0 {
+                                self.emit(ByteCode::Op(OpCode::LoadGlobal));
+                            } else if i != access_chain.len() - 1 {
+                                self.emit(ByteCode::Op(OpCode::LoadTable));
+                            } else {
+                                self.emit(ByteCode::Op(OpCode::StoreTable));
+                            }
+                        }
+                    }
+                }
                 FunctionName::Function { name } => match name {
                     Token::Identifier { value, .. } => {
                         self.push_string(value);
@@ -803,6 +881,7 @@ impl Compiler {
         let module = std::mem::replace(
             &mut self.module,
             ByteCodeModule {
+                string_pool_cache: vec![],
                 protypes: vec![],
                 code: vec![],
                 string_pool: vec![],
@@ -859,6 +938,7 @@ pub fn compile(block: Rc<Stmt>) -> Result<ByteCodeModule, CompileError> {
             n_locals: 0,
         },
         module: ByteCodeModule {
+            string_pool_cache: vec![],
             protypes: vec![],
             code: vec![],
             string_pool: vec![],

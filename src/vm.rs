@@ -10,7 +10,7 @@ use crate::{
     bytecode::{u32_from_3xu8, ByteCode, ByteCodeModule, OpCode},
     closure::{Callable, Closure, UpValue, UpValueInner},
     gc::{Gc, GcState, Traceable},
-    runtime::{ErrorKind, RuntimeError},
+    runtime::{ErrorKind, RuntimeError, RuntimeInner},
     state::{CallContext, Frame, State},
     table::Table,
     value::{Managed, ManagedCell, Value, ValueData},
@@ -22,6 +22,7 @@ The instances represents a thread
 pub struct Instance {
     pub(crate) gc: Rc<GcState>,
     pub(crate) state: State,
+    pub(crate) runtime: Rc<RefCell<RuntimeInner>>,
 }
 
 enum Continue {
@@ -33,7 +34,7 @@ macro_rules! new_frame {
     ($eval_stack:expr, $n_args:expr,$closure:expr) => {{
         let mut frame = Frame::new($eval_stack.len() - $n_args, $n_args, $closure);
         for i in 0..$n_args {
-            frame.locals[i] = $eval_stack[$eval_stack.len() - $n_args + i];
+            frame.locals[i] = $eval_stack[$eval_stack.len() - 1 - i];
         }
         let len = $eval_stack.len();
         $eval_stack.resize(len - $n_args, Value::nil());
@@ -153,6 +154,12 @@ impl Instance {
                         eval_stack[i - 1] = c;
                         eval_stack[i] = a;
                     }
+                    OpCode::Self_ => {
+                        let method = eval_stack.pop().unwrap();
+                        let table = eval_stack.last().unwrap();
+                        let f = state.table_get(*table, method)?;
+                        eval_stack.push(f);
+                    }
                     OpCode::Not => {
                         let top = eval_stack.last_mut().unwrap();
                         *top = state.not(*top)?;
@@ -211,6 +218,12 @@ impl Instance {
                     }
                     OpCode::LoadFalse => {
                         eval_stack.push(Value::from_bool(false));
+                    }
+                    OpCode::And => {
+                        binary_op_impl!(bitwise_and)
+                    }
+                    OpCode::Or => {
+                        binary_op_impl!(bitwise_or)
                     }
                     OpCode::Add => {
                         binary_op_impl!(add)
@@ -281,8 +294,9 @@ impl Instance {
                     }
                     OpCode::LoadStr => {
                         let idx = u32_from_3xu8(operands);
-                        eval_stack
-                            .push(state.create_string(module.string_pool[idx as usize].clone()));
+                        eval_stack.push(module.string_pool_cache[idx as usize]);
+                        // eval_stack
+                        // .push(state.create_string(module.string_pool[idx as usize].clone()));
                     }
                     OpCode::StoreUpvalue => {
                         let idx = u32_from_3xu8(operands);
@@ -423,7 +437,21 @@ impl Instance {
         // println!("{}", eval_stack.last().unwrap().print());
         Ok(Continue::Return)
     }
-    pub fn exec(&self, module: ByteCodeModule) -> Result<(), RuntimeError> {
+    pub fn exec(&self, mut module: ByteCodeModule) -> Result<(), RuntimeError> {
+        {
+            module.string_pool_cache.clear();
+            let mut runtime = self.runtime.borrow_mut();
+            for (_i, s) in module.string_pool.iter().enumerate() {
+                let v = if let Some(v) = runtime.string_pool.get(s) {
+                    *v
+                } else {
+                    let v = self.state.create_string(s.clone());
+                    runtime.string_pool.insert(s.clone(), v);
+                    v
+                };
+                module.string_pool_cache.push(v);
+            }
+        }
         self.exec_impl(module)?;
         assert!(self.state.borrow().eval_stack.borrow().is_empty());
         Ok(())
