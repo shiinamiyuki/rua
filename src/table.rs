@@ -266,7 +266,7 @@ fn is_int(x: f64) -> bool {
     x.fract() == 0.0
 }
 impl Table {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             array: vec![],
             map: LinkedHashMap::new(),
@@ -275,7 +275,7 @@ impl Table {
             need_recompute_len: false,
         }
     }
-    pub fn new_with(array_part_len: usize, hash_part_len: usize) -> Self {
+    pub(crate) fn new_with(array_part_len: usize, hash_part_len: usize) -> Self {
         Self {
             array: vec![Value::nil(); array_part_len],
             map: LinkedHashMap::with_len(hash_part_len),
@@ -284,7 +284,7 @@ impl Table {
             need_recompute_len: false,
         }
     }
-    pub fn len(&mut self) -> usize {
+    pub(crate) fn len(&mut self) -> usize {
         if !self.need_recompute_len {
             self.len
         } else {
@@ -306,7 +306,7 @@ impl Table {
             self.len
         }
     }
-    pub fn get(&self, key: Value) -> Value {
+    pub(crate) fn get(&self, key: Value) -> Value {
         match key.data {
             ValueData::Number(x) if is_int(x.0) => {
                 let i = x.trunc() as i64;
@@ -318,7 +318,7 @@ impl Table {
         }
         self.map.get(key)
     }
-    pub fn set(&mut self, key: Value, value: Value) {
+    pub(crate) fn set(&mut self, key: Value, value: Value) {
         match key.data {
             ValueData::Number(x) if is_int(x.0) => {
                 let i = x.trunc() as i64;

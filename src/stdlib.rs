@@ -11,16 +11,16 @@ pub(crate) fn add_math_lib(runtime: &Runtime) {
     macro_rules! unary_func {
         ($func:ident) => {{
             math.function(stringify!($func).into(), |ctx| {
-                let x:f64 = *ctx.cast_arg(0)?;
+                let x:f64 = ctx.arg(0)?.cast::<f64>()?;
                 // println!("math.{}({})",stringify!($func), x);
-                ctx.ret(0, Value::from_number(x.$func()));
+                ctx.ret(0, ctx.create_number(x.$func()));
                 Ok(())
             });
         }};
         ($name:literal, $func:ident) => {{
             math.function($name.into(), |ctx| {
-                let x:f64 = *ctx.cast_arg(0)?;
-                ctx.ret(0, Value::from_number(x.$func()));
+                let x:f64 = ctx.arg(0)?.cast::<f64>()?;
+                ctx.ret(0, ctx.create_number(x.$func()));
                 Ok(())
             });
         }};

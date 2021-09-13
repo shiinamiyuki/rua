@@ -2,13 +2,13 @@ use crate::{
     bytecode::ByteCode,
     closure::Closure,
     gc::{Gc, GcState, Traceable},
-    runtime::{ErrorKind, RuntimeError},
+    runtime::{ErrorKind, RuntimeError, ValueRef},
     table::Table,
     value::{Managed, ManagedCell, Tuple, TupleUnpack, UserData, Value, ValueData},
     vm::Instance,
     Stack,
 };
-use std::{any::TypeId, cell::RefCell, cmp::Ordering, rc::Rc};
+use std::{any::TypeId, cell::RefCell, cmp::Ordering, marker::PhantomData, rc::Rc};
 
 pub const MAX_LOCALS: usize = 256;
 pub(crate) struct Frame {
@@ -106,156 +106,85 @@ pub struct CallContext<'a> {
     pub(crate) frames: &'a Stack<Frame>,
 }
 
-macro_rules! get_arg {
-    ($ctx:expr, $i:expr) => {{
-        match $ctx.arg($i) {
-            Some(x) => x,
-            None => {
-                return Err(RuntimeError {
-                    kind: ErrorKind::ArgumentArityError,
-                    msg: format!("arg {} is not supplied", $i,),
-                })
-            }
-        }
-    }};
-}
-macro_rules! arg_f64 {
-    ($ctx:expr, $i:expr) => {{
-        let x = get_arg!($ctx, $i);
-        match x.as_f64() {
-            Some(x) => Ok(x),
-            None => {
-                return Err(RuntimeError {
-                    kind: ErrorKind::TypeError,
-                    msg: format!(
-                        "expected arg {} of type 'number' but is {}",
-                        $i,
-                        x.type_of()
-                    ),
-                })
-            }
-        }
-    }};
-}
-// macro_rules! arg_i64 {
-//     ($ctx:expr, $i:expr) => {{
-//         let x = get_arg!($ctx, $i);
-//         match x.as_i64() {
-//             Some(x) => Ok(x),
-//             None => {
-//                 return Err(RuntimeError {
-//                     kind: ErrorKind::TypeError,
-//                     msg: format!("expected arg {} is integer", $I),
-//                 })
-//             }
-//         }
-//     }};
-// }
-macro_rules! arg_user {
-    ($ctx:expr, $i:expr,$t:ty) => {{
-        let x = get_arg!($ctx, $i);
-        match x.as_userdata() {
-            Some(userdata) => {
-                let any = userdata.as_any();
-                if let Some(x) = any.downcast_ref::<$t>() {
-                    Ok(x)
-                } else {
-                    return Err(RuntimeError {
-                        kind: ErrorKind::TypeError,
-                        msg: format!(
-                            "expected arg {}  of type 'userdata' but is {}",
-                            $i,
-                            userdata.type_name()
-                        ),
-                    });
-                }
-            }
-            None => {
-                return Err(RuntimeError {
-                    kind: ErrorKind::TypeError,
-                    msg: format!(
-                        "expected arg {}  of type 'userdata' but is {}",
-                        $i,
-                        x.type_of()
-                    ),
-                })
-            }
-        }
-    }};
-}
-macro_rules! arg_string {
-    ($ctx:expr, $i:expr) => {{
-        let x = get_arg!($ctx, $i);
-        match x.as_string() {
-            Some(x) => Ok(x),
-            None => {
-                return Err(RuntimeError {
-                    kind: ErrorKind::TypeError,
-                    msg: format!(
-                        "expected arg {}  of type 'string' but is {}",
-                        $i,
-                        x.type_of()
-                    ),
-                })
-            }
-        }
-    }};
-}
-// macro_rules! arg {
-//     ($ctx:expr, $i:expr, $t:ty) => {{
-
-//     }};
-// }
-
-fn dummy_convert<T: 'static, U: 'static>(x: &T) -> &U {
-    if TypeId::of::<T>() == TypeId::of::<U>() {
-        unsafe { std::mem::transmute(x) }
-    } else {
-        unreachable!()
-    }
-}
-
 impl<'a> CallContext<'a> {
+    pub fn create_number(&self, x: f64) -> ValueRef<'a> {
+        ValueRef {
+            phantom: PhantomData {},
+            value: Value::from_number(x),
+        }
+    }
+    pub fn create_bool(&self, x: bool) -> ValueRef<'a> {
+        ValueRef {
+            phantom: PhantomData {},
+            value: Value::from_bool(x),
+        }
+    }
+    pub fn create_userdata<T: UserData + Traceable>(&self, userdata: T) -> ValueRef<'a> {
+        ValueRef {
+            phantom: PhantomData {},
+            value: self.state.create_userdata(userdata),
+        }
+    }
+    pub fn create_string(&self, s: String) -> ValueRef<'a> {
+        ValueRef {
+            phantom: PhantomData {},
+            value: self.state.create_string(s),
+        }
+    }
     pub fn get_arg_count(&self) -> usize {
         let frame = self.frames.last().unwrap();
         frame.n_args
     }
-    pub fn arg(&self, i: usize) -> Option<&Value> {
+    pub fn arg(&'a self, i: usize) -> Result<ValueRef<'a>, RuntimeError> {
         let frame = self.frames.last().unwrap();
         if i < frame.n_args {
-            Some(&frame.locals[i])
+            Ok(ValueRef {
+                value: frame.locals[i],
+                phantom: PhantomData {},
+            })
             // Some(self.eval_stack.borrow()[frame.frame_bottom + i])
         } else {
-            None
+            Err(RuntimeError {
+                kind: ErrorKind::ArgumentArityError,
+                msg: format!("arg {} is not supplied", i,),
+            })
         }
     }
-    pub fn cast_arg<T: 'static>(&self, i: usize) -> Result<&T, RuntimeError> {
-        if TypeId::of::<f64>() == TypeId::of::<T>() {
-            let x = arg_f64!(self, i)?;
-            Ok(dummy_convert::<f64, T>(x))
-        } else if TypeId::of::<String>() == TypeId::of::<T>() {
-            let x = arg_string!(self, i)?;
-            Ok(dummy_convert::<String, T>(x))
-        } else {
-            let x = arg_user!(self, i, T)?;
-            Ok(dummy_convert::<T, T>(x))
-        }
+    pub fn table_set(
+        &self,
+        table: ValueRef<'a>,
+        key: ValueRef<'a>,
+        value: ValueRef<'a>,
+    ) -> Result<(), RuntimeError> {
+        self.state.table_set(table.value, key.value, value.value)
     }
-    pub fn table_set(&self, table: Value, key: Value, value: Value) -> Result<(), RuntimeError> {
-        self.state.table_set(table, key, value)
+    pub fn table_get(
+        &self,
+        table: ValueRef<'a>,
+        key: ValueRef<'a>,
+    ) -> Result<ValueRef<'a>, RuntimeError> {
+        Ok(ValueRef {
+            value: self.state.table_get(table.value, key.value)?,
+            phantom: PhantomData {},
+        })
     }
-    pub fn table_get(&self, table: Value, key: Value) -> Result<Value, RuntimeError> {
-        self.state.table_get(table, key)
-    }
-    pub fn ret(&self, i: usize, value: Value) {
+    pub fn ret(&self, i: usize, value: ValueRef<'a>) {
         let mut ret_values = self.ret_values.borrow_mut();
         if i >= ret_values.len() {
             ret_values.resize(i + 1, Value::nil());
         }
-        ret_values[i] = value;
+        ret_values[i] = value.value;
     }
-    pub fn call(&self, closure: Value, args: &[Value]) -> Result<Value, RuntimeError> {
-        self.instance.call(closure, args)
+    pub fn call(
+        &self,
+        closure: ValueRef<'a>,
+        args: &[ValueRef<'a>],
+    ) -> Result<ValueRef<'a>, RuntimeError> {
+        let args: Vec<_> = args.iter().map(|x| x.value).collect();
+        Ok(ValueRef {
+            value: self.instance.call(closure.value, &args)?,
+            phantom: PhantomData {},
+        })
     }
 }
 impl<'a> Drop for CallContext<'a> {
@@ -280,12 +209,12 @@ impl<'a> Drop for CallContext<'a> {
     }
 }
 impl State {
-    pub fn get_global(&self, name: Value) -> Value {
+    pub(crate) fn get_global(&self, name: Value) -> Value {
         let globals = self.globals.as_table().unwrap();
         let globals = globals.borrow();
         globals.get(name)
     }
-    pub fn set_global(&self, name: Value, value: Value) {
+    pub(crate) fn set_global(&self, name: Value, value: Value) {
         let globals = self.globals.as_table().unwrap();
         let mut globals = globals.borrow_mut();
         globals.set(name, value)
@@ -305,7 +234,7 @@ impl State {
     //         Value::nil()
     //     }
     // }
-    pub fn table_get(&self, table: Value, key: Value) -> Result<Value, RuntimeError> {
+    pub(crate) fn table_get(&self, table: Value, key: Value) -> Result<Value, RuntimeError> {
         let table = match table.as_table() {
             Some(x) => x,
             None => {
@@ -318,7 +247,12 @@ impl State {
         let table = table.borrow();
         Ok(table.get(key))
     }
-    pub fn table_set(&self, table: Value, key: Value, value: Value) -> Result<(), RuntimeError> {
+    pub(crate) fn table_set(
+        &self,
+        table: Value,
+        key: Value,
+        value: Value,
+    ) -> Result<(), RuntimeError> {
         let table = match table.as_table() {
             Some(x) => x,
             None => {
@@ -359,7 +293,7 @@ impl State {
     //         }
     //     }
     // }
-    pub fn create_userdata<T: UserData + Traceable>(&self, userdata: T) -> Value {
+    pub(crate) fn create_userdata<T: UserData + Traceable>(&self, userdata: T) -> Value {
         let p: Box<dyn UserData> = Box::new(userdata);
         let s = self.gc.allocate(p);
         Value {
@@ -367,43 +301,43 @@ impl State {
             metatable: None,
         }
     }
-    pub fn create_string(&self, s: String) -> Value {
+    pub(crate) fn create_string(&self, s: String) -> Value {
         let s = self.gc.allocate(Managed { data: s });
         Value {
             data: ValueData::String(s),
             metatable: None,
         }
     }
-    pub fn create_table(&self, t: Table) -> Value {
+    pub(crate) fn create_table(&self, t: Table) -> Value {
         let t = self.gc.allocate(RefCell::new(t));
         Value {
             data: ValueData::Table(t),
             metatable: None,
         }
     }
-    pub fn create_closure(&self, c: Closure) -> Value {
+    pub(crate) fn create_closure(&self, c: Closure) -> Value {
         let c = self.gc.allocate(c);
         Value {
             data: ValueData::Closure(c),
             metatable: None,
         }
     }
-    pub fn add(&self, a: Value, b: Value) -> Result<Value, RuntimeError> {
+    pub(crate) fn add(&self, a: Value, b: Value) -> Result<Value, RuntimeError> {
         binary_op_impl!(+, a,b)
     }
-    pub fn sub(&self, a: Value, b: Value) -> Result<Value, RuntimeError> {
+    pub(crate) fn sub(&self, a: Value, b: Value) -> Result<Value, RuntimeError> {
         binary_op_impl!(-, a,b)
     }
-    pub fn mul(&self, a: Value, b: Value) -> Result<Value, RuntimeError> {
+    pub(crate) fn mul(&self, a: Value, b: Value) -> Result<Value, RuntimeError> {
         binary_op_impl!(*, a,b)
     }
-    pub fn div(&self, a: Value, b: Value) -> Result<Value, RuntimeError> {
+    pub(crate) fn div(&self, a: Value, b: Value) -> Result<Value, RuntimeError> {
         binary_op_impl!(/, a,b)
     }
-    pub fn mod_(&self, a: Value, b: Value) -> Result<Value, RuntimeError> {
+    pub(crate) fn mod_(&self, a: Value, b: Value) -> Result<Value, RuntimeError> {
         binary_op_impl!(%, a,b)
     }
-    pub fn pow(&self, a: Value, b: Value) -> Result<Value, RuntimeError> {
+    pub(crate) fn pow(&self, a: Value, b: Value) -> Result<Value, RuntimeError> {
         if let (Some(a), Some(b)) = (a.number(), b.number()) {
             Ok(Value::from_number(a.powf(b)))
         } else {
@@ -417,14 +351,14 @@ impl State {
             })
         }
     }
-    pub fn bitwise_and(&self, a: Value, b: Value) -> Result<Value, RuntimeError> {
+    pub(crate) fn bitwise_and(&self, a: Value, b: Value) -> Result<Value, RuntimeError> {
         int_binary_op_impl!(&, a, b)
     }
-    pub fn bitwise_or(&self, a: Value, b: Value) -> Result<Value, RuntimeError> {
+    pub(crate) fn bitwise_or(&self, a: Value, b: Value) -> Result<Value, RuntimeError> {
         int_binary_op_impl!(|, a, b)
     }
 
-    pub fn cmp(&self, a: Value, b: Value) -> Result<Ordering, RuntimeError> {
+    pub(crate) fn cmp(&self, a: Value, b: Value) -> Result<Ordering, RuntimeError> {
         let res = match (a.data, b.data) {
             (ValueData::Nil, ValueData::Nil) => Ok(Ordering::Equal),
             (ValueData::Bool(a), ValueData::Bool(b)) => Ok(a.cmp(&b)),
@@ -459,35 +393,35 @@ impl State {
         res
     }
 
-    pub fn lt(&self, a: Value, b: Value) -> Result<Value, RuntimeError> {
+    pub(crate) fn lt(&self, a: Value, b: Value) -> Result<Value, RuntimeError> {
         let ordering = self.cmp(a, b)?;
         Ok(Value::from_bool(ordering == Ordering::Less))
     }
-    pub fn le(&self, a: Value, b: Value) -> Result<Value, RuntimeError> {
+    pub(crate) fn le(&self, a: Value, b: Value) -> Result<Value, RuntimeError> {
         let ordering = self.cmp(a, b)?;
         Ok(Value::from_bool(
             ordering == Ordering::Less || ordering == Ordering::Equal,
         ))
     }
-    pub fn gt(&self, a: Value, b: Value) -> Result<Value, RuntimeError> {
+    pub(crate) fn gt(&self, a: Value, b: Value) -> Result<Value, RuntimeError> {
         let ordering = self.cmp(a, b)?;
         Ok(Value::from_bool(ordering == Ordering::Greater))
     }
-    pub fn ge(&self, a: Value, b: Value) -> Result<Value, RuntimeError> {
+    pub(crate) fn ge(&self, a: Value, b: Value) -> Result<Value, RuntimeError> {
         let ordering = self.cmp(a, b)?;
         Ok(Value::from_bool(
             ordering == Ordering::Greater || ordering == Ordering::Equal,
         ))
     }
-    pub fn eq(&self, a: Value, b: Value) -> Result<Value, RuntimeError> {
+    pub(crate) fn eq(&self, a: Value, b: Value) -> Result<Value, RuntimeError> {
         let ordering = self.cmp(a, b)?;
         Ok(Value::from_bool(ordering == Ordering::Equal))
     }
-    pub fn ne(&self, a: Value, b: Value) -> Result<Value, RuntimeError> {
+    pub(crate) fn ne(&self, a: Value, b: Value) -> Result<Value, RuntimeError> {
         let ordering = self.cmp(a, b)?;
         Ok(Value::from_bool(ordering != Ordering::Equal))
     }
-    pub fn idiv(&self, a: Value, b: Value) -> Result<Value, RuntimeError> {
+    pub(crate) fn idiv(&self, a: Value, b: Value) -> Result<Value, RuntimeError> {
         if let (Some(a), Some(b)) = (a.number(), b.number()) {
             if b == 0.0 {
                 return Err(RuntimeError {
@@ -507,7 +441,7 @@ impl State {
             })
         }
     }
-    pub fn len(&self, a: Value) -> Result<Value, RuntimeError> {
+    pub(crate) fn len(&self, a: Value) -> Result<Value, RuntimeError> {
         match a.data {
             // ValueData::Nil => todo!(),
             // ValueData::Bool(_) => todo!(),
@@ -523,10 +457,10 @@ impl State {
             }),
         }
     }
-    pub fn not(&self, a: Value) -> Result<Value, RuntimeError> {
+    pub(crate) fn not(&self, a: Value) -> Result<Value, RuntimeError> {
         Ok(Value::from_bool(!a.to_bool()))
     }
-    pub fn bitwise_not(&self, a: Value) -> Result<Value, RuntimeError> {
+    pub(crate) fn bitwise_not(&self, a: Value) -> Result<Value, RuntimeError> {
         match a.data {
             // ValueData::Nil => todo!(),
             // ValueData::Bool(_) => todo!(),
@@ -547,7 +481,7 @@ impl State {
             }),
         }
     }
-    pub fn neg(&self, a: Value) -> Result<Value, RuntimeError> {
+    pub(crate) fn neg(&self, a: Value) -> Result<Value, RuntimeError> {
         match a.data {
             // ValueData::Nil => todo!(),
             // ValueData::Bool(_) => todo!(),

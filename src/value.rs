@@ -87,8 +87,8 @@ pub enum TupleUnpack {
     TruncateFill,
 }
 pub struct Tuple {
-    pub values: Vec<Value>,
-    pub unpack: TupleUnpack,
+    pub(crate) values: Vec<Value>,
+    pub(crate) unpack: TupleUnpack,
 }
 impl Traceable for Tuple {
     fn trace(&self, gc: &GcState) {
@@ -159,9 +159,9 @@ impl Hash for ValueData {
 }
 impl Eq for ValueData {}
 #[derive(Clone, Copy, Hash, PartialEq, Eq)]
-pub struct Value {
-    pub data: ValueData,
-    pub metatable: Option<Gc<RefCell<Table>>>,
+pub(crate) struct Value {
+    pub(crate) data: ValueData,
+    pub(crate) metatable: Option<Gc<RefCell<Table>>>,
 }
 // impl Hash for Value {
 //     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
@@ -192,28 +192,28 @@ impl Traceable for Value {
 }
 
 impl Value {
-    pub fn is_nil(&self) -> bool {
+    pub(crate) fn is_nil(&self) -> bool {
         match self.data {
             ValueData::Nil => true,
             _ => false,
         }
     }
-    pub fn nil() -> Self {
+    pub(crate) fn nil() -> Self {
         Default::default()
     }
-    pub fn from_bool(x: bool) -> Self {
+    pub(crate) fn from_bool(x: bool) -> Self {
         Self {
             data: ValueData::Bool(x),
             metatable: None,
         }
     }
-    pub fn from_number(x: f64) -> Self {
+    pub(crate) fn from_number(x: f64) -> Self {
         Self {
             data: ValueData::Number(OrderedFloat(x)),
             metatable: None,
         }
     }
-    pub fn number(&self) -> Option<f64> {
+    pub(crate) fn number(&self) -> Option<f64> {
         match self.data {
             ValueData::Number(x) => Some(x.0),
             ValueData::String(s) => {
@@ -226,19 +226,19 @@ impl Value {
             _ => None,
         }
     }
-    pub fn as_f64(&self) -> Option<&f64> {
+    pub(crate) fn as_f64(&self) -> Option<&f64> {
         match &self.data {
             ValueData::Number(x) => Some(&x.0),
             _ => None,
         }
     }
-    pub fn as_bool(&self) -> Option<&bool> {
+    pub(crate) fn as_bool(&self) -> Option<&bool> {
         match &self.data {
             ValueData::Bool(x) => Some(x),
             _ => None,
         }
     }
-    pub fn to_bool(&self) -> bool {
+    pub(crate) fn to_bool(&self) -> bool {
         match self.data {
             ValueData::Number(x) => x != 0.0,
             ValueData::Bool(x) => x,
@@ -264,7 +264,7 @@ impl Value {
             _ => None,
         }
     }
-    pub fn as_i64(&self) -> Option<i64> {
+    pub(crate) fn as_i64(&self) -> Option<i64> {
         let x = self.number()?;
         let fract = x.fract();
         if fract == 0.0 {
@@ -273,7 +273,7 @@ impl Value {
             None
         }
     }
-    pub fn type_of(&self) -> &'static str {
+    pub(crate) fn type_of(&self) -> &'static str {
         match self.data {
             ValueData::Nil => "nil",
             ValueData::Bool(_) => "boolean",
@@ -283,10 +283,10 @@ impl Value {
             ValueData::Closure(_) => "function",
             ValueData::Callable(_) => "function",
             ValueData::Tuple(_) => "tuple",
-            ValueData::UserData(_) => "userdata",
+            ValueData::UserData(x) => x.type_name(),
         }
     }
-    pub fn print(&self) -> String {
+    pub(crate) fn print(&self) -> String {
         match self.data {
             ValueData::Nil => String::from("nil"),
             ValueData::Bool(t) => {
@@ -312,7 +312,7 @@ impl Value {
             }
             ValueData::Tuple(tuple) => {
                 let mut s = String::from("(");
-                for (i, v) in unsafe { (*tuple).values.iter().enumerate() } {
+                for (i, v) in  (*tuple).values.iter().enumerate()  {
                     if i > 0 {
                         s.push(',');
                     }

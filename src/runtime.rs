@@ -1,6 +1,9 @@
 use std::{
-    cell::{Ref, RefCell},
+    any::TypeId,
+    cell::{Cell, Ref, RefCell, RefMut},
     collections::HashMap,
+    marker::PhantomData,
+    mem::size_of,
     rc::Rc,
 };
 
@@ -10,7 +13,7 @@ use crate::{
     state::{CallContext, State},
     stdlib,
     table::Table,
-    value::{Managed, ManagedCell, Value, ValueData},
+    value::{Managed, ManagedCell, UserData, Value, ValueData},
     vm::Instance,
     Stack,
 };
@@ -28,30 +31,200 @@ pub struct RuntimeError {
     pub kind: ErrorKind,
     pub msg: String,
 }
-// struct Locals{
-//     locals:RefCell<Vec<Rc<RefCell<Value>>>>,
-// }
+
 struct RuntimeInner {
     gc: Rc<GcState>,
     globals: Value,
     instances: Vec<Rc<Instance>>,
-    // local_handles:Rc<Locals>,
+}
+pub struct ValueRef<'a> {
+    pub(crate) value: Value,
+    pub(crate) phantom: PhantomData<&'a u32>,
+}
+fn dummy_convert_ref<T: 'static, U: 'static>(x: &T) -> &U {
+    if TypeId::of::<T>() == TypeId::of::<U>() {
+        unsafe { std::mem::transmute(x) }
+    } else {
+        unreachable!()
+    }
+}
+fn dummy_convert<T: 'static + Sized, U: 'static + Sized>(x: T) -> U {
+    if TypeId::of::<T>() == TypeId::of::<U>() {
+        unsafe {
+            debug_assert!(size_of::<T>() == size_of::<U>());
+            let y = std::mem::transmute_copy(&x);
+            std::mem::forget(x);
+            y
+        }
+    } else {
+        unreachable!()
+    }
+}
+macro_rules! arg_f64 {
+    ($self:expr) => {{
+        match $self.as_f64() {
+            Some(x) => Ok(x),
+            None => {
+                return Err(RuntimeError {
+                    kind: ErrorKind::TypeError,
+                    msg: format!("expected  type 'number' but is {}", $self.type_of()),
+                })
+            }
+        }
+    }};
+}
+macro_rules! arg_user {
+    ($self:expr,$t:ty) => {{
+        match $self.as_userdata() {
+            Some(userdata) => {
+                let any = userdata.as_any();
+                if let Some(x) = any.downcast_ref::<$t>() {
+                    Ok(x)
+                } else {
+                    return Err(RuntimeError {
+                        kind: ErrorKind::TypeError,
+                        msg: format!("expected type 'userdata' but is {}", userdata.type_name()),
+                    });
+                }
+            }
+            None => {
+                return Err(RuntimeError {
+                    kind: ErrorKind::TypeError,
+                    msg: format!(
+                        "expected 'userdata' {} but is {}",
+                        std::any::type_name::<T>(),
+                        $self.type_of()
+                    ),
+                })
+            }
+        }
+    }};
+}
+macro_rules! arg_string {
+    ($self:expr) => {{
+        match $self.as_string() {
+            Some(x) => Ok(x),
+            None => {
+                return Err(RuntimeError {
+                    kind: ErrorKind::TypeError,
+                    msg: format!("expected 'string' but is {}", $self.type_of()),
+                })
+            }
+        }
+    }};
 }
 
+impl<'a> ValueRef<'a> {
+    pub fn to_number(&'a self) -> Option<f64> {
+        self.value.number()
+    }
+    pub fn as_f64(&'a self) -> Option<&'a f64> {
+        self.value.as_f64()
+    }
+    pub fn as_bool(&'a self) -> Option<&'a bool> {
+        self.value.as_bool()
+    }
+    pub fn as_string(&'a self) -> Option<&'a String> {
+        self.value.as_string()
+    }
+    pub fn as_userdata(&'a self) -> Option<&'a dyn UserData> {
+        self.value.as_userdata()
+    }
+    pub fn to_bool(&self) -> bool {
+        self.value.to_bool()
+    }
+    pub fn type_of(&self) -> &'static str {
+        self.value.type_of()
+    }
+    pub fn cast<T: 'static>(&self) -> Result<T, RuntimeError> {
+        if TypeId::of::<f64>() == TypeId::of::<T>() {
+            let x = match self.to_number() {
+                Some(x) => Ok(x),
+                None => Err(RuntimeError {
+                    kind: ErrorKind::TypeError,
+                    msg: format!("expected  type 'number' but is {}", self.type_of()),
+                }),
+            }?;
+            Ok(dummy_convert::<f64, T>(x))
+        } else if TypeId::of::<String>() == TypeId::of::<T>() {
+            let x = match self.as_string() {
+                Some(x) => Ok(x.clone()),
+                None => Err(RuntimeError {
+                    kind: ErrorKind::TypeError,
+                    msg: format!("expected  type 'string' but is {}", self.type_of()),
+                }),
+            }?;
+            Ok(dummy_convert::<String, T>(x))
+        } else {
+            panic!("attempt to cast a userdata, use cast_ref instead!");
+        }
+    }
+    pub fn cast_ref<T: 'static>(&self) -> Result<&T, RuntimeError> {
+        if TypeId::of::<f64>() == TypeId::of::<T>() {
+            let x = arg_f64!(self)?;
+            Ok(dummy_convert_ref::<f64, T>(x))
+        } else if TypeId::of::<String>() == TypeId::of::<T>() {
+            let x = arg_string!(self)?;
+            Ok(dummy_convert_ref::<String, T>(x))
+        } else {
+            let x = arg_user!(self, T)?;
+            Ok(dummy_convert_ref::<T, T>(x))
+        }
+    }
+}
+
+struct ValueBox {
+    next: Cell<*const ValueBox>,
+    prev: Cell<*const ValueBox>,
+    value: RefCell<Value>,
+}
 /*
 Safe wrapper for Value
 Local are gc roots
 */
-// pub struct Local<'a>{
-//     value:Rc<RefCell<Value>>,
-//     local_handles:Rc<Locals>,
-//     phantom:PhantomData<&'a u32>,
-// }
-// impl<'a>Local<'a>{
-//     pub fn borrow<'a>(&'a self)->Ref<'a,Value>{
-//         self.value.borrow()
-//     }
-// }
+pub struct RootValue {
+    inner: Box<ValueBox>,
+}
+pub struct RootBorrowMut<'a> {
+    inner: &'a ValueBox,
+    ref_: RefMut<'a, Value>,
+    value: ValueRef<'a>,
+}
+
+pub struct RootBorrow<'a> {
+    inner: &'a ValueBox,
+    ref_: Ref<'a, Value>,
+    value: ValueRef<'a>,
+}
+impl RootValue {
+    pub fn borrow_mut<'a>(&'a self) -> RootBorrowMut<'a> {
+        let b = self.inner.value.borrow_mut();
+        RootBorrowMut {
+            inner: self.inner.as_ref(),
+            value: ValueRef {
+                value: *b,
+                phantom: PhantomData {},
+            },
+            ref_: b,
+        }
+    }
+    fn borrow<'a>(&'a self) -> RootBorrow<'a> {
+        let b = self.inner.value.borrow();
+        RootBorrow {
+            inner: self.inner.as_ref(),
+            value: ValueRef {
+                value: *b,
+                phantom: PhantomData {},
+            },
+            ref_: b,
+        }
+    }
+}
+impl<'a> Drop for RootBorrowMut<'a> {
+    fn drop(&mut self) {
+        *self.ref_ = self.value.value;
+    }
+}
 
 pub struct Module {
     runtime: Rc<RefCell<RuntimeInner>>,
@@ -187,19 +360,19 @@ impl RuntimeInner {
                 if i > 0 {
                     print!(" ");
                 }
-                print!("{}", arg.print());
+                print!("{}", arg.value.print());
             }
             print!("\n");
             Ok(())
         });
         self.add_function("assert".into(), |ctx| {
             let v = ctx.arg(0).unwrap();
-            assert!(v.to_bool());
+            assert!(v.value.to_bool());
             Ok(())
         });
         self.add_function("type".into(), |ctx| {
             let v = ctx.arg(0).unwrap();
-            ctx.ret(0, ctx.state.create_string(String::from(v.type_of())));
+            ctx.ret(0, ctx.create_string(String::from(v.type_of())));
             Ok(())
         });
         // let pself = self as *mut RuntimeInner;

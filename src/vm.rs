@@ -287,7 +287,7 @@ impl Instance {
                     OpCode::StoreUpvalue => {
                         let idx = u32_from_3xu8(operands);
                         let v = eval_stack.pop().unwrap();
-                        unsafe {
+                        {
                             let c = frame.closure.as_ref().unwrap();
                             c.set_upvalue(idx, v);
                         }
