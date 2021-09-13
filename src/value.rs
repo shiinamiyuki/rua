@@ -34,6 +34,7 @@ pub type ManagedCell<T> = Managed<RefCell<T>>;
 pub trait UserData: Traceable + Any {
     fn as_traceable(&self) -> &dyn Traceable;
     fn as_any(&self) -> &dyn Any;
+    fn type_name(&self) -> &'static str;
 }
 impl<T> UserData for Managed<T> {
     fn as_traceable(&self) -> &dyn Traceable {
@@ -42,10 +43,13 @@ impl<T> UserData for Managed<T> {
     fn as_any(&self) -> &dyn Any {
         self
     }
+    fn type_name(&self) -> &'static str {
+        std::any::type_name::<T>()
+    }
 }
 impl Traceable for Box<dyn UserData> {
     fn trace(&self, gc: &GcState) {
-        self.trace(gc)
+        self.as_ref().trace(gc)
     }
 }
 
@@ -124,7 +128,7 @@ impl PartialEq for ValueData {
                 if a.ptr_eq(b) {
                     return true;
                 }
-                unsafe {
+                {
                     let a = &(*a).data;
                     let b = &(*b).data;
                     a == b
@@ -142,10 +146,10 @@ impl Hash for ValueData {
             ValueData::Bool(x) => x.hash(state),
             ValueData::Number(x) => x.hash(state),
             ValueData::Table(x) => std::ptr::hash(x.as_ptr(), state),
-            ValueData::String(x) => unsafe {
+            ValueData::String(x) => {
                 let s = &(*x).data;
                 s.hash(state)
-            },
+            }
             ValueData::Closure(x) => std::ptr::hash(x.as_ptr(), state),
             ValueData::Callable(x) => std::ptr::hash(x.as_ptr(), state),
             ValueData::Tuple(x) => std::ptr::hash(x.as_ptr(), state),
@@ -174,13 +178,10 @@ pub struct Value {
 impl Traceable for Value {
     fn trace(&self, gc: &GcState) {
         match self.data {
-            ValueData::Table(x) => unsafe {
-                let table = (*x).borrow();
-                gc.trace(&*table)
-            },
+            ValueData::Table(x) => gc.trace_ptr(x),
             ValueData::String(x) => gc.trace_ptr(x),
             ValueData::Closure(x) => gc.trace_ptr(x),
-            ValueData::Callable(x) => unsafe { gc.trace(&(**x)) },
+            ValueData::Callable(x) => gc.trace_ptr(x),
             ValueData::Tuple(x) => gc.trace_ptr(x),
             _ => {}
         }
@@ -189,6 +190,7 @@ impl Traceable for Value {
         }
     }
 }
+
 impl Value {
     pub fn is_nil(&self) -> bool {
         match self.data {
@@ -214,17 +216,29 @@ impl Value {
     pub fn number(&self) -> Option<f64> {
         match self.data {
             ValueData::Number(x) => Some(x.0),
-            ValueData::String(s) => unsafe {
+            ValueData::String(s) => {
                 if let Ok(x) = (*s).data.parse::<f64>() {
                     Some(x)
                 } else {
                     None
                 }
-            },
+            }
             _ => None,
         }
     }
-    pub fn as_bool(&self) -> bool {
+    pub fn as_f64(&self) -> Option<&f64> {
+        match &self.data {
+            ValueData::Number(x) => Some(&x.0),
+            _ => None,
+        }
+    }
+    pub fn as_bool(&self) -> Option<&bool> {
+        match &self.data {
+            ValueData::Bool(x) => Some(x),
+            _ => None,
+        }
+    }
+    pub fn to_bool(&self) -> bool {
         match self.data {
             ValueData::Number(x) => x != 0.0,
             ValueData::Bool(x) => x,
@@ -241,6 +255,12 @@ impl Value {
     pub(crate) fn as_table<'a>(&'a self) -> Option<&'a RefCell<Table>> {
         match self.data {
             ValueData::Table(t) => unsafe { Some(&(*t.as_ptr())) },
+            _ => None,
+        }
+    }
+    pub(crate) fn as_userdata<'a>(&'a self) -> Option<&'a dyn UserData> {
+        match self.data {
+            ValueData::UserData(t) => unsafe { Some(&(**t.as_ptr())) },
             _ => None,
         }
     }
@@ -280,7 +300,7 @@ impl Value {
             ValueData::Table(table) => {
                 format!("table: 0x{:0x}", table.as_ptr() as u64)
             }
-            ValueData::String(s) => unsafe { (*s).data.clone() },
+            ValueData::String(s) => (*s).data.clone(),
             ValueData::Closure(closure) => {
                 format!("function: 0x{:0x}", closure.as_ptr() as u64)
             }

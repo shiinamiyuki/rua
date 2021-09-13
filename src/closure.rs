@@ -19,7 +19,7 @@ pub trait Callable: Traceable {
 }
 impl Traceable for Box<dyn Callable> {
     fn trace(&self, gc: &GcState) {
-        gc.trace(&*self);
+        self.as_ref().trace(gc)
     }
 }
 pub struct NativeFunction {

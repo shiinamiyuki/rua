@@ -5,6 +5,7 @@ use std::{
         hash_map::{DefaultHasher, RandomState},
         HashMap,
     },
+    fmt,
     hash::{BuildHasher, Hash, Hasher},
 };
 
@@ -19,6 +20,11 @@ struct Entry {
     value: Value,
     prev: usize,
     next: usize,
+}
+impl fmt::Display for Entry {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "({}, {})", self.prev, self.next)
+    }
 }
 
 impl Default for Entry {
@@ -69,6 +75,46 @@ impl<'a> Iterator for LinkedHashMapIter<'a> {
 }
 
 impl LinkedHashMap {
+    // fn check_cycle(&self) -> bool {
+    //     let mut fast = self.iter();
+    //     let mut slow = self.iter();
+    //     let mut prev = usize::MAX;
+    //     let r = loop {
+    //         fast.next();
+    //         let prev= slow.i;
+    //         let a = fast.next();
+    //         let b = slow.next();
+
+    //         if a.is_none() || b.is_none() {
+    //             break false;
+    //         }
+    //         if self.table[slow.i].prev!= prev{
+    //             println!("head={} slow.i={}", self.head, slow.i);
+    //             for (i, e) in self.table.iter().enumerate() {
+    //                 println!("{} {}", i, e);
+    //             }
+    //         }
+    //         assert_eq!(self.table[slow.i].prev, prev);
+    //         if prev != usize::MAX {
+    //             assert_eq!(self.table[prev].next, slow.i);
+    //         }
+    //         if fast.i == slow.i {
+    //             break true;
+    //         }
+    //     };
+    //     if r {
+    //         let mut it = self.iter();
+    //         println!("head={}", self.head);
+    //         for i in 0..10 {
+    //             let i = it.i;
+    //             println!("{}", i);
+    //             if it.next().is_none() {
+    //                 break;
+    //             }
+    //         }
+    //     }
+    //     r
+    // }
     pub(crate) fn iter<'a>(&'a self) -> LinkedHashMapIter<'a> {
         LinkedHashMapIter::<'a> {
             map: self,
@@ -135,6 +181,9 @@ impl LinkedHashMap {
     }
     fn remove(&mut self, k: &Value) {
         let idx = self.get_index(k).unwrap();
+        if self.table[idx].value.is_nil() {
+            return;
+        }
         let entry = self.table[idx];
         let prev = entry.prev;
         let next = entry.next;
@@ -147,8 +196,9 @@ impl LinkedHashMap {
         if next != usize::MAX {
             self.table[next].prev = prev;
         }
-        self.table[idx].value = Value::nil();
+        self.table[idx] = Entry::default();
         self.len -= 1;
+        // debug_assert!(!self.check_cycle());
     }
     fn get(&self, key: Value) -> Value {
         // println!("get {}", key.print());
@@ -162,9 +212,11 @@ impl LinkedHashMap {
         // println!("insert {} {}", k.print(), v.print());
         if self.table.is_empty() {
             self.reset(16);
+            // debug_assert!(!self.check_cycle());
         }
         if self.len * 2 > self.table.len() {
             self.grow();
+            // debug_assert!(!self.check_cycle());
         }
         if v.is_nil() {
             // effectively deleting the entry
@@ -172,23 +224,31 @@ impl LinkedHashMap {
         } else {
             loop {
                 if let Some(idx) = self.get_index(&k) {
-                    let entry = Entry {
-                        key: k,
-                        value: v,
-                        next: self.head,
-                        ..Default::default()
-                    };
-                    if self.head != usize::MAX {
-                        debug_assert!(!self.table[self.head].value.is_nil());
-                        self.table[self.head].prev = idx;
+                    // debug_assert!(!self.check_cycle());
+                    if !self.table[idx].value.is_nil() {
+                        self.table[idx].value = v;
+                        // debug_assert!(!self.check_cycle());
+                    } else {
+                        let entry = Entry {
+                            key: k,
+                            value: v,
+                            next: self.head,
+                            prev: usize::MAX,
+                        };
+                        if self.head != usize::MAX {
+                            // debug_assert!(!self.table[self.head].value.is_nil());
+                            self.table[self.head].prev = idx;
+                        }
+                        self.head = idx;
+                        self.table[idx] = entry;
+                        self.len += 1;
+                        // debug_assert!(!self.check_cycle());
+                        // println!("insert to slot {}", idx);
                     }
-                    self.head = idx;
-                    self.table[idx] = entry;
-                    self.len += 1;
-                    // println!("insert to slot {}", idx);
                     break;
                 } else {
                     self.grow();
+                    // debug_assert!(!self.check_cycle());
                 }
             }
         }

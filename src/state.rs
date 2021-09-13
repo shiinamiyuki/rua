@@ -1,14 +1,14 @@
 use crate::{
     bytecode::ByteCode,
     closure::Closure,
-    gc::{Gc, GcState},
+    gc::{Gc, GcState, Traceable},
     runtime::{ErrorKind, RuntimeError},
     table::Table,
-    value::{Managed, ManagedCell, Tuple, TupleUnpack, Value, ValueData},
+    value::{Managed, ManagedCell, Tuple, TupleUnpack, UserData, Value, ValueData},
     vm::Instance,
     Stack,
 };
-use std::{cell::RefCell, cmp::Ordering, rc::Rc};
+use std::{any::TypeId, cell::RefCell, cmp::Ordering, rc::Rc};
 
 pub const MAX_LOCALS: usize = 256;
 pub(crate) struct Frame {
@@ -20,7 +20,9 @@ pub(crate) struct Frame {
 }
 impl Frame {
     pub(crate) fn get_ip(closure: Option<Gc<Closure>>) -> usize {
-        unsafe { closure.as_ref().map_or(0, |c| c.entry) }
+        {
+            closure.as_ref().map_or(0, |c| c.entry)
+        }
     }
     pub(crate) fn new(frame_bottom: usize, n_args: usize, closure: Option<Gc<Closure>>) -> Self {
         Self {
@@ -101,13 +103,143 @@ pub struct CallContext<'a> {
     pub(crate) state: &'a State,
     pub(crate) instance: &'a Instance,
     pub(crate) ret_values: RefCell<Vec<Value>>,
+    pub(crate) frames: &'a Stack<Frame>,
 }
+
+macro_rules! get_arg {
+    ($ctx:expr, $i:expr) => {{
+        match $ctx.arg($i) {
+            Some(x) => x,
+            None => {
+                return Err(RuntimeError {
+                    kind: ErrorKind::ArgumentArityError,
+                    msg: format!("arg {} is not supplied", $i,),
+                })
+            }
+        }
+    }};
+}
+macro_rules! arg_f64 {
+    ($ctx:expr, $i:expr) => {{
+        let x = get_arg!($ctx, $i);
+        match x.as_f64() {
+            Some(x) => Ok(x),
+            None => {
+                return Err(RuntimeError {
+                    kind: ErrorKind::TypeError,
+                    msg: format!(
+                        "expected arg {} of type 'number' but is {}",
+                        $i,
+                        x.type_of()
+                    ),
+                })
+            }
+        }
+    }};
+}
+// macro_rules! arg_i64 {
+//     ($ctx:expr, $i:expr) => {{
+//         let x = get_arg!($ctx, $i);
+//         match x.as_i64() {
+//             Some(x) => Ok(x),
+//             None => {
+//                 return Err(RuntimeError {
+//                     kind: ErrorKind::TypeError,
+//                     msg: format!("expected arg {} is integer", $I),
+//                 })
+//             }
+//         }
+//     }};
+// }
+macro_rules! arg_user {
+    ($ctx:expr, $i:expr,$t:ty) => {{
+        let x = get_arg!($ctx, $i);
+        match x.as_userdata() {
+            Some(userdata) => {
+                let any = userdata.as_any();
+                if let Some(x) = any.downcast_ref::<$t>() {
+                    Ok(x)
+                } else {
+                    return Err(RuntimeError {
+                        kind: ErrorKind::TypeError,
+                        msg: format!(
+                            "expected arg {}  of type 'userdata' but is {}",
+                            $i,
+                            userdata.type_name()
+                        ),
+                    });
+                }
+            }
+            None => {
+                return Err(RuntimeError {
+                    kind: ErrorKind::TypeError,
+                    msg: format!(
+                        "expected arg {}  of type 'userdata' but is {}",
+                        $i,
+                        x.type_of()
+                    ),
+                })
+            }
+        }
+    }};
+}
+macro_rules! arg_string {
+    ($ctx:expr, $i:expr) => {{
+        let x = get_arg!($ctx, $i);
+        match x.as_string() {
+            Some(x) => Ok(x),
+            None => {
+                return Err(RuntimeError {
+                    kind: ErrorKind::TypeError,
+                    msg: format!(
+                        "expected arg {}  of type 'string' but is {}",
+                        $i,
+                        x.type_of()
+                    ),
+                })
+            }
+        }
+    }};
+}
+// macro_rules! arg {
+//     ($ctx:expr, $i:expr, $t:ty) => {{
+
+//     }};
+// }
+
+fn dummy_convert<T: 'static, U: 'static>(x: &T) -> &U {
+    if TypeId::of::<T>() == TypeId::of::<U>() {
+        unsafe { std::mem::transmute(x) }
+    } else {
+        unreachable!()
+    }
+}
+
 impl<'a> CallContext<'a> {
     pub fn get_arg_count(&self) -> usize {
-        self.state.get_arg_count()
+        let frame = self.frames.last().unwrap();
+        frame.n_args
     }
-    pub fn arg(&self, i: usize) -> Value {
-        self.state.arg(i)
+    pub fn arg(&self, i: usize) -> Option<&Value> {
+        let frame = self.frames.last().unwrap();
+        if i < frame.n_args {
+            Some(&frame.locals[i])
+            // Some(self.eval_stack.borrow()[frame.frame_bottom + i])
+        } else {
+            None
+        }
+    }
+    pub fn cast_arg<T: 'static>(&self, i: usize) -> Result<&T, RuntimeError> {
+        if TypeId::of::<f64>() == TypeId::of::<T>() {
+            let x = arg_f64!(self, i)?;
+            Ok(dummy_convert::<f64, T>(x))
+        } else if TypeId::of::<String>() == TypeId::of::<T>() {
+            let x = arg_string!(self, i)?;
+            Ok(dummy_convert::<String, T>(x))
+        } else {
+            let x = arg_user!(self, i, T)?;
+            Ok(dummy_convert::<T, T>(x))
+        }
     }
     pub fn table_set(&self, table: Value, key: Value, value: Value) -> Result<(), RuntimeError> {
         self.state.table_set(table, key, value)
@@ -158,21 +290,21 @@ impl State {
         let mut globals = globals.borrow_mut();
         globals.set(name, value)
     }
-    fn get_arg_count(&self) -> usize {
-        let frames = self.frames.borrow();
-        let frame = frames.last().unwrap();
-        frame.n_args
-    }
-    fn arg(&self, i: usize) -> Value {
-        let frames = self.frames.borrow();
-        let frame = frames.last().unwrap();
-        if i < frame.n_args {
-            frame.locals[i]
-            // Some(self.eval_stack.borrow()[frame.frame_bottom + i])
-        } else {
-            Value::nil()
-        }
-    }
+    // fn get_arg_count(&self) -> usize {
+    //     let frames = self.frames.borrow();
+    //     let frame = frames.last().unwrap();
+    //     frame.n_args
+    // }
+    // fn arg(&self, i: usize) -> Value {
+    //     let frames = self.frames.borrow();
+    //     let frame = frames.last().unwrap();
+    //     if i < frame.n_args {
+    //         frame.locals[i]
+    //         // Some(self.eval_stack.borrow()[frame.frame_bottom + i])
+    //     } else {
+    //         Value::nil()
+    //     }
+    // }
     pub fn table_get(&self, table: Value, key: Value) -> Result<Value, RuntimeError> {
         let table = match table.as_table() {
             Some(x) => x,
@@ -227,6 +359,14 @@ impl State {
     //         }
     //     }
     // }
+    pub fn create_userdata<T: UserData + Traceable>(&self, userdata: T) -> Value {
+        let p: Box<dyn UserData> = Box::new(userdata);
+        let s = self.gc.allocate(p);
+        Value {
+            data: ValueData::UserData(s),
+            metatable: None,
+        }
+    }
     pub fn create_string(&self, s: String) -> Value {
         let s = self.gc.allocate(Managed { data: s });
         Value {
@@ -289,11 +429,11 @@ impl State {
             (ValueData::Nil, ValueData::Nil) => Ok(Ordering::Equal),
             (ValueData::Bool(a), ValueData::Bool(b)) => Ok(a.cmp(&b)),
             (ValueData::Number(a), ValueData::Number(b)) => Ok(a.cmp(&b)),
-            (ValueData::String(a), ValueData::String(b)) => unsafe {
+            (ValueData::String(a), ValueData::String(b)) => {
                 let a = &(*a).data;
                 let b = &(*b).data;
                 Ok(a.cmp(b))
-            },
+            }
             _ => Err(RuntimeError {
                 kind: ErrorKind::ArithmeticError,
                 msg: format!(
@@ -372,13 +512,11 @@ impl State {
             // ValueData::Nil => todo!(),
             // ValueData::Bool(_) => todo!(),
             // ValueData::Number(_) => todo!(),
-            ValueData::Table(x) => unsafe {
-                Ok(Value::from_number((*x).borrow_mut().len() as f64))
-            },
-            ValueData::String(x) => unsafe { Ok(Value::from_number((*x).data.len() as f64)) },
+            ValueData::Table(x) => Ok(Value::from_number((*x).borrow_mut().len() as f64)),
+            ValueData::String(x) => Ok(Value::from_number((*x).data.len() as f64)),
             // ValueData::Closure(_) => todo!(),
             // ValueData::Callable(_) => todo!(),
-            ValueData::Tuple(x) => unsafe { Ok(Value::from_number((*x).values.len() as f64)) },
+            ValueData::Tuple(x) => Ok(Value::from_number((*x).values.len() as f64)),
             _ => Err(RuntimeError {
                 kind: ErrorKind::ArithmeticError,
                 msg: format!(" attempt to get length of a {} value", a.type_of(),),
@@ -386,7 +524,7 @@ impl State {
         }
     }
     pub fn not(&self, a: Value) -> Result<Value, RuntimeError> {
-        Ok(Value::from_bool(!a.as_bool()))
+        Ok(Value::from_bool(!a.to_bool()))
     }
     pub fn bitwise_not(&self, a: Value) -> Result<Value, RuntimeError> {
         match a.data {

@@ -4,8 +4,17 @@ use std::ptr::NonNull;
 pub struct GcState {
     inner: RefCell<GcInner>,
 }
+// #[derive(Clone, Copy, PartialEq, Eq)]
+// enum Color {
+//     White,
+//     Black,
+//     Grey,
+// }
+// #[derive(Clone, Copy, PartialEq, Eq)]
+// enum Mark
 #[repr(C)]
 pub(crate) struct GcBox<T: Traceable + ?Sized + 'static> {
+    marked: Cell<bool>,
     next: Cell<PtrTraceable>,
     data: T,
 }
@@ -70,12 +79,15 @@ struct GcInner {
 impl GcState {
     // move an object onto heap
     pub fn allocate<T: Traceable + 'static>(&self, object: T) -> Gc<T> {
+        
         let gc_box: *mut GcBox<T> = Box::into_raw(Box::new(GcBox {
+            // color: Cell::new(Color::White),
+            marked: Cell::new(false),
             data: object,
             next: Cell::new(None),
         }));
+        // println!("allocate object {:0x}",gc_box as u64);
         unsafe {
-            let p = &mut (*gc_box).data as *mut T;
             let gc_box_dyn: *mut GcBox<dyn Traceable> = gc_box;
             let mut gc = self.inner.borrow_mut();
             if let Some(head) = &mut gc.head {
@@ -90,14 +102,51 @@ impl GcState {
         }
     }
     pub fn trace_ptr<T: Traceable + ?Sized + 'static>(&self, obj: Gc<T>) {
-        todo!()
+        unsafe {
+            
+            let ptr = obj.ptr;
+            let gc_box = ptr.as_ref();
+            // println!("tracing object {:0x} {}", obj.as_ptr().cast::<()>() as u64, gc_box.marked.get());
+            if !gc_box.marked.get() {
+                gc_box.marked.set(true);
+                return obj.trace(self);
+            }
+        }
     }
     pub fn trace<T: Traceable + ?Sized + 'static>(&self, obj: &T) {
-        todo!()
+        obj.trace(self);
     }
     pub fn new() -> Self {
         Self {
             inner: RefCell::new(GcInner { head: None }),
+        }
+    }
+    pub(crate) fn start_trace(&self) {}
+    pub(crate) fn end_trace(&self) {}
+    pub(crate) fn collect(&self) {
+        let mut gc = self.inner.borrow_mut();
+        let mut cur = gc.head;
+        let mut prev: Option<NonNull<GcBox<dyn Traceable>>> = None;
+        // println!("collecting");
+        unsafe {
+            while let Some(p) = cur {
+                let object = p.as_ref();
+                let next = object.next.get();
+                if !object.marked.get() {
+                    if cur == gc.head {
+                        gc.head = next;
+                    } else {
+                        let prev = prev.unwrap().as_ref();
+                        prev.next.set(next);
+                    }
+                    // println!("collected object {:0x}", p.as_ptr().cast::<()>() as u64);
+                    Box::from_raw(p.as_ptr());
+                } else {
+                    object.marked.set(false);
+                    prev = cur;
+                }                
+                cur = next;
+            }
         }
     }
 }

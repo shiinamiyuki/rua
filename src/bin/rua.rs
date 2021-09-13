@@ -10,7 +10,7 @@ use rua::{
 fn exec_file(path: &str) {
     let show_ast = std::env::var("PRINT_AST").map_or(false, |x| x == "1");
     let show_module = std::env::var("PRINT_BYTECODE").map_or(false, |x| x == "1");
-    let src = std::fs::read_to_string("test.lua").unwrap();
+    let src = std::fs::read_to_string(path).unwrap();
     let tokens = tokenize("test.lua", &src);
     let tokens = match tokens {
         Ok(tokens) => tokens,
@@ -42,7 +42,7 @@ fn exec_file(path: &str) {
     if show_module {
         println!("{:#?}", module);
     }
-    let mut runtime = Runtime::new();
+    let runtime = Runtime::new();
 
     let instance = runtime.create_instance();
     match instance.exec(module) {
@@ -113,10 +113,10 @@ fn repl(runtime: &Runtime, instance: &Instance) -> bool {
 fn main() {
     let args: Vec<_> = std::env::args().collect();
     if args.len() == 1 {
-        let mut runtime = Runtime::new();
+        let runtime = Runtime::new();
         let instance = runtime.create_instance();
         loop {
-            repl(&mut runtime, &instance);
+            repl(&runtime, &instance);
         }
     } else {
         let filename = &args[1];

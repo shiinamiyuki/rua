@@ -8,6 +8,7 @@ use crate::{
     closure::{Callable, NativeFunction},
     gc::{GcState, Traceable},
     state::{CallContext, State},
+    stdlib,
     table::Table,
     value::{Managed, ManagedCell, Value, ValueData},
     vm::Instance,
@@ -19,6 +20,8 @@ pub enum ErrorKind {
     TypeError,
     ArithmeticError,
     NameError,
+    ExternalError,
+    ArgumentArityError,
 }
 #[derive(Debug, Clone)]
 pub struct RuntimeError {
@@ -28,7 +31,7 @@ pub struct RuntimeError {
 // struct Locals{
 //     locals:RefCell<Vec<Rc<RefCell<Value>>>>,
 // }
-pub struct Runtime {
+struct RuntimeInner {
     gc: Rc<GcState>,
     globals: Value,
     instances: Vec<Rc<Instance>>,
@@ -50,28 +53,101 @@ Local are gc roots
 //     }
 // }
 
-// pub struct Module {
-
-// }
-// impl Module {
-//     pub fn function<'a, F: Fn(&CallContext<'_>) -> Result<(), RuntimeError> + 'static>(
-//         &'a mut self,
-//         name: String,
-//         f: F,
-//     ) {
-
-//     }
-// }
-
+pub struct Module {
+    runtime: Rc<RefCell<RuntimeInner>>,
+    module: Value,
+}
+impl Module {
+    pub fn function<'a, F: Fn(&CallContext<'_>) -> Result<(), RuntimeError> + 'static>(
+        &'a mut self,
+        name: String,
+        f: F,
+    ) -> &mut Module {
+        {
+            let gc = self.runtime.borrow().gc.clone();
+            let mut table = self.module.as_table().unwrap().borrow_mut();
+            table.set(
+                Value {
+                    data: ValueData::String(gc.allocate(Managed::new(name))),
+                    metatable: None,
+                },
+                Value {
+                    data: ValueData::Callable(gc.allocate(Box::new(NativeFunction::new(f)))),
+                    metatable: None,
+                },
+            );
+        }
+        self
+    }
+    pub fn submodule(&mut self, name: String, module: Module) -> &mut Module {
+        {
+            let gc = self.runtime.borrow().gc.clone();
+            let mut table = self.module.as_table().unwrap().borrow_mut();
+            table.set(
+                Value {
+                    data: ValueData::String(gc.allocate(Managed::new(name))),
+                    metatable: None,
+                },
+                module.module,
+            );
+        }
+        self
+    }
+}
+#[derive(Clone)]
+pub struct Runtime {
+    inner: Rc<RefCell<RuntimeInner>>,
+}
 impl Runtime {
-    pub fn add_function<'a, F: Fn(&CallContext<'_>) -> Result<(), RuntimeError> + 'static>(
+    pub fn new() -> Self {
+        let r = Self {
+            inner: Rc::new(RefCell::new(RuntimeInner::new())),
+        };
+        {
+            let mut inner = r.inner.borrow_mut();
+            inner.add_std_lib(r.inner.clone());
+        }
+        stdlib::add_math_lib(&r);
+        r
+    }
+    pub fn create_instance(&self) -> Rc<Instance> {
+        self.inner.borrow_mut().create_instance()
+    }
+    pub fn create_module(&self) -> Module {
+        let gc = self.inner.borrow().gc.clone();
+        Module {
+            runtime: self.inner.clone(),
+            module: Value {
+                data: ValueData::Table(gc.allocate(RefCell::new(Table::new()))),
+                metatable: None,
+            },
+        }
+    }
+    pub fn add_module(&self, name: String, module: Module) {
+        self.inner.borrow_mut().add_module(name, module)
+    }
+}
+
+impl RuntimeInner {
+    pub fn add_module(&mut self, name: String, module: Module) {
+        let globals = self.globals.as_table().unwrap();
+        let mut globals = globals.borrow_mut();
+        globals.set(
+            Value {
+                data: ValueData::String(self.gc.allocate(Managed { data: name })),
+                metatable: None,
+            },
+            module.module,
+        );
+    }
+    fn add_function<'a, F: Fn(&CallContext<'_>) -> Result<(), RuntimeError> + 'static>(
         &'a mut self,
         name: String,
         f: F,
     ) {
         self.add_callable(name, Box::new(NativeFunction::new(f)))
     }
-    pub fn add_callable<'a>(&'a mut self, name: String, callable: Box<dyn Callable>)
+    fn add_callable<'a>(&'a mut self, name: String, callable: Box<dyn Callable>)
     /*->Option<Local<'a>>*/
     {
         let globals = self.globals.as_table().unwrap();
@@ -79,11 +155,11 @@ impl Runtime {
         globals.set(
             Value {
                 data: ValueData::String(self.gc.allocate(Managed { data: name })),
-                metatable:None,
+                metatable: None,
             },
             Value {
                 data: ValueData::Callable(self.gc.allocate(callable)),
-                metatable:None,
+                metatable: None,
             },
         );
         // Some(Local{
@@ -91,7 +167,7 @@ impl Runtime {
         //     phantom:PhantomData{},
         // })
     }
-    pub fn create_instance(&mut self) -> Rc<Instance> {
+    fn create_instance(&mut self) -> Rc<Instance> {
         let instance = Rc::new(Instance {
             gc: self.gc.clone(),
             state: State {
@@ -104,10 +180,10 @@ impl Runtime {
         self.instances.push(instance.clone());
         instance
     }
-    fn add_std_lib(&mut self) {
+    fn add_std_lib(&mut self, pself: Rc<RefCell<RuntimeInner>>) {
         self.add_function("print".into(), |ctx| {
             for i in 0..ctx.get_arg_count() {
-                let arg = ctx.arg(i);
+                let arg = ctx.arg(i).unwrap();
                 if i > 0 {
                     print!(" ");
                 }
@@ -117,27 +193,44 @@ impl Runtime {
             Ok(())
         });
         self.add_function("assert".into(), |ctx| {
-            let v = ctx.arg(0);
-            assert!(v.as_bool());
+            let v = ctx.arg(0).unwrap();
+            assert!(v.to_bool());
             Ok(())
         });
         self.add_function("type".into(), |ctx| {
-            let v = ctx.arg(0);
+            let v = ctx.arg(0).unwrap();
             ctx.ret(0, ctx.state.create_string(String::from(v.type_of())));
             Ok(())
         });
+        // let pself = self as *mut RuntimeInner;
+        let gc = self.gc.clone();
+        self.add_function("collectgarbage".into(), move |_ctx| {
+            let self_ = pself.borrow();
+            gc.start_trace();
+            gc.trace(&*self_);
+            gc.end_trace();
+            gc.collect();
+            Ok(())
+        });
     }
-    pub fn new() -> Self {
+    fn new() -> Self {
         let gc = Rc::new(GcState::new());
-        let mut runtime = Self {
+        let runtime = Self {
             gc: gc.clone(),
             globals: Value {
                 data: ValueData::Table(gc.allocate(RefCell::new(Table::new()))),
-                metatable:None,
+                metatable: None,
             },
             instances: vec![],
         };
-        runtime.add_std_lib();
         runtime
+    }
+}
+impl Traceable for RuntimeInner {
+    fn trace(&self, gc: &GcState) {
+        gc.trace(&self.globals);
+        for instance in &self.instances {
+            gc.trace(instance.as_ref());
+        }
     }
 }

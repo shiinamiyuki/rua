@@ -1,3 +1,5 @@
+use std::marker::PhantomData;
+
 pub mod bytecode;
 pub mod closure;
 pub mod compile;
@@ -5,10 +7,10 @@ pub mod gc;
 pub mod parse;
 pub mod runtime;
 pub mod state;
+pub mod stdlib;
 pub mod table;
 pub mod value;
 pub mod vm;
-pub mod stdlib;
 
 pub(crate) const fn num_bits<T>() -> usize {
     std::mem::size_of::<T>() * 8
@@ -28,13 +30,25 @@ struct StackNode<T> {
 }
 pub(crate) struct Stack<T> {
     last: *mut StackNode<T>,
-    len:usize,
+    len: usize,
+}
+struct StackIterator<'a, T> {
+    node: *mut StackNode<T>,
+    phantom: PhantomData<&'a T>,
+}
+impl<'a, T> Iterator for StackIterator<'a, T> {
+    type Item = &'a T;
+    fn next(&mut self) -> Option<Self::Item> {
+        let item = unsafe { self.node.as_ref()?.data.as_ref().unwrap() };
+        self.node = unsafe { (*self.node).prev };
+        Some(item)
+    }
 }
 impl<T> Stack<T> {
     pub(crate) fn new() -> Self {
         Self {
             last: std::ptr::null_mut(),
-            len:0,
+            len: 0,
         }
     }
     pub(crate) fn is_empty(&self) -> bool {
@@ -47,6 +61,9 @@ impl<T> Stack<T> {
         }));
         self.last = node;
         self.len += 1;
+    }
+    pub(crate) fn iter<'a>(&'a self)->StackIterator<'a, T>{
+        StackIterator { node: self.last, phantom:PhantomData{} }
     }
     pub(crate) fn last<'a>(&'a self) -> Option<&'a T> {
         unsafe {
@@ -71,7 +88,7 @@ impl<T> Stack<T> {
             if self.last.is_null() {
                 None
             } else {
-                self.len -=1;
+                self.len -= 1;
                 let p = self.last;
                 let ret = std::mem::replace(&mut (*p).data, None).unwrap();
                 self.last = (*self.last).prev;
@@ -80,7 +97,7 @@ impl<T> Stack<T> {
             }
         }
     }
-    pub(crate) fn len(&self)->usize{
+    pub(crate) fn len(&self) -> usize {
         self.len
     }
 }

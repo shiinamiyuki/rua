@@ -6,7 +6,15 @@ use std::{
     rc::Rc,
 };
 
-use crate::{bytecode::{u32_from_3xu8, ByteCode, ByteCodeModule, OpCode}, closure::{Callable, Closure, UpValue, UpValueInner}, gc::{Gc, GcState}, runtime::{ErrorKind, RuntimeError}, state::{CallContext, Frame, State}, table::Table, value::{Managed, ManagedCell, Value, ValueData}};
+use crate::{
+    bytecode::{u32_from_3xu8, ByteCode, ByteCodeModule, OpCode},
+    closure::{Callable, Closure, UpValue, UpValueInner},
+    gc::{Gc, GcState, Traceable},
+    runtime::{ErrorKind, RuntimeError},
+    state::{CallContext, Frame, State},
+    table::Table,
+    value::{Managed, ManagedCell, Value, ValueData},
+};
 
 /*
 The instances represents a thread
@@ -69,13 +77,17 @@ impl Instance {
                     let mut frames = self.state.frames.borrow_mut();
                     frames.push(frame);
                 }
-                let ctx = CallContext {
-                    instance: self,
-                    state: &self.state,
-                    ret_values: RefCell::new(vec![]),
-                };
-                let func = unsafe { &(*callable) };
-                func.call(&ctx);
+                {
+                    let frames = self.state.frames.borrow();
+                    let ctx = CallContext {
+                        instance: self,
+                        state: &self.state,
+                        frames: &*frames,
+                        ret_values: RefCell::new(vec![]),
+                    };
+                    let func = { &(*callable) };
+                    func.call(&ctx)?;
+                }
                 {
                     let mut frames = self.state.frames.borrow_mut();
                     frames.pop().unwrap();
@@ -95,7 +107,7 @@ impl Instance {
         let frame = frames.last_mut().unwrap();
         let ip = &mut frame.ip;
         let module = &*frame.closure.unwrap().module;
-        unsafe {
+        {
             let closure = &frame.closure.unwrap();
             for (i, v) in closure.upvalues.iter().enumerate() {
                 let proto = &(*closure.module).protypes[closure.proto_idx];
@@ -282,7 +294,7 @@ impl Instance {
                     }
                     OpCode::LoadUpvalue => {
                         let idx = u32_from_3xu8(operands);
-                        unsafe {
+                        {
                             let c = frame.closure.as_ref().unwrap();
                             eval_stack.push(c.get_upvalue(idx));
                         }
@@ -351,7 +363,7 @@ impl Instance {
                         let b = operands[0];
                         let pop_t = operands[1];
                         let pop_f = operands[1];
-                        if top.as_bool() == (b != 0) {
+                        if top.to_bool() == (b != 0) {
                             *ip = addr as usize;
                             if pop_t != 0 {
                                 eval_stack.pop();
@@ -453,13 +465,17 @@ impl Instance {
                         let mut frames = self.state.frames.borrow_mut();
                         frames.push(frame);
                     }
-                    let func = unsafe { &(*callable) };
-                    let ctx = CallContext {
-                        instance: self,
-                        state: &self.state,
-                        ret_values: RefCell::new(vec![]),
-                    };
-                    func.call(&ctx);
+                    {
+                        let frames = self.state.frames.borrow();
+                        let func = &(*callable);
+                        let ctx = CallContext {
+                            instance: self,
+                            state: &self.state,
+                            frames: &*frames,
+                            ret_values: RefCell::new(vec![]),
+                        };
+                        func.call(&ctx)?;
+                    }
                     {
                         let mut frames = self.state.frames.borrow_mut();
                         frames.pop().unwrap();
@@ -496,5 +512,23 @@ impl Instance {
         }
 
         Ok(())
+    }
+}
+impl Traceable for Instance {
+    fn trace(&self, gc: &GcState) {
+        let st = self.state.eval_stack.borrow();
+        for v in st.iter() {
+            gc.trace(v);
+        }
+        gc.trace(&self.state.globals);
+        let frames = self.state.frames.borrow();
+        for f in frames.iter() {
+            for v in &f.locals {
+                gc.trace(v)
+            }
+            if let Some(c) = &f.closure {
+                gc.trace_ptr(*c);
+            }
+        }
     }
 }
