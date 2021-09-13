@@ -1,27 +1,36 @@
-use std::{borrow::Borrow, cell::{Cell, RefCell, RefMut}, collections::HashMap, iter::FromIterator, rc::Rc};
-
-use crate::{
-    bytecode::{u32_from_3xu8, ByteCode, ByteCodeModule, OpCode},
-    closure::{Callable, Closure, UpValue, UpValueInner},
-    gc::Gc,
-    runtime::{ErrorKind, RuntimeError},
-    state::{CallContext, Frame, State},
-    table::Table,
-    value::{Managed, ManagedCell, Value, ValueData},
+use std::{
+    borrow::Borrow,
+    cell::{Cell, RefCell, RefMut},
+    collections::HashMap,
+    iter::FromIterator,
+    rc::Rc,
 };
+
+use crate::{bytecode::{u32_from_3xu8, ByteCode, ByteCodeModule, OpCode}, closure::{Callable, Closure, UpValue, UpValueInner}, gc::{Gc, GcState}, runtime::{ErrorKind, RuntimeError}, state::{CallContext, Frame, State}, table::Table, value::{Managed, ManagedCell, Value, ValueData}};
 
 /*
 The instances represents a thread
 */
 pub struct Instance {
-    pub(crate) gc: Rc<Gc>,
+    pub(crate) gc: Rc<GcState>,
     pub(crate) state: State,
 }
 
 enum Continue {
     Return,
     NewFrame(Frame),
-    CallExt(*const Managed<Box<dyn Callable>>, Frame),
+    CallExt(Gc<Box<dyn Callable>>, Frame),
+}
+macro_rules! new_frame {
+    ($eval_stack:expr, $n_args:expr,$closure:expr) => {{
+        let mut frame = Frame::new($eval_stack.len() - $n_args, $n_args, $closure);
+        for i in 0..$n_args {
+            frame.locals[i] = $eval_stack[$eval_stack.len() - $n_args + i];
+        }
+        let len = $eval_stack.len();
+        $eval_stack.resize(len - $n_args, Value::nil());
+        frame
+    }};
 }
 impl Instance {
     /*
@@ -30,13 +39,64 @@ impl Instance {
     // pub fn lock<'a>(&self) -> RefMut<State> {
     //     self.state.borrow_mut()
     // }
+    pub(crate) fn call(&self, closure: Value, args: &[Value]) -> Result<Value, RuntimeError> {
+        match closure.data {
+            ValueData::Closure(closure) => {
+                let n_args = args.len();
+                let frame = {
+                    let mut eval_stack = self.state.eval_stack.borrow_mut();
+                    new_frame!(eval_stack, n_args, Some(closure))
+                };
+                let level = {
+                    let mut frames = self.state.frames.borrow_mut();
+                    let level = frames.len();
+                    frames.push(frame);
+                    level
+                };
+                self.exec_frames_loop(level)?;
+                {
+                    let mut eval_stack = self.state.eval_stack.borrow_mut();
+                    Ok(eval_stack.pop().unwrap())
+                }
+            }
+            ValueData::Callable(callable) => {
+                let n_args = args.len();
+                let frame = {
+                    let mut eval_stack = self.state.eval_stack.borrow_mut();
+                    new_frame!(eval_stack, n_args, None)
+                };
+                {
+                    let mut frames = self.state.frames.borrow_mut();
+                    frames.push(frame);
+                }
+                let ctx = CallContext {
+                    instance: self,
+                    state: &self.state,
+                    ret_values: RefCell::new(vec![]),
+                };
+                let func = unsafe { &(*callable) };
+                func.call(&ctx);
+                {
+                    let mut frames = self.state.frames.borrow_mut();
+                    frames.pop().unwrap();
+                }
+                {
+                    let mut eval_stack = self.state.eval_stack.borrow_mut();
+                    Ok(eval_stack.pop().unwrap())
+                }
+            }
+            _ => {
+                unimplemented!()
+            }
+        }
+    }
     fn exec_frame(&self, state: &State) -> Result<Continue, RuntimeError> {
         let mut frames = state.frames.borrow_mut();
         let frame = frames.last_mut().unwrap();
         let ip = &mut frame.ip;
-        let module = unsafe { &*(*frame.closure).data.module };
+        let module = &*frame.closure.unwrap().module;
         unsafe {
-            let closure = &(*frame.closure).data;
+            let closure = &frame.closure.unwrap();
             for (i, v) in closure.upvalues.iter().enumerate() {
                 let proto = &(*closure.module).protypes[closure.proto_idx];
                 let info = &proto.upvalues[i];
@@ -118,17 +178,13 @@ impl Instance {
                     OpCode::LoadTable => {
                         let table = eval_stack.pop().unwrap();
                         let key = eval_stack.pop().unwrap();
-                        let table = table.as_table().unwrap();
-                        let table = table.borrow();
-                        eval_stack.push(table.get(key));
+                        eval_stack.push(state.table_get(table, key)?);
                     }
                     OpCode::StoreTable => {
                         let table = eval_stack.pop().unwrap();
                         let key = eval_stack.pop().unwrap();
                         let value = eval_stack.pop().unwrap();
-                        let table = table.as_table().unwrap();
-                        let mut table = table.borrow_mut();
-                        table.set(key, value);
+                        state.table_set(table, key, value)?;
                     }
                     OpCode::StoreGlobal => {
                         let name = eval_stack.pop().unwrap();
@@ -220,14 +276,14 @@ impl Instance {
                         let idx = u32_from_3xu8(operands);
                         let v = eval_stack.pop().unwrap();
                         unsafe {
-                            let c = &frame.closure.as_ref().unwrap().data;
+                            let c = frame.closure.as_ref().unwrap();
                             c.set_upvalue(idx, v);
                         }
                     }
                     OpCode::LoadUpvalue => {
                         let idx = u32_from_3xu8(operands);
                         unsafe {
-                            let c = &frame.closure.as_ref().unwrap().data;
+                            let c = frame.closure.as_ref().unwrap();
                             eval_stack.push(c.get_upvalue(idx));
                         }
                     }
@@ -245,7 +301,7 @@ impl Instance {
                         match func.data {
                             ValueData::Closure(closure) => {
                                 ip_modified = true;
-                                *ip = Frame::get_ip(closure);
+                                *ip = Frame::get_ip(Some(closure));
                                 for i in 0..n_args {
                                     frame.locals[i] = eval_stack[eval_stack.len() - n_args + i];
                                 }
@@ -255,8 +311,7 @@ impl Instance {
                             }
                             ValueData::Callable(callable) => {
                                 *ip += 1;
-                                let mut frame =
-                                    Frame::new(eval_stack.len() - n_args, n_args, std::ptr::null());
+                                let mut frame = Frame::new(eval_stack.len() - n_args, n_args, None);
                                 for i in 0..n_args {
                                     frame.locals[i] = eval_stack[eval_stack.len() - n_args + i];
                                 }
@@ -273,24 +328,12 @@ impl Instance {
                         match func.data {
                             ValueData::Closure(closure) => {
                                 *ip += 1;
-                                let mut frame =
-                                    Frame::new(eval_stack.len() - n_args, n_args, closure);
-                                for i in 0..n_args {
-                                    frame.locals[i] = eval_stack[eval_stack.len() - n_args + i];
-                                }
-                                let len = eval_stack.len();
-                                eval_stack.resize(len - n_args, Value::nil());
+                                let frame = new_frame!(eval_stack, n_args, Some(closure));
                                 return Ok(Continue::NewFrame(frame));
                             }
                             ValueData::Callable(callable) => {
                                 *ip += 1;
-                                let mut frame =
-                                    Frame::new(eval_stack.len() - n_args, n_args, std::ptr::null());
-                                for i in 0..n_args {
-                                    frame.locals[i] = eval_stack[eval_stack.len() - n_args + i];
-                                }
-                                let len = eval_stack.len();
-                                eval_stack.resize(len - n_args, Value::nil());
+                                let frame = new_frame!(eval_stack, n_args, None);
                                 return Ok(Continue::CallExt(callable, frame));
                             }
                             _ => {
@@ -328,7 +371,7 @@ impl Instance {
                             ByteCode::Address(bytes) => u32::from_le_bytes(bytes),
                             _ => unreachable!(),
                         };
-                        let parent = unsafe { &(*frame.closure).data };
+                        let parent = frame.closure.as_ref().unwrap();
                         let upvalues = proto
                             .upvalues
                             .iter()
@@ -350,7 +393,7 @@ impl Instance {
                             proto_idx: proto_idx as usize,
                             n_args: proto.n_args,
                             entry: entry as usize,
-                            module: unsafe { (*frame.closure).data.module.clone() },
+                            module: frame.closure.unwrap().module.clone(),
                             upvalues,
                             called: Cell::new(false),
                         });
@@ -375,9 +418,9 @@ impl Instance {
     }
     pub fn eval_repl(&self, module: ByteCodeModule) -> Result<(), RuntimeError> {
         self.exec_impl(module)?;
-        assert!(self.state.borrow().eval_stack.borrow().len()<=1);
+        assert!(self.state.borrow().eval_stack.borrow().len() <= 1);
         if self.state.borrow().eval_stack.borrow().len() == 1 {
-            let mut st =  self.state.borrow().eval_stack.borrow_mut();
+            let mut st = self.state.borrow().eval_stack.borrow_mut();
             let v = st.pop().unwrap();
             println!("{}", v.print());
         }
@@ -385,21 +428,23 @@ impl Instance {
     }
     // top level
     fn exec_impl(&self, module: ByteCodeModule) -> Result<(), RuntimeError> {
-        let closure = self.gc.manage(Managed::<Closure> {
-            data: Closure {
-                entry: 0,
-                n_args: 0,
-                // n_locals: 0,
-                module: Rc::new(module),
-                upvalues: vec![],
-                called: Cell::new(false),
-                proto_idx: usize::MAX,
-            },
+        let closure = self.gc.allocate(Closure {
+            entry: 0,
+            n_args: 0,
+            // n_locals: 0,
+            module: Rc::new(module),
+            upvalues: vec![],
+            called: Cell::new(false),
+            proto_idx: usize::MAX,
         });
         {
             let mut frames = self.state.frames.borrow_mut();
-            frames.push(Frame::new(0, 0, closure));
+            frames.push(Frame::new(0, 0, Some(closure)));
         }
+        self.exec_frames_loop(0)
+    }
+
+    fn exec_frames_loop(&self, level: usize) -> Result<(), RuntimeError> {
         loop {
             let cont = self.exec_frame(&self.state)?;
             match cont {
@@ -408,8 +453,9 @@ impl Instance {
                         let mut frames = self.state.frames.borrow_mut();
                         frames.push(frame);
                     }
-                    let func = unsafe { &(*callable).data };
+                    let func = unsafe { &(*callable) };
                     let ctx = CallContext {
+                        instance: self,
                         state: &self.state,
                         ret_values: RefCell::new(vec![]),
                     };
@@ -426,7 +472,7 @@ impl Instance {
                 Continue::Return => {
                     let mut frames = self.state.frames.borrow_mut();
                     unsafe {
-                        let closure = &frames.last().unwrap().closure.as_ref().unwrap().data;
+                        let closure = frames.last().unwrap().closure.as_ref().unwrap();
                         for v in &closure.upvalues {
                             let v = v.inner.borrow();
                             let inner = v.get();
@@ -442,13 +488,13 @@ impl Instance {
                         }
                     }
                     frames.pop().unwrap();
-                    if frames.is_empty() {
+                    if frames.len() == level {
                         break;
                     }
                 }
             }
         }
-       
+
         Ok(())
     }
 }

@@ -8,24 +8,33 @@ use std::{
 use crate::{
     bytecode::ByteCodeModule,
     compile::UpValueInfo,
-    gc::{Gc, Traceable},
+    gc::{GcState, Traceable},
+    runtime::RuntimeError,
     state::CallContext,
     value::Value,
 };
 
-pub trait Callable {
-    fn call<'a>(&self, ctx: &CallContext<'a>);
+pub trait Callable: Traceable {
+    fn call<'a>(&self, ctx: &CallContext<'a>) -> Result<(), RuntimeError>;
+}
+impl Traceable for Box<dyn Callable> {
+    fn trace(&self, gc: &GcState) {
+        gc.trace(&*self);
+    }
 }
 pub struct NativeFunction {
-    func: Box<dyn Fn(&CallContext<'_>) -> ()>,
+    func: Box<dyn Fn(&CallContext<'_>) -> Result<(), RuntimeError>>,
 }
 impl NativeFunction {
-    pub fn new<F: Fn(&CallContext<'_>) -> () + 'static>(f: F) -> Self {
+    pub fn new<F: Fn(&CallContext<'_>) -> Result<(), RuntimeError> + 'static>(f: F) -> Self {
         Self { func: Box::new(f) }
     }
 }
+impl Traceable for NativeFunction {
+    fn trace(&self, _gc: &GcState) {}
+}
 impl Callable for NativeFunction {
-    fn call<'a>(&self, ctx: &CallContext<'_>) {
+    fn call<'a>(&self, ctx: &CallContext<'_>) -> Result<(), RuntimeError> {
         (self.func)(ctx)
     }
 }
@@ -98,11 +107,11 @@ impl Closure {
     }
 }
 impl Traceable for Closure {
-    fn trace(&self, gc: &Gc) {
+    fn trace(&self, gc: &GcState) {
         for v in &self.upvalues {
             let v = v.inner.borrow();
             match (**v).get() {
-                UpValueInner::Open(p) => gc.trace_ptr(p),
+                UpValueInner::Open(p) => gc.trace(unsafe { &*p }),
                 UpValueInner::Closed(v) => {
                     gc.trace(&v);
                 }

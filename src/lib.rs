@@ -8,6 +8,7 @@ pub mod state;
 pub mod table;
 pub mod value;
 pub mod vm;
+pub mod stdlib;
 
 pub(crate) const fn num_bits<T>() -> usize {
     std::mem::size_of::<T>() * 8
@@ -27,11 +28,13 @@ struct StackNode<T> {
 }
 pub(crate) struct Stack<T> {
     last: *mut StackNode<T>,
+    len:usize,
 }
 impl<T> Stack<T> {
     pub(crate) fn new() -> Self {
         Self {
             last: std::ptr::null_mut(),
+            len:0,
         }
     }
     pub(crate) fn is_empty(&self) -> bool {
@@ -43,6 +46,7 @@ impl<T> Stack<T> {
             prev: self.last,
         }));
         self.last = node;
+        self.len += 1;
     }
     pub(crate) fn last<'a>(&'a self) -> Option<&'a T> {
         unsafe {
@@ -67,6 +71,7 @@ impl<T> Stack<T> {
             if self.last.is_null() {
                 None
             } else {
+                self.len -=1;
                 let p = self.last;
                 let ret = std::mem::replace(&mut (*p).data, None).unwrap();
                 self.last = (*self.last).prev;
@@ -74,6 +79,9 @@ impl<T> Stack<T> {
                 Some(ret)
             }
         }
+    }
+    pub(crate) fn len(&self)->usize{
+        self.len
     }
 }
 impl<T> Drop for Stack<T> {

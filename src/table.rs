@@ -1,4 +1,6 @@
 use std::{
+    borrow::Borrow,
+    cell::RefCell,
     collections::{
         hash_map::{DefaultHasher, RandomState},
         HashMap,
@@ -284,7 +286,7 @@ impl Table {
 }
 
 impl Traceable for Table {
-    fn trace(&self, gc: &crate::gc::Gc) {
+    fn trace(&self, gc: &crate::gc::GcState) {
         for i in &self.array {
             gc.trace(i);
         }
@@ -292,5 +294,11 @@ impl Traceable for Table {
             gc.trace(&k);
             gc.trace(&v);
         }
+    }
+}
+impl Traceable for RefCell<Table> {
+    fn trace(&self, gc: &crate::gc::GcState) {
+        let table = self.borrow();
+        gc.trace(&*table);
     }
 }

@@ -1,4 +1,5 @@
 use std::{
+    any::Any,
     cell::{Cell, RefCell},
     collections::HashMap,
     hash::Hash,
@@ -10,25 +11,43 @@ use ordered_float::OrderedFloat;
 use crate::{
     bytecode::ByteCodeModule,
     closure::{Callable, Closure},
-    gc::{Gc, Traceable},
+    gc::{Gc, GcState, Traceable},
     state::State,
     table::Table,
 };
 
-pub trait UserData {}
-
 pub struct Managed<T: ?Sized + 'static> {
     pub data: T,
 }
+pub type LightUserData<T> = Managed<T>;
 impl<T> Managed<T> {
     pub fn new(data: T) -> Self {
         Self { data }
     }
 }
 impl<T> Traceable for Managed<T> {
-    fn trace(&self, _gc: &Gc) {}
+    fn trace(&self, _gc: &GcState) {}
 }
+
 pub type ManagedCell<T> = Managed<RefCell<T>>;
+
+pub trait UserData: Traceable + Any {
+    fn as_traceable(&self) -> &dyn Traceable;
+    fn as_any(&self) -> &dyn Any;
+}
+impl<T> UserData for Managed<T> {
+    fn as_traceable(&self) -> &dyn Traceable {
+        self
+    }
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+impl Traceable for Box<dyn UserData> {
+    fn trace(&self, gc: &GcState) {
+        self.trace(gc)
+    }
+}
 
 /*
 function f(x) return 1,2 end
@@ -67,17 +86,30 @@ pub struct Tuple {
     pub values: Vec<Value>,
     pub unpack: TupleUnpack,
 }
-#[derive(Clone, Copy)]
+impl Traceable for Tuple {
+    fn trace(&self, gc: &GcState) {
+        for v in &self.values {
+            gc.trace(v);
+        }
+    }
+}
+
 pub enum ValueData {
     Nil,
     Bool(bool),
     Number(OrderedFloat<f64>),
-    Table(*const ManagedCell<Table>),
-    String(*const Managed<String>),
-    Closure(*const Managed<Closure>),
-    Callable(*const Managed<Box<dyn Callable>>),
-    Tuple(*const Managed<Tuple>),
-    UserData(*const Managed<dyn UserData>),
+    Table(Gc<RefCell<Table>>),
+    String(Gc<Managed<String>>),
+    Closure(Gc<Closure>),
+    Callable(Gc<Box<dyn Callable>>),
+    Tuple(Gc<Tuple>),
+    UserData(Gc<Box<dyn UserData>>),
+}
+impl Copy for ValueData {}
+impl Clone for ValueData {
+    fn clone(&self) -> Self {
+        *self
+    }
 }
 impl PartialEq for ValueData {
     fn eq(&self, other: &Self) -> bool {
@@ -85,16 +117,16 @@ impl PartialEq for ValueData {
             (ValueData::Nil, ValueData::Nil) => true,
             (ValueData::Bool(a), ValueData::Bool(b)) => a == b,
             (ValueData::Number(a), ValueData::Number(b)) => a == b,
-            (ValueData::Table(a), ValueData::Table(b)) => a == b,
-            (ValueData::Callable(a), ValueData::Callable(b)) => a == b,
-            (ValueData::Closure(a), ValueData::Closure(b)) => a == b,
+            (ValueData::Table(a), ValueData::Table(b)) => a.ptr_eq(b),
+            (ValueData::Callable(a), ValueData::Callable(b)) => a.ptr_eq(b),
+            (ValueData::Closure(a), ValueData::Closure(b)) => a.ptr_eq(b),
             (ValueData::String(a), ValueData::String(b)) => {
-                if a == b {
+                if a.ptr_eq(b) {
                     return true;
                 }
                 unsafe {
-                    let a = &(**a).data;
-                    let b = &(**b).data;
+                    let a = &(*a).data;
+                    let b = &(*b).data;
                     a == b
                 }
             }
@@ -109,15 +141,15 @@ impl Hash for ValueData {
             ValueData::Nil => ().hash(state),
             ValueData::Bool(x) => x.hash(state),
             ValueData::Number(x) => x.hash(state),
-            ValueData::Table(x) => std::ptr::hash(*x, state),
+            ValueData::Table(x) => std::ptr::hash(x.as_ptr(), state),
             ValueData::String(x) => unsafe {
-                let s = &(**x).data;
+                let s = &(*x).data;
                 s.hash(state)
             },
-            ValueData::Closure(x) => std::ptr::hash(*x, state),
-            ValueData::Callable(x) => std::ptr::hash(*x, state),
-            ValueData::Tuple(x) => std::ptr::hash(*x, state),
-            ValueData::UserData(x) => std::ptr::hash(*x, state),
+            ValueData::Closure(x) => std::ptr::hash(x.as_ptr(), state),
+            ValueData::Callable(x) => std::ptr::hash(x.as_ptr(), state),
+            ValueData::Tuple(x) => std::ptr::hash(x.as_ptr(), state),
+            ValueData::UserData(x) => std::ptr::hash(x.as_ptr(), state),
         }
     }
 }
@@ -125,19 +157,36 @@ impl Eq for ValueData {}
 #[derive(Clone, Copy, Hash, PartialEq, Eq)]
 pub struct Value {
     pub data: ValueData,
-    pub metatable: *const ManagedCell<Table>,
+    pub metatable: Option<Gc<RefCell<Table>>>,
 }
+// impl Hash for Value {
+//     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+//         self.data.hash(state);
+//         std::ptr::hash(self.metatable.as_ptr(), state);
+//     }
+// }
+// impl PartialEq for Value {
+//     fn eq(&self, other: &Self) -> bool {
+//         self.data == other.data && self.metatable.ptr_eq(&other.metatable)
+//     }
+// }
+// impl Eq for Value {}
 impl Traceable for Value {
-    fn trace(&self, gc: &Gc) {
+    fn trace(&self, gc: &GcState) {
         match self.data {
-            ValueData::Table(x) => gc.trace_ptr(x),
+            ValueData::Table(x) => unsafe {
+                let table = (*x).borrow();
+                gc.trace(&*table)
+            },
             ValueData::String(x) => gc.trace_ptr(x),
             ValueData::Closure(x) => gc.trace_ptr(x),
-            ValueData::Callable(x) => gc.trace_ptr(x),
+            ValueData::Callable(x) => unsafe { gc.trace(&(**x)) },
             ValueData::Tuple(x) => gc.trace_ptr(x),
             _ => {}
         }
-        gc.trace_ptr(self.metatable);
+        if let Some(p) = self.metatable {
+            gc.trace_ptr(p);
+        }
     }
 }
 impl Value {
@@ -153,13 +202,13 @@ impl Value {
     pub fn from_bool(x: bool) -> Self {
         Self {
             data: ValueData::Bool(x),
-            metatable: std::ptr::null(),
+            metatable: None,
         }
     }
     pub fn from_number(x: f64) -> Self {
         Self {
             data: ValueData::Number(OrderedFloat(x)),
-            metatable: std::ptr::null(),
+            metatable: None,
         }
     }
     pub fn number(&self) -> Option<f64> {
@@ -185,13 +234,13 @@ impl Value {
     }
     pub(crate) fn as_string<'a>(&'a self) -> Option<&'a String> {
         match self.data {
-            ValueData::String(s) => unsafe { Some(&(*s).data) },
+            ValueData::String(s) => unsafe { Some(&(*s.as_ptr()).data) },
             _ => None,
         }
     }
     pub(crate) fn as_table<'a>(&'a self) -> Option<&'a RefCell<Table>> {
         match self.data {
-            ValueData::Table(t) => unsafe { Some(&(*t).data) },
+            ValueData::Table(t) => unsafe { Some(&(*t.as_ptr())) },
             _ => None,
         }
     }
@@ -229,21 +278,21 @@ impl Value {
             }
             ValueData::Number(x) => x.to_string(),
             ValueData::Table(table) => {
-                format!("table: {:0x}", table as u64)
+                format!("table: 0x{:0x}", table.as_ptr() as u64)
             }
             ValueData::String(s) => unsafe { (*s).data.clone() },
             ValueData::Closure(closure) => {
-                format!("function: {:0x}", closure as u64)
+                format!("function: 0x{:0x}", closure.as_ptr() as u64)
             }
             ValueData::Callable(callable) => {
-                format!("function: {:0x}", callable as u64)
+                format!("function: 0x{:0x}", callable.as_ptr() as u64)
             }
             ValueData::UserData(p) => {
-                format!("userdata: {:0x}", p.cast::<()>() as u64)
+                format!("userdata: 0x{:0x}", p.as_ptr() as u64)
             }
             ValueData::Tuple(tuple) => {
                 let mut s = String::from("(");
-                for (i, v) in unsafe { (*tuple).data.values.iter().enumerate() } {
+                for (i, v) in unsafe { (*tuple).values.iter().enumerate() } {
                     if i > 0 {
                         s.push(',');
                     }
@@ -260,7 +309,7 @@ impl Default for Value {
     fn default() -> Self {
         Self {
             data: ValueData::Nil,
-            metatable: std::ptr::null(),
+            metatable: None,
         }
     }
 }

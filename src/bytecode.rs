@@ -95,6 +95,7 @@ pub enum ByteCode {
     FloatHi([u8; 4]),
     FloatLo([u8; 4]),
     Address([u8; 4]),
+    Label([u8;4]), // used only during compilation
 }
 #[derive(Clone, Debug)]
 pub struct ByteCodeModule {

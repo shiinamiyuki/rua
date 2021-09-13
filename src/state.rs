@@ -1,7 +1,7 @@
 use crate::{
     bytecode::ByteCode,
     closure::Closure,
-    gc::Gc,
+    gc::{Gc, GcState},
     runtime::{ErrorKind, RuntimeError},
     table::Table,
     value::{Managed, ManagedCell, Tuple, TupleUnpack, Value, ValueData},
@@ -14,19 +14,15 @@ pub const MAX_LOCALS: usize = 256;
 pub(crate) struct Frame {
     pub(crate) locals: [Value; MAX_LOCALS],
     pub(crate) frame_bottom: usize, //stack[frame_buttom..frame_buttom_n_args]
-    pub(crate) closure: *const Managed<Closure>,
+    pub(crate) closure: Option<Gc<Closure>>,
     pub(crate) ip: usize,
     pub(crate) n_args: usize,
 }
 impl Frame {
-    pub(crate) fn get_ip(closure: *const Managed<Closure>) -> usize {
-        unsafe { closure.as_ref().map_or(0, |c| c.data.entry) }
+    pub(crate) fn get_ip(closure: Option<Gc<Closure>>) -> usize {
+        unsafe { closure.as_ref().map_or(0, |c| c.entry) }
     }
-    pub(crate) fn new(
-        frame_bottom: usize,
-        n_args: usize,
-        closure: *const Managed<Closure>,
-    ) -> Self {
+    pub(crate) fn new(frame_bottom: usize, n_args: usize, closure: Option<Gc<Closure>>) -> Self {
         Self {
             locals: [Value::default(); MAX_LOCALS],
             frame_bottom,
@@ -42,7 +38,7 @@ An instance have only one state
 A runtime has multiple instances
 */
 pub struct State {
-    pub(crate) gc: Rc<Gc>,
+    pub(crate) gc: Rc<GcState>,
     pub(crate) globals: Value,
     pub(crate) frames: RefCell<Stack<Frame>>,
     pub(crate) eval_stack: RefCell<Vec<Value>>,
@@ -103,6 +99,7 @@ macro_rules! int_binary_op_impl {
 }
 pub struct CallContext<'a> {
     pub(crate) state: &'a State,
+    pub(crate) instance: &'a Instance,
     pub(crate) ret_values: RefCell<Vec<Value>>,
 }
 impl<'a> CallContext<'a> {
@@ -112,12 +109,21 @@ impl<'a> CallContext<'a> {
     pub fn arg(&self, i: usize) -> Value {
         self.state.arg(i)
     }
+    pub fn table_set(&self, table: Value, key: Value, value: Value) -> Result<(), RuntimeError> {
+        self.state.table_set(table, key, value)
+    }
+    pub fn table_get(&self, table: Value, key: Value) -> Result<Value, RuntimeError> {
+        self.state.table_get(table, key)
+    }
     pub fn ret(&self, i: usize, value: Value) {
         let mut ret_values = self.ret_values.borrow_mut();
         if i >= ret_values.len() {
             ret_values.resize(i + 1, Value::nil());
         }
         ret_values[i] = value;
+    }
+    pub fn call(&self, closure: Value, args: &[Value]) -> Result<Value, RuntimeError> {
+        self.instance.call(closure, args)
     }
 }
 impl<'a> Drop for CallContext<'a> {
@@ -130,13 +136,11 @@ impl<'a> Drop for CallContext<'a> {
         } else {
             let rv = std::mem::replace(&mut *ret_values, vec![]);
             Value {
-                data: ValueData::Tuple(self.state.gc.manage(Managed {
-                    data: Tuple {
-                        values: rv,
-                        unpack: TupleUnpack::TruncateFill,
-                    },
+                data: ValueData::Tuple(self.state.gc.allocate(Tuple {
+                    values: rv,
+                    unpack: TupleUnpack::TruncateFill,
                 })),
-                metatable: std::ptr::null(),
+                metatable: None,
             }
         };
         let mut st = self.state.eval_stack.borrow_mut();
@@ -169,25 +173,79 @@ impl State {
             Value::nil()
         }
     }
+    pub fn table_get(&self, table: Value, key: Value) -> Result<Value, RuntimeError> {
+        let table = match table.as_table() {
+            Some(x) => x,
+            None => {
+                return Err(RuntimeError {
+                    kind: ErrorKind::TypeError,
+                    msg: format!(" attempt to index a {} value", table.type_of()),
+                })
+            }
+        };
+        let table = table.borrow();
+        Ok(table.get(key))
+    }
+    pub fn table_set(&self, table: Value, key: Value, value: Value) -> Result<(), RuntimeError> {
+        let table = match table.as_table() {
+            Some(x) => x,
+            None => {
+                return Err(RuntimeError {
+                    kind: ErrorKind::TypeError,
+                    msg: format!(" attempt to index a {} value", table.type_of()),
+                })
+            }
+        };
+        let mut table = table.borrow_mut();
+        table.set(key, value);
+        Ok(())
+    }
+    // pub fn call(&self, closure: Value, args: &[Value]) -> Result<Value, RuntimeError> {
+    //     unsafe {
+    //         match closure.data {
+    //             ValueData::Closure(closure) => {
+    //                 ip_modified = true;
+    //                 *ip = Frame::get_ip(closure);
+    //                 for i in 0..n_args {
+    //                     frame.locals[i] = eval_stack[eval_stack.len() - n_args + i];
+    //                 }
+    //                 frame.n_args = n_args;
+    //                 let len = eval_stack.len();
+    //                 eval_stack.resize(len - n_args, Value::nil());
+    //             }
+    //             ValueData::Callable(callable) => {
+    //                 *ip += 1;
+    //                 let mut frame = Frame::new(eval_stack.len() - n_args, n_args, std::ptr::null());
+    //                 for i in 0..n_args {
+    //                     frame.locals[i] = eval_stack[eval_stack.len() - n_args + i];
+    //                 }
+    //                 let len = eval_stack.len();
+    //                 eval_stack.resize(len - n_args, Value::nil());
+    //                 return Ok(Continue::CallExt(callable, frame));
+    //             }
+    //             _ => unreachable!(),
+    //         }
+    //     }
+    // }
     pub fn create_string(&self, s: String) -> Value {
-        let s = self.gc.manage(Managed { data: s });
+        let s = self.gc.allocate(Managed { data: s });
         Value {
             data: ValueData::String(s),
-            metatable: std::ptr::null(),
+            metatable: None,
         }
     }
     pub fn create_table(&self, t: Table) -> Value {
-        let t = self.gc.manage(ManagedCell::new(RefCell::new(t)));
+        let t = self.gc.allocate(RefCell::new(t));
         Value {
             data: ValueData::Table(t),
-            metatable: std::ptr::null(),
+            metatable: None,
         }
     }
     pub fn create_closure(&self, c: Closure) -> Value {
-        let c = self.gc.manage(Managed::new(c));
+        let c = self.gc.allocate(c);
         Value {
             data: ValueData::Closure(c),
-            metatable: std::ptr::null(),
+            metatable: None,
         }
     }
     pub fn add(&self, a: Value, b: Value) -> Result<Value, RuntimeError> {
@@ -315,12 +373,12 @@ impl State {
             // ValueData::Bool(_) => todo!(),
             // ValueData::Number(_) => todo!(),
             ValueData::Table(x) => unsafe {
-                Ok(Value::from_number((*x).data.borrow_mut().len() as f64))
+                Ok(Value::from_number((*x).borrow_mut().len() as f64))
             },
             ValueData::String(x) => unsafe { Ok(Value::from_number((*x).data.len() as f64)) },
             // ValueData::Closure(_) => todo!(),
             // ValueData::Callable(_) => todo!(),
-            ValueData::Tuple(x) => unsafe { Ok(Value::from_number((*x).data.values.len() as f64)) },
+            ValueData::Tuple(x) => unsafe { Ok(Value::from_number((*x).values.len() as f64)) },
             _ => Err(RuntimeError {
                 kind: ErrorKind::ArithmeticError,
                 msg: format!(" attempt to get length of a {} value", a.type_of(),),

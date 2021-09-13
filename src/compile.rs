@@ -130,13 +130,23 @@ struct Compiler {
     module: ByteCodeModule,
     str_map: HashMap<String, usize>,
     var_uid_gen: u32,
+    label_gen: u32,
+    labels: HashMap<u32, usize>,
 }
 
 impl Compiler {
-    fn emit(&mut self, inst: ByteCode) -> usize {
-        let ret = self.module.code.len();
+    fn emit(&mut self, inst: ByteCode) {
+        // let ret = self.module.code.len();
         self.module.code.push(inst);
-        ret
+        // ret
+    }
+    fn new_label(&mut self) -> u32 {
+        let l = self.label_gen;
+        self.label_gen += 1;
+        l
+    }
+    fn emit_label(&mut self, l: u32) {
+        self.labels.insert(l, self.module.code.len());
     }
     fn push_number(&mut self, n: f64) {
         let bytes = n.to_le_bytes();
@@ -295,21 +305,18 @@ impl Compiler {
                         "and" => {
                             self.compile_expr(lhs)?;
                             self.emit(ByteCode::Op3U8(OpCode::TestJump, [0, 0, 1]));
-                            let jmp = self.emit(ByteCode::Address([0; 4]));
+                            let l = self.new_label();
+                            self.emit(ByteCode::Label(l.to_le_bytes()));
                             self.compile_expr(rhs)?;
-                            self.module.code[jmp] = ByteCode::Address(
-                                (self.module.code.len() as u32 - 1).to_le_bytes(),
-                            );
+                            self.emit_label(l);
                             return Ok(());
                         }
                         "or" => {
                             self.compile_expr(lhs)?;
                             self.emit(ByteCode::Op3U8(OpCode::TestJump, [1, 0, 1]));
-                            let jmp = self.emit(ByteCode::Address([0; 4]));
+                            let l = self.new_label();
                             self.compile_expr(rhs)?;
-                            self.module.code[jmp] = ByteCode::Address(
-                                (self.module.code.len() as u32 - 1).to_le_bytes(),
-                            );
+                            self.emit_label(l);
                             return Ok(());
                         }
                         _ => unreachable!(),
@@ -489,7 +496,7 @@ impl Compiler {
                                     Token::Identifier { value, .. } => value,
                                     _ => unreachable!(),
                                 };
-                                if let None = self.symbols.get(name) {
+                                if let None = self.symbols.get_cur(name) {
                                     self.add_var(name.clone());
                                 }
                             }
@@ -551,29 +558,28 @@ impl Compiler {
                 self.compile_expr(cond)?;
                 self.emit(ByteCode::Op3U8(OpCode::TestJump, [0, 1, 1]));
                 let mut jmp_end = vec![];
-                let jmp = self.emit(ByteCode::Address([0; 4]));
+                let l = self.new_label();
+                self.emit(ByteCode::Label(l.to_le_bytes()));
                 self.compile_stmt(then)?;
                 for (cond, then) in else_ifs {
                     self.compile_expr(cond)?;
                     self.emit(ByteCode::Op3U8(OpCode::TestJump, [0, 1, 1]));
-                    let jmp_then_end = self.emit(ByteCode::Address([0; 4]));
+                    let l = self.new_label();
+                    self.emit(ByteCode::Label(l.to_le_bytes()));
                     self.compile_stmt(then)?;
                     self.emit(ByteCode::Op(OpCode::Jump));
-                    let jmp = self.emit(ByteCode::Address([0; 4]));
-                    jmp_end.push(jmp);
-                    self.module.code[jmp_then_end] =
-                        ByteCode::Address((self.module.code.len() as u32).to_le_bytes());
+                    let end = self.new_label();
+                    self.emit(ByteCode::Label(end.to_le_bytes()));
+                    jmp_end.push(end);
+                    self.emit_label(l);
                 }
-                self.module.code[jmp] =
-                    ByteCode::Address((self.module.code.len() as u32).to_le_bytes());
+                self.emit_label(l);
                 if let Some(else_) = else_ {
                     self.compile_stmt(else_)?;
                 }
                 {
-                    let end = self.module.code.len() as u32;
                     for jmp in jmp_end {
-                        assert!(self.module.code[jmp] == ByteCode::Address([0; 4]));
-                        self.module.code[jmp] = ByteCode::Address(end.to_le_bytes());
+                        self.emit_label(jmp);
                     }
                 }
                 Ok(())
@@ -582,12 +588,12 @@ impl Compiler {
                 let start = self.module.code.len();
                 self.compile_expr(cond)?;
                 self.emit(ByteCode::Op3U8(OpCode::TestJump, [0, 1, 1]));
-                let jmp_endloop = self.emit(ByteCode::Address([0; 4]));
+                let l = self.new_label();
+                self.emit(ByteCode::Label(l.to_le_bytes()));
                 self.compile_stmt(body)?;
                 self.emit(ByteCode::Op(OpCode::Jump));
                 self.emit(ByteCode::Address((start as u32).to_le_bytes()));
-                self.module.code[jmp_endloop] =
-                    ByteCode::Address((self.module.code.len() as u32).to_le_bytes());
+                self.emit_label(l);
                 Ok(())
             }
             Stmt::Repeat { loc, cond, body } => todo!(),
@@ -635,7 +641,8 @@ impl Compiler {
         location: FunctionLocation,
     ) -> Result<(), CompileError> {
         self.emit(ByteCode::Op(OpCode::Jump));
-        let jmp = self.emit(ByteCode::Address([0; 4]));
+        let end = self.new_label();
+        self.emit(ByteCode::Label(end.to_le_bytes()));
         let entry = self.module.code.len() as u32;
         self.enter_scope(true);
         for (i, arg) in args.iter().enumerate() {
@@ -677,9 +684,9 @@ impl Compiler {
         self.leave_scope(true);
         let proto_idx = self.module.protypes.len() as u32;
         self.module.protypes.push(proto);
-        let end = self.emit(ByteCode::Op3U8(OpCode::NewClosure, get_3xu8(proto_idx))) as u32;
+        self.emit_label(end);
+        self.emit(ByteCode::Op3U8(OpCode::NewClosure, get_3xu8(proto_idx)));
         self.emit(ByteCode::Address(entry.to_le_bytes()));
-        self.module.code[jmp] = ByteCode::Address(end.to_le_bytes());
         match location {
             FunctionLocation::Global => match name.unwrap() {
                 FunctionName::Method {
@@ -744,14 +751,14 @@ impl Compiler {
             }
             // Expr::BinaryExpr { op, lhs, rhs } => todo!(),
             // Expr::UnaryExpr { op, arg } => todo!(),
-            Expr::IndexExpr { loc:_, lhs, rhs } => {
+            Expr::IndexExpr { loc: _, lhs, rhs } => {
                 self.compile_expr(rhs)?;
                 self.compile_expr(lhs)?;
                 self.emit(ByteCode::Op(OpCode::StoreTable));
                 Ok(())
             }
             Expr::DotExpr {
-                loc:_,
+                loc: _,
                 lhs,
                 rhs: token,
             } => {
@@ -776,8 +783,23 @@ impl Compiler {
             }),
         }
     }
+    fn resolve_labels(&mut self) {
+        for (i, inst) in self.module.code.iter_mut().enumerate() {
+            match *inst {
+                ByteCode::Label(label) => {
+                    let level = u32::from_le_bytes(label);
+                    let addr = *self.labels.get(&level).unwrap() as u32;
+                    *inst = ByteCode::Address(addr.to_le_bytes());
+                }
+                _ => {}
+            }
+        }
+    }
     fn run(&mut self, block: Rc<Stmt>) -> Result<ByteCodeModule, CompileError> {
+        self.enter_scope(true);
         self.compile_stmt(&*block)?;
+        self.leave_scope(true);
+        self.resolve_labels();
         let module = std::mem::replace(
             &mut self.module,
             ByteCodeModule {
@@ -828,6 +850,8 @@ pub fn compile(block: Rc<Stmt>) -> Result<ByteCodeModule, CompileError> {
     let mut compiler = Compiler {
         funcs: vec![],
         var_uid_gen: 0,
+        label_gen: 0,
+        labels: HashMap::new(),
         symbols: SymbolTable {
             vars: HashMap::new(),
             parent: std::ptr::null_mut(),
@@ -845,23 +869,7 @@ pub fn compile(block: Rc<Stmt>) -> Result<ByteCodeModule, CompileError> {
 }
 
 pub fn compile_repl(block: Rc<Stmt>) -> Result<ByteCodeModule, CompileError> {
-    let mut compiler = Compiler {
-        funcs: vec![],
-        var_uid_gen: 0,
-        symbols: SymbolTable {
-            vars: HashMap::new(),
-            parent: std::ptr::null_mut(),
-            func_scope: 0,
-            n_locals: 0,
-        },
-        module: ByteCodeModule {
-            protypes: vec![],
-            code: vec![],
-            string_pool: vec![],
-        },
-        str_map: HashMap::new(),
-    };
-    let mut module = compiler.run(block)?;
+    let mut module = compile(block)?;
     match *module.code.last().unwrap() {
         ByteCode::Op(OpCode::Pop) => {
             module.code.pop().unwrap();
