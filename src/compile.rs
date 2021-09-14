@@ -511,9 +511,9 @@ impl Compiler {
                                     Token::Identifier { value, .. } => value,
                                     _ => unreachable!(),
                                 };
-                                if let None = self.symbols.get_cur(name) {
+                                // if let None = self.symbols.get_cur(name) {
                                     self.add_var(name.clone());
-                                }
+                                // }
                             }
                             _ => unreachable!(),
                         };

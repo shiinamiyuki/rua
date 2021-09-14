@@ -9,7 +9,16 @@ edition = "2018"
 # pest = "*"
 # pest_derive = "*"
 ordered-float = "2.0"
+smallvec = "1.6.1"
+nalgebra = {version ="0.26.2", features = ["serde-serialize"], optional=true }
+# rua-derive ={path="rua-derive", optional=true }
 
 [[bin]]
 name="rua"
 path="src/bin/rua.rs"
+
+[features]
+default=[]
+# default=["rua-derive"]
+complete = ["nalgebra"]
+# derive = ["rua-derive"]

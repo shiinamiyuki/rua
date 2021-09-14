@@ -1,8 +1,11 @@
 use std::cell::RefCell;
 use std::fs::{File, OpenOptions};
+use std::io::{BufReader, BufWriter};
 use std::rc::Rc;
 
 use crate::runtime::{ErrorKind, Runtime, RuntimeError};
+use crate::value::Managed;
+
 
 pub(crate) fn add_math_lib(runtime: &Runtime) {
     let mut math = runtime.create_module();
@@ -52,62 +55,156 @@ pub(crate) fn add_math_lib(runtime: &Runtime) {
     });
     runtime.add_module("math".into(), math);
 }
-
+// type FileHandle = Rc<RefCell<FileRecord>>;
 // struct IOContext {
-//     file: Option<std::fs::File>,
+//     input: Option<FileHandle>,
+//     output: Option<FileHandle>,
 // }
-// struct FileHandle {
-//     file: std::fs::File,
+// struct FileRecord {
+//     file: Option<std::fs::File>,
+//     reader: Option<std::io::BufReader<std::fs::File>>,
+//     writer: Option<std::io::BufWriter<std::fs::File>>,
+// }
+// impl FileRecord {
+//     fn is_read(&mut self) -> bool {
+//         self.reader.is_some()
+//     }
+//     fn is_write(&mut self) -> bool {
+//         self.writer.is_some()
+//     }
+//     fn to_read(&mut self) {
+//         let file = std::mem::replace(&mut self.file, None).unwrap();
+//         self.reader = Some(BufReader::new(file));
+//     }
+//     fn to_write(&mut self) {
+//         let file = std::mem::replace(&mut self.file, None).unwrap();
+//         self.writer = Some(BufWriter::new(file));
+//     }
 // }
 // pub(crate) fn add_io_lib(runtime: &Runtime) {
 //     let mut io = runtime.create_module();
-//     let ctx = Rc::new(RefCell::new(IOContext { file: None }));
+//     let io_ctx = Rc::new(RefCell::new(IOContext {
+//         input: None,
+//         output: None,
+//     }));
 
-//     io.function("open".into(), |ctx| {
-//         let filename = ctx.arg(0)?;
-//         let filename = filename.cast_ref::<String>()?;
-//         let mut options = OpenOptions::new();
+//     {
+//         io.function("open".into(), move |ctx| {
+//             let filename = ctx.arg(0)?;
+//             let filename = filename.cast_ref::<String>()?;
+//             let mut options = OpenOptions::new();
 
-//         let file = if ctx.get_arg_count() > 1 {
-//             let mode = ctx.arg(1)?;
-//             let mode = mode.cast_ref::<String>()?;
-//             if mode == "r" {
-//                 options.read(true);
-//             }
-//             if mode == "w" {
-//                 options.write(true);
-//             }
-//             if mode == "a" {
-//                 options.append(true);
-//             }
-//             if mode == "r+" {
-//                 options.read(true).write(true);
-//             }
-//             if mode == "w+" {
-//                 options.write(true).truncate(true);
-//             }
-//             match options.open(filename) {
-//                 Err(e) => {
+//             let file = if ctx.get_arg_count() > 1 {
+//                 let mode = ctx.arg(1)?;
+//                 let mode = mode.cast_ref::<String>()?;
+//                 if mode == "r" {
+//                     options.read(true);
+//                 } else if mode == "w" {
+//                     options.write(true).truncate(true);
+//                 } else if mode == "a" {
+//                     options.append(true);
+//                 } else if mode == "r+" {
+//                     // options.read(true).write(true);
 //                     return Err(RuntimeError {
 //                         kind: ErrorKind::ExternalError,
-//                         msg: format!("{}", e),
+//                         msg: "r+ is not suppored".into(),
 //                     });
-//                 }
-//                 Ok(f) => f,
-//             }
-//         } else {
-//             match std::fs::File::open(filename) {
-//                 Err(e) => {
+//                 } else if mode == "w+" {
+//                     // options.write(true).truncate(true);
 //                     return Err(RuntimeError {
 //                         kind: ErrorKind::ExternalError,
-//                         msg: format!("{}", e),
+//                         msg: "w+ is not suppored".into(),
+//                     });
+//                 } else {
+//                     return Err(RuntimeError {
+//                         kind: ErrorKind::ExternalError,
+//                         msg: format!("unrecognized mode {}", mode),
 //                     });
 //                 }
-//                 Ok(f) => f,
+//                 match options.open(filename) {
+//                     Err(e) => {
+//                         return Err(RuntimeError {
+//                             kind: ErrorKind::ExternalError,
+//                             msg: format!("{}", e),
+//                         });
+//                     }
+//                     Ok(f) => f,
+//                 }
+//             } else {
+//                 match std::fs::File::open(filename) {
+//                     Err(e) => {
+//                         return Err(RuntimeError {
+//                             kind: ErrorKind::ExternalError,
+//                             msg: format!("{}", e),
+//                         });
+//                     }
+//                     Ok(f) => f,
+//                 }
+//             };
+//             ctx.ret(
+//                 0,
+//                 ctx.create_userdata(Managed::<FileHandle>::new(Rc::new(RefCell::new(
+//                     FileRecord {
+//                         file: Some(file),
+//                         reader: None,
+//                         writer: None,
+//                     },
+//                 )))),
+//             );
+//             Ok(())
+//         });
+//     }
+//     {
+//         let io_ctx = io_ctx.clone();
+//         io.function("input".into(), move |ctx| {
+//             let arg0 = ctx.arg(0)?;
+//             let handle = arg0.cast_ref::<FileHandle>()?;
+//             {
+//                 let mut handle = handle.borrow_mut();
+//                 if handle.is_write() {
+//                     return ctx.error("file is set to write".into());
+//                 }
+//                 if !handle.is_read() {
+//                     handle.to_read();
+//                 }
 //             }
-//         };
-//         // ctx.ret(0, ctx.create_userdata(Managed::new(Some(file))));
-//         Ok(())
-//     });
+//             let mut io_ctx = io_ctx.borrow_mut();
+//             io_ctx.input = Some(handle.clone());
+//             Ok(())
+//         });
+//     }
+//     {
+//         let io_ctx = io_ctx.clone();
+//         io.function("output".into(), move |ctx| {
+//             let arg0 = ctx.arg(0)?;
+//             if arg0.is_nil(){
+//                 let 
+//             }
+//             let handle = arg0.cast_ref::<FileHandle>()?;
+//             {
+//                 let mut handle = handle.borrow_mut();
+//                 if handle.is_read() {
+//                     return ctx.error("file is set to read".into());
+//                 }
+//                 if !handle.is_write() {
+//                     handle.to_write();
+//                 }
+//             }
+//             let mut io_ctx = io_ctx.borrow_mut();
+//             io_ctx.output = Some(handle.clone());
+//             Ok(())
+//         });
+//     }
+//     {
+//         let io_ctx = io_ctx.clone();
+//         io.function("read".into(), move |ctx| {
+//             let mut io_ctx = io_ctx.borrow_mut();
+//             if io_ctx.input.is_none() {
+//                 let s = 
+//             }
+//             let mut input = io_ctx.input.
+//             Ok(())
+//         });
+//     }
 //     runtime.add_module("io".into(), io);
 // }

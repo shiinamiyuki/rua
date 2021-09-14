@@ -7,19 +7,7 @@ use std::{
     rc::Rc,
 };
 
-use crate::{
-    bytecode::ByteCodeModule,
-    closure::{Callable, NativeFunction},
-    compile::{compile, CompileError},
-    gc::{GcState, Traceable},
-    parse::{parse_impl, tokenize},
-    state::{CallContext, State},
-    stdlib,
-    table::Table,
-    value::{Managed, ManagedCell, UserData, Value, ValueData},
-    vm::Instance,
-    Stack,
-};
+use crate::{Stack, bytecode::ByteCodeModule, closure::{Callable, NativeFunction}, compile::{compile, CompileError}, dummy_convert, dummy_convert_ref, gc::{GcState, Traceable}, parse::{parse_impl, tokenize}, state::{CallContext, State}, stdlib, table::Table, value::{Managed, ManagedCell, UserData, Value, ValueData}, vm::Instance};
 
 #[derive(Clone, Copy, Debug)]
 pub enum ErrorKind {
@@ -29,6 +17,7 @@ pub enum ErrorKind {
     ExternalError,
     ArgumentArityError,
     CompileError,
+    KeyError,
 }
 #[derive(Debug, Clone)]
 pub struct RuntimeError {
@@ -46,25 +35,7 @@ pub struct ValueRef<'a> {
     pub(crate) value: Value,
     pub(crate) phantom: PhantomData<&'a u32>,
 }
-fn dummy_convert_ref<T: 'static, U: 'static>(x: &T) -> &U {
-    if TypeId::of::<T>() == TypeId::of::<U>() {
-        unsafe { std::mem::transmute(x) }
-    } else {
-        unreachable!()
-    }
-}
-fn dummy_convert<T: 'static + Sized, U: 'static + Sized>(x: T) -> U {
-    if TypeId::of::<T>() == TypeId::of::<U>() {
-        unsafe {
-            debug_assert!(size_of::<T>() == size_of::<U>());
-            let y = std::mem::transmute_copy(&x);
-            std::mem::forget(x);
-            y
-        }
-    } else {
-        unreachable!()
-    }
-}
+
 macro_rules! arg_f64 {
     ($self:expr) => {{
         match $self.as_f64() {
@@ -120,6 +91,9 @@ macro_rules! arg_string {
 }
 
 impl<'a> ValueRef<'a> {
+    pub fn is_nil(&self) -> bool {
+        self.value.is_nil()
+    }
     pub fn to_number(&'a self) -> Option<f64> {
         self.value.number()
     }
@@ -141,6 +115,7 @@ impl<'a> ValueRef<'a> {
     pub fn type_of(&self) -> &'static str {
         self.value.type_of()
     }
+
     pub fn cast<T: 'static>(&self) -> Result<T, RuntimeError> {
         if TypeId::of::<f64>() == TypeId::of::<T>() {
             let x = match self.to_number() {
@@ -151,6 +126,9 @@ impl<'a> ValueRef<'a> {
                 }),
             }?;
             Ok(dummy_convert::<f64, T>(x))
+        } else if TypeId::of::<bool>() == TypeId::of::<T>() {
+            let x = self.to_bool();
+            Ok(dummy_convert::<bool, T>(x))
         } else if TypeId::of::<String>() == TypeId::of::<T>() {
             let x = match self.as_string() {
                 Some(x) => Ok(x.clone()),
@@ -168,6 +146,15 @@ impl<'a> ValueRef<'a> {
         if TypeId::of::<f64>() == TypeId::of::<T>() {
             let x = arg_f64!(self)?;
             Ok(dummy_convert_ref::<f64, T>(x))
+        } else if TypeId::of::<bool>() == TypeId::of::<T>() {
+            let x = match self.as_bool() {
+                Some(x) => Ok(x),
+                None => Err(RuntimeError {
+                    kind: ErrorKind::TypeError,
+                    msg: format!("expected  type 'boolean' but is {}", self.type_of()),
+                }),
+            }?;
+            Ok(dummy_convert_ref::<bool, T>(x))
         } else if TypeId::of::<String>() == TypeId::of::<T>() {
             let x = arg_string!(self)?;
             Ok(dummy_convert_ref::<String, T>(x))
@@ -421,6 +408,27 @@ impl RuntimeInner {
         self.add_function("type".into(), |ctx| {
             let v = ctx.arg(0).unwrap();
             ctx.ret(0, ctx.create_string(String::from(v.type_of())));
+            Ok(())
+        });
+        self.add_function("next".into(), |ctx| {
+            let v = ctx.arg(0)?;
+            let key = ctx.arg_or_nil(1);
+            let table = v.value.as_table().map_or(
+                Err(RuntimeError {
+                    kind: ErrorKind::TypeError,
+                    msg: format!("table expected in 'next' but found {}", v.value.type_of()),
+                }),
+                |x| Ok(x),
+            )?;
+            let table = table.borrow();
+            let next = table.next(key.value)?;
+            ctx.ret(
+                0,
+                ValueRef {
+                    value: next,
+                    phantom: PhantomData {},
+                },
+            );
             Ok(())
         });
         // let pself = self as *mut RuntimeInner;

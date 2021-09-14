@@ -6,15 +6,7 @@ use std::{
     rc::Rc,
 };
 
-use crate::{
-    bytecode::{u32_from_3xu8, ByteCode, ByteCodeModule, OpCode},
-    closure::{Callable, Closure, UpValue, UpValueInner},
-    gc::{Gc, GcState, Traceable},
-    runtime::{ErrorKind, RuntimeError, RuntimeInner},
-    state::{CallContext, Frame, State},
-    table::Table,
-    value::{Managed, ManagedCell, Value, ValueData},
-};
+use crate::{Stack, bytecode::{u32_from_3xu8, ByteCode, ByteCodeModule, OpCode}, closure::{Callable, Closure, UpValue, UpValueInner}, gc::{Gc, GcState, Traceable}, runtime::{ErrorKind, RuntimeError, RuntimeInner}, state::{CallContext, Frame, State}, table::Table, value::{Managed, ManagedCell, Value, ValueData}};
 
 /*
 The instances represents a thread
@@ -437,7 +429,7 @@ impl Instance {
         // println!("{}", eval_stack.last().unwrap().print());
         Ok(Continue::Return)
     }
-    pub fn exec(&self, mut module: ByteCodeModule) -> Result<(), RuntimeError> {
+    fn load_module_string(&self, mut module: ByteCodeModule)->ByteCodeModule{
         {
             module.string_pool_cache.clear();
             let mut runtime = self.runtime.borrow_mut();
@@ -452,12 +444,35 @@ impl Instance {
                 module.string_pool_cache.push(v);
             }
         }
-        self.exec_impl(module)?;
+        module
+    }
+    pub fn exec(&self, module: ByteCodeModule) -> Result<(), RuntimeError> {
+        let module= self.load_module_string(module);
+        match self.exec_impl(module){
+            Ok(_)=>{},
+            Err(e)=>{                
+                self.reset();
+                return Err(e);
+            }
+        }
         assert!(self.state.borrow().eval_stack.borrow().is_empty());
         Ok(())
     }
+    fn reset(&self){
+        let mut st = self.state.eval_stack.borrow_mut();
+        st.clear();
+        let mut frames = self.state.frames.borrow_mut();
+        *frames = Stack::new();
+    }
     pub fn eval_repl(&self, module: ByteCodeModule) -> Result<(), RuntimeError> {
-        self.exec_impl(module)?;
+        let module= self.load_module_string(module);
+        match self.exec_impl(module){
+            Ok(_)=>{},
+            Err(e)=>{                
+                self.reset();
+                return Err(e);
+            }
+        }
         assert!(self.state.borrow().eval_stack.borrow().len() <= 1);
         if self.state.borrow().eval_stack.borrow().len() == 1 {
             let mut st = self.state.borrow().eval_stack.borrow_mut();

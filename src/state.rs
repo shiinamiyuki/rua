@@ -1,13 +1,4 @@
-use crate::{
-    bytecode::ByteCode,
-    closure::Closure,
-    gc::{Gc, GcState, Traceable},
-    runtime::{ErrorKind, RuntimeError, ValueRef},
-    table::Table,
-    value::{Managed, ManagedCell, Tuple, TupleUnpack, UserData, Value, ValueData},
-    vm::Instance,
-    Stack,
-};
+use crate::{Stack, bytecode::ByteCode, closure::{Callable, Closure}, gc::{Gc, GcState, Traceable}, runtime::{ErrorKind, RuntimeError, ValueRef}, table::Table, value::{Managed, ManagedCell, Tuple, TupleUnpack, UserData, Value, ValueData}, vm::Instance};
 use std::{any::TypeId, cell::RefCell, cmp::Ordering, marker::PhantomData, rc::Rc};
 
 pub const MAX_LOCALS: usize = 256;
@@ -107,6 +98,12 @@ pub struct CallContext<'a> {
 }
 
 impl<'a> CallContext<'a> {
+    pub fn error(&self, msg: String) -> Result<(), RuntimeError> {
+        Err(RuntimeError {
+            kind: ErrorKind::ExternalError,
+            msg,
+        })
+    }
     pub fn create_number(&self, x: f64) -> ValueRef<'a> {
         ValueRef {
             phantom: PhantomData {},
@@ -119,6 +116,12 @@ impl<'a> CallContext<'a> {
             value: Value::from_bool(x),
         }
     }
+    // pub fn create_function_from_closure<F: Fn(&CallContext<'_>) -> Result<(), RuntimeError> + 'static>(&self, f:F) -> ValueRef<'a> {
+    //     ValueRef {
+    //         phantom: PhantomData {},
+    //         value:
+    //     }
+    // }
     pub fn create_userdata<T: UserData + Traceable>(&self, userdata: T) -> ValueRef<'a> {
         ValueRef {
             phantom: PhantomData {},
@@ -134,6 +137,21 @@ impl<'a> CallContext<'a> {
     pub fn get_arg_count(&self) -> usize {
         let frame = self.frames.last().unwrap();
         frame.n_args
+    }
+    pub fn arg_or_nil(&'a self, i: usize) -> ValueRef<'a> {
+        let frame = self.frames.last().unwrap();
+        if i < frame.n_args {
+            ValueRef {
+                value: frame.locals[i],
+                phantom: PhantomData {},
+            }
+            // Some(self.eval_stack.borrow()[frame.frame_bottom + i])
+        } else {
+            ValueRef {
+                value: Value::nil(),
+                phantom: PhantomData {},
+            }
+        }
     }
     pub fn arg(&'a self, i: usize) -> Result<ValueRef<'a>, RuntimeError> {
         let frame = self.frames.last().unwrap();
@@ -240,7 +258,11 @@ impl State {
             None => {
                 return Err(RuntimeError {
                     kind: ErrorKind::TypeError,
-                    msg: format!(" attempt to index a {} value, key:{}", table.type_of(), key.print()),
+                    msg: format!(
+                        " attempt to index a {} value, key:{}",
+                        table.type_of(),
+                        key.print()
+                    ),
                 })
             }
         };
@@ -306,6 +328,13 @@ impl State {
             metatable: None,
         }
     }
+    // pub(crate) fn create_callable<T: Callable>(&self, f: T) -> Value {
+    //     let s = self.gc.allocate(p);
+    //     Value {
+    //         data: ValueData::UserData(s),
+    //         metatable: None,
+    //     }
+    // }
     pub(crate) fn create_string(&self, s: String) -> Value {
         let s = self.gc.allocate(Managed { data: s });
         Value {

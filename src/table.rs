@@ -11,6 +11,7 @@ use std::{
 
 use crate::{
     gc::Traceable,
+    runtime::RuntimeError,
     value::{Value, ValueData},
 };
 
@@ -273,6 +274,43 @@ impl Table {
             largest_uint: 0,
             len: 0,
             need_recompute_len: false,
+        }
+    }
+    pub(crate) fn next(&self, key: Value) -> Result<Value, RuntimeError> {
+        if key.is_nil() {
+            if !self.array.is_empty() {
+                return Ok(Value::from_number(1 as f64));
+            } else if !self.map.table.is_empty() {
+                return Ok(self.map.table[self.map.head].key);
+            } else {
+                return Ok(Value::nil());
+            }
+        }
+        match key.data {
+            ValueData::Number(x) if is_int(x.0) => {
+                let i = x.trunc() as i64;
+                if i >= 1 && i < self.array.len() as i64 {
+                    return Ok(Value::from_number((i + 1) as f64));
+                }
+            }
+            _ => {}
+        }
+        if let Some(i) = self.map.get_index(&key) {
+            let entry = self.map.table[i];
+            if entry.value.is_nil() {
+                Err(RuntimeError {
+                    kind: crate::runtime::ErrorKind::TypeError,
+                    msg: format!("invalid key to 'next', key:{}", key.print()),
+                })
+            } else {
+                if entry.next != usize::MAX {
+                    Ok(self.map.table[entry.next].key)
+                } else {
+                    Ok(Value::nil())
+                }
+            }
+        } else {
+            Ok(Value::nil())
         }
     }
     pub(crate) fn new_with(array_part_len: usize, hash_part_len: usize) -> Self {

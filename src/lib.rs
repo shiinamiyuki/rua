@@ -1,4 +1,4 @@
-use std::marker::PhantomData;
+use std::{any::TypeId, marker::PhantomData, mem::size_of};
 
 pub mod bytecode;
 pub mod closure;
@@ -11,6 +11,7 @@ pub mod stdlib;
 pub mod table;
 pub mod value;
 pub mod vm;
+pub mod bind;
 
 pub(crate) const fn num_bits<T>() -> usize {
     std::mem::size_of::<T>() * 8
@@ -111,5 +112,26 @@ impl<T> Drop for Stack<T> {
                 p = prev;
             }
         }
+    }
+}
+
+
+pub(crate) fn dummy_convert_ref<T: 'static, U: 'static>(x: &T) -> &U {
+    if TypeId::of::<T>() == TypeId::of::<U>() {
+        unsafe { std::mem::transmute(x) }
+    } else {
+        unreachable!()
+    }
+}
+pub(crate) fn dummy_convert<T: 'static + Sized, U: 'static + Sized>(x: T) -> U {
+    if TypeId::of::<T>() == TypeId::of::<U>() {
+        unsafe {
+            debug_assert!(size_of::<T>() == size_of::<U>());
+            let y = std::mem::transmute_copy(&x);
+            std::mem::forget(x);
+            y
+        }
+    } else {
+        unreachable!()
     }
 }
