@@ -9,11 +9,7 @@ use std::{
     hash::{BuildHasher, Hash, Hasher},
 };
 
-use crate::{
-    gc::Traceable,
-    runtime::RuntimeError,
-    value::{Value, ValueData},
-};
+use crate::{gc::Traceable, runtime::RuntimeError, value::Value};
 
 #[derive(Clone, Copy)]
 struct Entry {
@@ -262,6 +258,7 @@ pub struct Table {
     largest_uint: u64,
     len: usize,
     need_recompute_len: bool,
+    pub(crate) metatable: Value,
 }
 fn is_int(x: f64) -> bool {
     x.fract() == 0.0
@@ -274,6 +271,7 @@ impl Table {
             largest_uint: 0,
             len: 0,
             need_recompute_len: false,
+            metatable: Value::Nil,
         }
     }
     pub(crate) fn next(&self, key: Value) -> Result<Value, RuntimeError> {
@@ -286,8 +284,8 @@ impl Table {
                 return Ok(Value::nil());
             }
         }
-        match key.data {
-            ValueData::Number(x) if is_int(x.0) => {
+        match key {
+            Value::Number(x) if is_int(x.0) => {
                 let i = x.trunc() as i64;
                 if i >= 1 && i < self.array.len() as i64 {
                     return Ok(Value::from_number((i + 1) as f64));
@@ -320,6 +318,7 @@ impl Table {
             largest_uint: array_part_len as u64,
             len: array_part_len,
             need_recompute_len: false,
+            metatable:Value::Nil,
         }
     }
     pub(crate) fn len(&mut self) -> usize {
@@ -345,8 +344,8 @@ impl Table {
         }
     }
     pub(crate) fn get(&self, key: Value) -> Value {
-        match key.data {
-            ValueData::Number(x) if is_int(x.0) => {
+        match key {
+            Value::Number(x) if is_int(x.0) => {
                 let i = x.trunc() as i64;
                 if i >= 1 && i <= self.array.len() as i64 {
                     return self.array[(i - 1) as usize];
@@ -357,8 +356,8 @@ impl Table {
         self.map.get(key)
     }
     pub(crate) fn set(&mut self, key: Value, value: Value) {
-        match key.data {
-            ValueData::Number(x) if is_int(x.0) => {
+        match key {
+            Value::Number(x) if is_int(x.0) => {
                 let i = x.trunc() as i64;
                 if !value.is_nil() {
                     self.largest_uint = self.largest_uint.max(i as u64);

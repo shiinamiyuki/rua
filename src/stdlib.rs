@@ -7,12 +7,31 @@ use crate::runtime::{ErrorKind, Runtime, RuntimeError};
 use crate::value::Managed;
 
 
+
+// macro_rules! bind_function {
+//     ($func:ident, fn($arg0:ty)->$ret:ty) => {
+//        |ctx|{
+//             let a0= ctx.arg(0)?;
+//             let a0 =cast!(a0,$arg0);
+
+//        }
+//     };
+// }
+// macro_rules! cast {
+//     ($x:expr,&$t:ty) => {
+//         x.cast::<$t>()?
+//     };
+//     ($x:expr,$t:ty) => {
+//         x.cast::<$t>()?.clone()
+//     };
+// }
+
 pub(crate) fn add_math_lib(runtime: &Runtime) {
     let mut math = runtime.create_module();
     macro_rules! unary_func {
         ($func:ident) => {{
             math.function(stringify!($func).into(), |ctx| {
-                let x: f64 = ctx.arg(0)?.cast::<f64>()?;
+                let x: f64 = *ctx.arg(0)?.cast::<f64>()?;
                 // println!("math.{}({})",stringify!($func), x);
                 ctx.ret(0, ctx.create_number(x.$func()));
                 Ok(())
@@ -20,7 +39,7 @@ pub(crate) fn add_math_lib(runtime: &Runtime) {
         }};
         ($name:literal, $func:ident) => {{
             math.function($name.into(), |ctx| {
-                let x: f64 = ctx.arg(0)?.cast::<f64>()?;
+                let x: f64 = *ctx.arg(0)?.cast::<f64>()?;
                 ctx.ret(0, ctx.create_number(x.$func()));
                 Ok(())
             });
@@ -42,14 +61,14 @@ pub(crate) fn add_math_lib(runtime: &Runtime) {
     unary_func!("deg", to_degrees);
     unary_func!("rad", to_radians);
     math.function("max".into(), |ctx| {
-        let x: f64 = ctx.arg(0)?.cast::<f64>()?;
-        let y: f64 = ctx.arg(1)?.cast::<f64>()?;
+        let x: f64 = *ctx.arg(0)?.cast::<f64>()?;
+        let y: f64 = *ctx.arg(1)?.cast::<f64>()?;
         ctx.ret(0, ctx.create_number(x.max(y)));
         Ok(())
     });
     math.function("min".into(), |ctx| {
-        let x: f64 = ctx.arg(0)?.cast::<f64>()?;
-        let y: f64 = ctx.arg(1)?.cast::<f64>()?;
+        let x: f64 = *ctx.arg(0)?.cast::<f64>()?;
+        let y: f64 = *ctx.arg(1)?.cast::<f64>()?;
         ctx.ret(0, ctx.create_number(x.min(y)));
         Ok(())
     });

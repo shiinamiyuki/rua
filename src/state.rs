@@ -1,10 +1,19 @@
-use crate::{Stack, bytecode::ByteCode, closure::{Callable, Closure}, gc::{Gc, GcState, Traceable}, runtime::{ErrorKind, RuntimeError, ValueRef}, table::Table, value::{Managed, ManagedCell, Tuple, TupleUnpack, UserData, Value, ValueData}, vm::Instance};
-use std::{any::TypeId, cell::RefCell, cmp::Ordering, marker::PhantomData, rc::Rc};
+use crate::{
+    bytecode::ByteCode,
+    closure::{Callable, Closure},
+    gc::{Gc, GcState, Traceable},
+    runtime::{ConstantsIndex, ErrorKind, RuntimeError, ValueRef},
+    table::Table,
+    value::{Managed, ManagedCell, Tuple, TupleUnpack, UserData, Value},
+    vm::Instance,
+    Stack,
+};
+use std::{any::TypeId, cell::{RefCell, UnsafeCell}, cmp::Ordering, marker::PhantomData, rc::{Rc, Weak}};
 
 pub const MAX_LOCALS: usize = 256;
 pub(crate) struct Frame {
     pub(crate) locals: [Value; MAX_LOCALS],
-    pub(crate) frame_bottom: usize, //stack[frame_buttom..frame_buttom_n_args]
+    // pub(crate) frame_bottom: usize, //stack[frame_buttom..frame_buttom_n_args]
     pub(crate) closure: Option<Gc<Closure>>,
     pub(crate) ip: usize,
     pub(crate) n_args: usize,
@@ -15,10 +24,9 @@ impl Frame {
             closure.as_ref().map_or(0, |c| c.entry)
         }
     }
-    pub(crate) fn new(frame_bottom: usize, n_args: usize, closure: Option<Gc<Closure>>) -> Self {
+    pub(crate) fn new(n_args: usize, closure: Option<Gc<Closure>>) -> Self {
         Self {
             locals: [Value::default(); MAX_LOCALS],
-            frame_bottom,
             closure,
             ip: Self::get_ip(closure),
             n_args,
@@ -33,8 +41,10 @@ A runtime has multiple instances
 pub struct State {
     pub(crate) gc: Rc<GcState>,
     pub(crate) globals: Value,
+    pub(crate) constants: Rc<Vec<Value>>,
     pub(crate) frames: RefCell<Stack<Frame>>,
     pub(crate) eval_stack: RefCell<Vec<Value>>,
+    pub(crate) instance:Weak<Instance>,
 }
 
 macro_rules! binary_op_impl {
@@ -105,16 +115,10 @@ impl<'a> CallContext<'a> {
         })
     }
     pub fn create_number(&self, x: f64) -> ValueRef<'a> {
-        ValueRef {
-            phantom: PhantomData {},
-            value: Value::from_number(x),
-        }
+        ValueRef::new(Value::from_number(x))
     }
     pub fn create_bool(&self, x: bool) -> ValueRef<'a> {
-        ValueRef {
-            phantom: PhantomData {},
-            value: Value::from_bool(x),
-        }
+        ValueRef::new(Value::from_bool(x))
     }
     // pub fn create_function_from_closure<F: Fn(&CallContext<'_>) -> Result<(), RuntimeError> + 'static>(&self, f:F) -> ValueRef<'a> {
     //     ValueRef {
@@ -123,16 +127,10 @@ impl<'a> CallContext<'a> {
     //     }
     // }
     pub fn create_userdata<T: UserData + Traceable>(&self, userdata: T) -> ValueRef<'a> {
-        ValueRef {
-            phantom: PhantomData {},
-            value: self.state.create_userdata(userdata),
-        }
+        ValueRef::new(self.state.create_userdata(userdata))
     }
     pub fn create_string(&self, s: String) -> ValueRef<'a> {
-        ValueRef {
-            phantom: PhantomData {},
-            value: self.state.create_string(s),
-        }
+        ValueRef::new(self.state.create_string(s))
     }
     pub fn get_arg_count(&self) -> usize {
         let frame = self.frames.last().unwrap();
@@ -141,25 +139,16 @@ impl<'a> CallContext<'a> {
     pub fn arg_or_nil(&'a self, i: usize) -> ValueRef<'a> {
         let frame = self.frames.last().unwrap();
         if i < frame.n_args {
-            ValueRef {
-                value: frame.locals[i],
-                phantom: PhantomData {},
-            }
+            ValueRef::new(frame.locals[i])
             // Some(self.eval_stack.borrow()[frame.frame_bottom + i])
         } else {
-            ValueRef {
-                value: Value::nil(),
-                phantom: PhantomData {},
-            }
+            ValueRef::new(Value::nil())
         }
     }
     pub fn arg(&'a self, i: usize) -> Result<ValueRef<'a>, RuntimeError> {
         let frame = self.frames.last().unwrap();
         if i < frame.n_args {
-            Ok(ValueRef {
-                value: frame.locals[i],
-                phantom: PhantomData {},
-            })
+            Ok(ValueRef::new(frame.locals[i]))
             // Some(self.eval_stack.borrow()[frame.frame_bottom + i])
         } else {
             Err(RuntimeError {
@@ -181,10 +170,7 @@ impl<'a> CallContext<'a> {
         table: ValueRef<'a>,
         key: ValueRef<'a>,
     ) -> Result<ValueRef<'a>, RuntimeError> {
-        Ok(ValueRef {
-            value: self.state.table_get(table.value, key.value)?,
-            phantom: PhantomData {},
-        })
+        Ok(ValueRef::new(self.state.table_get(table.value, key.value)?))
     }
     pub fn ret(&self, i: usize, value: ValueRef<'a>) {
         let mut ret_values = self.ret_values.borrow_mut();
@@ -199,10 +185,14 @@ impl<'a> CallContext<'a> {
         args: &[ValueRef<'a>],
     ) -> Result<ValueRef<'a>, RuntimeError> {
         let args: Vec<_> = args.iter().map(|x| x.value).collect();
-        Ok(ValueRef {
-            value: self.instance.call(closure.value, &args)?,
-            phantom: PhantomData {},
-        })
+        Ok(ValueRef::new(self.instance.call(closure.value, &args)?))
+    }
+    fn call_raw(
+        &self,
+        closure: Value,
+        args: &[Value],
+    ) -> Result<Value, RuntimeError> {
+        Ok(self.instance.call(closure, args)?)
     }
 }
 impl<'a> Drop for CallContext<'a> {
@@ -214,13 +204,10 @@ impl<'a> Drop for CallContext<'a> {
             ret_values[0]
         } else {
             let rv = std::mem::replace(&mut *ret_values, vec![]);
-            Value {
-                data: ValueData::Tuple(self.state.gc.allocate(Tuple {
-                    values: rv,
-                    unpack: TupleUnpack::TruncateFill,
-                })),
-                metatable: None,
-            }
+            Value::Tuple(self.state.gc.allocate(Tuple {
+                values: rv,
+                unpack: TupleUnpack::TruncateFill,
+            }))
         };
         let mut st = self.state.eval_stack.borrow_mut();
         st.push(ret);
@@ -252,22 +239,42 @@ impl State {
     //         Value::nil()
     //     }
     // }
-    pub(crate) fn table_get(&self, table: Value, key: Value) -> Result<Value, RuntimeError> {
-        let table = match table.as_table() {
-            Some(x) => x,
-            None => {
-                return Err(RuntimeError {
-                    kind: ErrorKind::TypeError,
-                    msg: format!(
-                        " attempt to index a {} value, key:{}",
-                        table.type_of(),
-                        key.print()
-                    ),
-                })
+    pub(crate) fn table_get(&self, mut table: Value, key: Value) -> Result<Value, RuntimeError> {
+        loop {
+            let (value, mt) = {
+                let table = match table.as_table() {
+                    Some(x) => x,
+                    None => {
+                        return Err(RuntimeError {
+                            kind: ErrorKind::TypeError,
+                            msg: format!(
+                                " attempt to index a {} value, key:{}",
+                                table.type_of(),
+                                key.print()
+                            ),
+                        })
+                    }
+                };
+
+                let table = table.borrow();
+                let mt = table.metatable;
+                (table.get(key), mt)
+            };
+            if !value.is_nil() || mt.is_nil() {
+                return Ok(value);
             }
-        };
-        let table = table.borrow();
-        Ok(table.get(key))
+            if let Some(mt) = mt.as_table(){
+                let mt = mt.borrow();
+                table = mt.get(self.constants.as_ref()[ConstantsIndex::MtKeyIndex as usize]);
+                if table.as_callable().is_some() || table.as_closure().is_some(){
+                    let instance = self.instance.upgrade().unwrap();
+                    return instance.call(table, &[key]);
+                }
+                if table.as_table().is_none() {
+                    return Ok(Value::Nil);
+                }
+            }
+        }
     }
     pub(crate) fn table_set(
         &self,
@@ -296,7 +303,7 @@ impl State {
     // pub fn call(&self, closure: Value, args: &[Value]) -> Result<Value, RuntimeError> {
     //     unsafe {
     //         match closure.data {
-    //             ValueData::Closure(closure) => {
+    //             Value::Closure(closure) => {
     //                 ip_modified = true;
     //                 *ip = Frame::get_ip(closure);
     //                 for i in 0..n_args {
@@ -306,7 +313,7 @@ impl State {
     //                 let len = eval_stack.len();
     //                 eval_stack.resize(len - n_args, Value::nil());
     //             }
-    //             ValueData::Callable(callable) => {
+    //             Value::Callable(callable) => {
     //                 *ip += 1;
     //                 let mut frame = Frame::new(eval_stack.len() - n_args, n_args, std::ptr::null());
     //                 for i in 0..n_args {
@@ -323,38 +330,26 @@ impl State {
     pub(crate) fn create_userdata<T: UserData + Traceable>(&self, userdata: T) -> Value {
         let p: Box<dyn UserData> = Box::new(userdata);
         let s = self.gc.allocate(p);
-        Value {
-            data: ValueData::UserData(s),
-            metatable: None,
-        }
+        Value::UserData(s)
     }
     // pub(crate) fn create_callable<T: Callable>(&self, f: T) -> Value {
     //     let s = self.gc.allocate(p);
     //     Value {
-    //         data: ValueData::UserData(s),
+    //         data: Value::UserData(s),
     //         metatable: None,
     //     }
     // }
     pub(crate) fn create_string(&self, s: String) -> Value {
         let s = self.gc.allocate(Managed { data: s });
-        Value {
-            data: ValueData::String(s),
-            metatable: None,
-        }
+        Value::String(s)
     }
     pub(crate) fn create_table(&self, t: Table) -> Value {
         let t = self.gc.allocate(RefCell::new(t));
-        Value {
-            data: ValueData::Table(t),
-            metatable: None,
-        }
+        Value::Table(t)
     }
     pub(crate) fn create_closure(&self, c: Closure) -> Value {
         let c = self.gc.allocate(c);
-        Value {
-            data: ValueData::Closure(c),
-            metatable: None,
-        }
+        Value::Closure(c)
     }
     pub(crate) fn add(&self, a: Value, b: Value) -> Result<Value, RuntimeError> {
         binary_op_impl!(+, a,b)
@@ -393,15 +388,20 @@ impl State {
     }
 
     pub(crate) fn cmp(&self, a: Value, b: Value) -> Result<Ordering, RuntimeError> {
-        let res = match (a.data, b.data) {
-            (ValueData::Nil, ValueData::Nil) => Ok(Ordering::Equal),
-            (ValueData::Bool(a), ValueData::Bool(b)) => Ok(a.cmp(&b)),
-            (ValueData::Number(a), ValueData::Number(b)) => Ok(a.cmp(&b)),
-            (ValueData::String(a), ValueData::String(b)) => {
+        let res = match (a, b) {
+            (Value::Nil, Value::Nil) => Ok(Ordering::Equal),
+            (Value::Bool(a), Value::Bool(b)) => Ok(a.cmp(&b)),
+            (Value::Number(a), Value::Number(b)) => Ok(a.cmp(&b)),
+            (Value::String(a), Value::String(b)) => {
                 let a = &(*a).data;
                 let b = &(*b).data;
                 Ok(a.cmp(b))
             }
+            // (Value::Table(a), Value::Table(b))=>{
+            //     if a == b {
+            //         Ok(Ordering::Equal)
+            //     }
+            // }
             _ => Err(RuntimeError {
                 kind: ErrorKind::ArithmeticError,
                 msg: format!(
@@ -448,12 +448,10 @@ impl State {
         ))
     }
     pub(crate) fn eq(&self, a: Value, b: Value) -> Result<Value, RuntimeError> {
-        let ordering = self.cmp(a, b)?;
-        Ok(Value::from_bool(ordering == Ordering::Equal))
+        Ok(Value::from_bool(a == b))
     }
     pub(crate) fn ne(&self, a: Value, b: Value) -> Result<Value, RuntimeError> {
-        let ordering = self.cmp(a, b)?;
-        Ok(Value::from_bool(ordering != Ordering::Equal))
+        Ok(Value::from_bool(a != b))
     }
     pub(crate) fn idiv(&self, a: Value, b: Value) -> Result<Value, RuntimeError> {
         if let (Some(a), Some(b)) = (a.number(), b.number()) {
@@ -476,15 +474,15 @@ impl State {
         }
     }
     pub(crate) fn len(&self, a: Value) -> Result<Value, RuntimeError> {
-        match a.data {
-            // ValueData::Nil => todo!(),
-            // ValueData::Bool(_) => todo!(),
-            // ValueData::Number(_) => todo!(),
-            ValueData::Table(x) => Ok(Value::from_number((*x).borrow_mut().len() as f64)),
-            ValueData::String(x) => Ok(Value::from_number((*x).data.len() as f64)),
-            // ValueData::Closure(_) => todo!(),
-            // ValueData::Callable(_) => todo!(),
-            ValueData::Tuple(x) => Ok(Value::from_number((*x).values.len() as f64)),
+        match a {
+            // Value::Nil => todo!(),
+            // Value::Bool(_) => todo!(),
+            // Value::Number(_) => todo!(),
+            Value::Table(x) => Ok(Value::from_number((*x).borrow_mut().len() as f64)),
+            Value::String(x) => Ok(Value::from_number((*x).data.len() as f64)),
+            // Value::Closure(_) => todo!(),
+            // Value::Callable(_) => todo!(),
+            Value::Tuple(x) => Ok(Value::from_number((*x).values.len() as f64)),
             _ => Err(RuntimeError {
                 kind: ErrorKind::ArithmeticError,
                 msg: format!(" attempt to get length of a {} value", a.type_of(),),
@@ -495,10 +493,10 @@ impl State {
         Ok(Value::from_bool(!a.to_bool()))
     }
     pub(crate) fn bitwise_not(&self, a: Value) -> Result<Value, RuntimeError> {
-        match a.data {
-            // ValueData::Nil => todo!(),
-            // ValueData::Bool(_) => todo!(),
-            ValueData::Number(_) => {
+        match a {
+            // Value::Nil => todo!(),
+            // Value::Bool(_) => todo!(),
+            Value::Number(_) => {
                 let i = a.as_i64();
                 if let Some(i) = i {
                     Ok(Value::from_number((!i) as f64))
@@ -516,10 +514,10 @@ impl State {
         }
     }
     pub(crate) fn neg(&self, a: Value) -> Result<Value, RuntimeError> {
-        match a.data {
-            // ValueData::Nil => todo!(),
-            // ValueData::Bool(_) => todo!(),
-            ValueData::Number(x) => Ok(Value::from_number(*-x)),
+        match a {
+            // Value::Nil => todo!(),
+            // Value::Bool(_) => todo!(),
+            Value::Number(x) => Ok(Value::from_number(*-x)),
             _ => Err(RuntimeError {
                 kind: ErrorKind::ArithmeticError,
                 msg: format!(" attempt to get length of a {} value", a.type_of(),),

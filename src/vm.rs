@@ -6,7 +6,16 @@ use std::{
     rc::Rc,
 };
 
-use crate::{Stack, bytecode::{u32_from_3xu8, ByteCode, ByteCodeModule, OpCode}, closure::{Callable, Closure, UpValue, UpValueInner}, gc::{Gc, GcState, Traceable}, runtime::{ErrorKind, RuntimeError, RuntimeInner}, state::{CallContext, Frame, State}, table::Table, value::{Managed, ManagedCell, Value, ValueData}};
+use crate::{
+    bytecode::{u32_from_3xu8, ByteCode, ByteCodeModule, OpCode},
+    closure::{Callable, Closure, UpValue, UpValueInner},
+    gc::{Gc, GcState, Traceable},
+    runtime::{ErrorKind, RuntimeError, RuntimeInner},
+    state::{CallContext, Frame, State},
+    table::Table,
+    value::{Managed, ManagedCell, Value},
+    Stack,
+};
 
 /*
 The instances represents a thread
@@ -24,12 +33,21 @@ enum Continue {
 }
 macro_rules! new_frame {
     ($eval_stack:expr, $n_args:expr,$closure:expr) => {{
-        let mut frame = Frame::new($eval_stack.len() - $n_args, $n_args, $closure);
+        let mut frame = Frame::new($n_args, $closure);
         for i in 0..$n_args {
             frame.locals[i] = $eval_stack[$eval_stack.len() - 1 - i];
         }
         let len = $eval_stack.len();
         $eval_stack.resize(len - $n_args, Value::nil());
+        frame
+    }};
+}
+macro_rules! new_frame_direct {
+    ($eval_stack:expr, $args:expr,$closure:expr) => {{
+        let mut frame = Frame::new($args.len(), $closure);
+        for i in 0..$args.len() {
+            frame.locals[i] = $args[i];
+        }
         frame
     }};
 }
@@ -41,12 +59,10 @@ impl Instance {
     //     self.state.borrow_mut()
     // }
     pub(crate) fn call(&self, closure: Value, args: &[Value]) -> Result<Value, RuntimeError> {
-        match closure.data {
-            ValueData::Closure(closure) => {
-                let n_args = args.len();
+        match closure {
+            Value::Closure(closure) => {
                 let frame = {
-                    let mut eval_stack = self.state.eval_stack.borrow_mut();
-                    new_frame!(eval_stack, n_args, Some(closure))
+                    new_frame_direct!(eval_stack, args, Some(closure))
                 };
                 let level = {
                     let mut frames = self.state.frames.borrow_mut();
@@ -60,11 +76,10 @@ impl Instance {
                     Ok(eval_stack.pop().unwrap())
                 }
             }
-            ValueData::Callable(callable) => {
+            Value::Callable(callable) => {
                 let n_args = args.len();
                 let frame = {
-                    let mut eval_stack = self.state.eval_stack.borrow_mut();
-                    new_frame!(eval_stack, n_args, None)
+                    new_frame_direct!(eval_stack, args, None)
                 };
                 {
                     let mut frames = self.state.frames.borrow_mut();
@@ -113,13 +128,17 @@ impl Instance {
                 }
             }
         }
-        let mut eval_stack = state.eval_stack.borrow_mut();
+
         while *ip < module.code.len() {
+            let mut eval_stack = state.eval_stack.borrow_mut();
             macro_rules! binary_op_impl {
                 ($func:ident) => {{
                     let rhs = eval_stack.pop().unwrap();
-                    let lhs = eval_stack.last_mut().unwrap();
-                    *lhs = state.$func(*lhs, rhs)?;
+                    let mut lhs = *eval_stack.last_mut().unwrap();
+                    std::mem::drop(eval_stack);
+                    lhs = state.$func(lhs, rhs)?;
+                    let mut eval_stack = state.eval_stack.borrow_mut();
+                    *eval_stack.last_mut().unwrap() = lhs;
                 }};
             }
             let instruction = module.code[*ip];
@@ -189,12 +208,16 @@ impl Instance {
                     OpCode::LoadTable => {
                         let table = eval_stack.pop().unwrap();
                         let key = eval_stack.pop().unwrap();
-                        eval_stack.push(state.table_get(table, key)?);
+                        std::mem::drop(eval_stack);
+                        let v = state.table_get(table, key)?;
+                        let mut eval_stack = state.eval_stack.borrow_mut();
+                        eval_stack.push(v);
                     }
                     OpCode::StoreTable => {
                         let table = eval_stack.pop().unwrap();
                         let key = eval_stack.pop().unwrap();
                         let value = eval_stack.pop().unwrap();
+                        std::mem::drop(eval_stack);
                         state.table_set(table, key, value)?;
                     }
                     OpCode::StoreGlobal => {
@@ -316,8 +339,8 @@ impl Instance {
                     OpCode::TailCall => {
                         let n_args = operands[0] as usize;
                         let func = eval_stack.pop().unwrap();
-                        match func.data {
-                            ValueData::Closure(closure) => {
+                        match func {
+                            Value::Closure(closure) => {
                                 ip_modified = true;
                                 *ip = Frame::get_ip(Some(closure));
                                 for i in 0..n_args {
@@ -327,9 +350,9 @@ impl Instance {
                                 let len = eval_stack.len();
                                 eval_stack.resize(len - n_args, Value::nil());
                             }
-                            ValueData::Callable(callable) => {
+                            Value::Callable(callable) => {
                                 *ip += 1;
-                                let mut frame = Frame::new(eval_stack.len() - n_args, n_args, None);
+                                let mut frame = Frame::new(n_args, None);
                                 for i in 0..n_args {
                                     frame.locals[i] = eval_stack[eval_stack.len() - n_args + i];
                                 }
@@ -343,13 +366,13 @@ impl Instance {
                     OpCode::Call => {
                         let n_args = operands[0] as usize;
                         let func = eval_stack.pop().unwrap();
-                        match func.data {
-                            ValueData::Closure(closure) => {
+                        match func {
+                            Value::Closure(closure) => {
                                 *ip += 1;
                                 let frame = new_frame!(eval_stack, n_args, Some(closure));
                                 return Ok(Continue::NewFrame(frame));
                             }
-                            ValueData::Callable(callable) => {
+                            Value::Callable(callable) => {
                                 *ip += 1;
                                 let frame = new_frame!(eval_stack, n_args, None);
                                 return Ok(Continue::CallExt(callable, frame));
@@ -429,28 +452,22 @@ impl Instance {
         // println!("{}", eval_stack.last().unwrap().print());
         Ok(Continue::Return)
     }
-    fn load_module_string(&self, mut module: ByteCodeModule)->ByteCodeModule{
+    fn load_module_string(&self, mut module: ByteCodeModule) -> ByteCodeModule {
         {
             module.string_pool_cache.clear();
             let mut runtime = self.runtime.borrow_mut();
             for (_i, s) in module.string_pool.iter().enumerate() {
-                let v = if let Some(v) = runtime.string_pool.get(s) {
-                    *v
-                } else {
-                    let v = self.state.create_string(s.clone());
-                    runtime.string_pool.insert(s.clone(), v);
-                    v
-                };
+                let v = runtime.create_pooled_string(s);
                 module.string_pool_cache.push(v);
             }
         }
         module
     }
     pub fn exec(&self, module: ByteCodeModule) -> Result<(), RuntimeError> {
-        let module= self.load_module_string(module);
-        match self.exec_impl(module){
-            Ok(_)=>{},
-            Err(e)=>{                
+        let module = self.load_module_string(module);
+        match self.exec_impl(module) {
+            Ok(_) => {}
+            Err(e) => {
                 self.reset();
                 return Err(e);
             }
@@ -458,17 +475,17 @@ impl Instance {
         assert!(self.state.borrow().eval_stack.borrow().is_empty());
         Ok(())
     }
-    fn reset(&self){
+    fn reset(&self) {
         let mut st = self.state.eval_stack.borrow_mut();
         st.clear();
         let mut frames = self.state.frames.borrow_mut();
         *frames = Stack::new();
     }
     pub fn eval_repl(&self, module: ByteCodeModule) -> Result<(), RuntimeError> {
-        let module= self.load_module_string(module);
-        match self.exec_impl(module){
-            Ok(_)=>{},
-            Err(e)=>{                
+        let module = self.load_module_string(module);
+        match self.exec_impl(module) {
+            Ok(_) => {}
+            Err(e) => {
                 self.reset();
                 return Err(e);
             }
@@ -494,7 +511,7 @@ impl Instance {
         });
         {
             let mut frames = self.state.frames.borrow_mut();
-            frames.push(Frame::new(0, 0, Some(closure)));
+            frames.push(Frame::new(0, Some(closure)));
         }
         self.exec_frames_loop(0)
     }

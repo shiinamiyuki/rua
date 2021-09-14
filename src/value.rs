@@ -97,19 +97,8 @@ impl Traceable for Tuple {
         }
     }
 }
-pub enum Number {
-    I8(i8),
-    U8(u8),
-    I16(i16),
-    U16(u16),
-    I32(i32),
-    U32(u32),
-    I64(i64),
-    U64(u64),
-    F32(f32),
-    F64(f64),
-}
-pub enum ValueData {
+
+pub enum Value {
     Nil,
     Bool(bool),
     Number(OrderedFloat<f64>),
@@ -120,22 +109,22 @@ pub enum ValueData {
     Tuple(Gc<Tuple>),
     UserData(Gc<Box<dyn UserData>>),
 }
-impl Copy for ValueData {}
-impl Clone for ValueData {
+impl Copy for Value {}
+impl Clone for Value {
     fn clone(&self) -> Self {
         *self
     }
 }
-impl PartialEq for ValueData {
+impl PartialEq for Value {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
-            (ValueData::Nil, ValueData::Nil) => true,
-            (ValueData::Bool(a), ValueData::Bool(b)) => a == b,
-            (ValueData::Number(a), ValueData::Number(b)) => a == b,
-            (ValueData::Table(a), ValueData::Table(b)) => a.ptr_eq(b),
-            (ValueData::Callable(a), ValueData::Callable(b)) => a.ptr_eq(b),
-            (ValueData::Closure(a), ValueData::Closure(b)) => a.ptr_eq(b),
-            (ValueData::String(a), ValueData::String(b)) => {
+            (Value::Nil, Value::Nil) => true,
+            (Value::Bool(a), Value::Bool(b)) => a == b,
+            (Value::Number(a), Value::Number(b)) => a == b,
+            (Value::Table(a), Value::Table(b)) => a.ptr_eq(b),
+            (Value::Callable(a), Value::Callable(b)) => a.ptr_eq(b),
+            (Value::Closure(a), Value::Closure(b)) => a.ptr_eq(b),
+            (Value::String(a), Value::String(b)) => {
                 if a.ptr_eq(b) {
                     return true;
                 }
@@ -150,30 +139,25 @@ impl PartialEq for ValueData {
     }
 }
 
-impl Hash for ValueData {
+impl Hash for Value {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         match self {
-            ValueData::Nil => ().hash(state),
-            ValueData::Bool(x) => x.hash(state),
-            ValueData::Number(x) => x.hash(state),
-            ValueData::Table(x) => std::ptr::hash(x.as_ptr(), state),
-            ValueData::String(x) => {
+            Value::Nil => ().hash(state),
+            Value::Bool(x) => x.hash(state),
+            Value::Number(x) => x.hash(state),
+            Value::Table(x) => std::ptr::hash(x.as_ptr(), state),
+            Value::String(x) => {
                 let s = &(*x).data;
                 s.hash(state)
             }
-            ValueData::Closure(x) => std::ptr::hash(x.as_ptr(), state),
-            ValueData::Callable(x) => std::ptr::hash(x.as_ptr(), state),
-            ValueData::Tuple(x) => std::ptr::hash(x.as_ptr(), state),
-            ValueData::UserData(x) => std::ptr::hash(x.as_ptr(), state),
+            Value::Closure(x) => std::ptr::hash(x.as_ptr(), state),
+            Value::Callable(x) => std::ptr::hash(x.as_ptr(), state),
+            Value::Tuple(x) => std::ptr::hash(x.as_ptr(), state),
+            Value::UserData(x) => std::ptr::hash(x.as_ptr(), state),
         }
     }
 }
-impl Eq for ValueData {}
-#[derive(Clone, Copy, Hash, PartialEq, Eq)]
-pub(crate) struct Value {
-    pub(crate) data: ValueData,
-    pub(crate) metatable: Option<Gc<RefCell<Table>>>,
-}
+impl Eq for Value {}
 // impl Hash for Value {
 //     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
 //         self.data.hash(state);
@@ -188,24 +172,21 @@ pub(crate) struct Value {
 // impl Eq for Value {}
 impl Traceable for Value {
     fn trace(&self, gc: &GcState) {
-        match self.data {
-            ValueData::Table(x) => gc.trace_ptr(x),
-            ValueData::String(x) => gc.trace_ptr(x),
-            ValueData::Closure(x) => gc.trace_ptr(x),
-            ValueData::Callable(x) => gc.trace_ptr(x),
-            ValueData::Tuple(x) => gc.trace_ptr(x),
+        match self {
+            Value::Table(x) => gc.trace_ptr(*x),
+            Value::String(x) => gc.trace_ptr(*x),
+            Value::Closure(x) => gc.trace_ptr(*x),
+            Value::Callable(x) => gc.trace_ptr(*x),
+            Value::Tuple(x) => gc.trace_ptr(*x),
             _ => {}
-        }
-        if let Some(p) = self.metatable {
-            gc.trace_ptr(p);
         }
     }
 }
 
 impl Value {
     pub(crate) fn is_nil(&self) -> bool {
-        match self.data {
-            ValueData::Nil => true,
+        match self {
+            Value::Nil => true,
             _ => false,
         }
     }
@@ -213,21 +194,15 @@ impl Value {
         Default::default()
     }
     pub(crate) fn from_bool(x: bool) -> Self {
-        Self {
-            data: ValueData::Bool(x),
-            metatable: None,
-        }
+        Value::Bool(x)
     }
     pub(crate) fn from_number(x: f64) -> Self {
-        Self {
-            data: ValueData::Number(OrderedFloat(x)),
-            metatable: None,
-        }
+        Value::Number(OrderedFloat(x))
     }
     pub(crate) fn number(&self) -> Option<f64> {
-        match self.data {
-            ValueData::Number(x) => Some(x.0),
-            ValueData::String(s) => {
+        match self {
+            Value::Number(x) => Some(x.0),
+            Value::String(s) => {
                 if let Ok(x) = (*s).data.parse::<f64>() {
                     Some(x)
                 } else {
@@ -238,40 +213,52 @@ impl Value {
         }
     }
     pub(crate) fn as_f64(&self) -> Option<&f64> {
-        match &self.data {
-            ValueData::Number(x) => Some(&x.0),
+        match &self {
+            Value::Number(x) => Some(&x.0),
             _ => None,
         }
     }
     pub(crate) fn as_bool(&self) -> Option<&bool> {
-        match &self.data {
-            ValueData::Bool(x) => Some(x),
+        match &self {
+            Value::Bool(x) => Some(x),
             _ => None,
         }
     }
     pub(crate) fn to_bool(&self) -> bool {
-        match self.data {
-            ValueData::Number(x) => x != 0.0,
-            ValueData::Bool(x) => x,
-            ValueData::Nil => false,
+        match self {
+            Value::Number(x) => *x != 0.0,
+            Value::Bool(x) => *x,
+            Value::Nil => false,
             _ => true,
         }
     }
     pub(crate) fn as_string<'a>(&'a self) -> Option<&'a String> {
-        match self.data {
-            ValueData::String(s) => unsafe { Some(&(*s.as_ptr()).data) },
+        match self {
+            Value::String(s) => unsafe { Some(&(*s.as_ptr()).data) },
             _ => None,
         }
     }
     pub(crate) fn as_table<'a>(&'a self) -> Option<&'a RefCell<Table>> {
-        match self.data {
-            ValueData::Table(t) => unsafe { Some(&(*t.as_ptr())) },
+        match self {
+            Value::Table(t) => unsafe { Some(&(*t.as_ptr())) },
+            _ => None,
+        }
+    }
+    pub(crate) fn as_closure<'a>(&'a self) -> Option<&'a Closure> {
+        match self {
+            Value::Closure(t) => unsafe { Some(&(*t.as_ptr())) },
+            _ => None,
+        }
+    }
+    pub(crate) fn as_callable<'a>(&'a self) -> Option<&'a Box<dyn Callable>> {
+        match self {
+            Value::Callable(t) => unsafe { Some(&(*t.as_ptr())) },
             _ => None,
         }
     }
     pub(crate) fn as_userdata<'a>(&'a self) -> Option<&'a dyn UserData> {
-        match self.data {
-            ValueData::UserData(t) => unsafe { Some(&(**t.as_ptr())) },
+        match self {
+            Value::UserData(t) => unsafe { Some(&(**t.as_ptr())) },
             _ => None,
         }
     }
@@ -285,45 +272,45 @@ impl Value {
         }
     }
     pub(crate) fn type_of(&self) -> &'static str {
-        match self.data {
-            ValueData::Nil => "nil",
-            ValueData::Bool(_) => "boolean",
-            ValueData::Number(_) => "number",
-            ValueData::Table(_) => "table",
-            ValueData::String(_) => "string",
-            ValueData::Closure(_) => "function",
-            ValueData::Callable(_) => "function",
-            ValueData::Tuple(_) => "tuple",
-            ValueData::UserData(x) => x.type_name(),
+        match self {
+            Value::Nil => "nil",
+            Value::Bool(_) => "boolean",
+            Value::Number(_) => "number",
+            Value::Table(_) => "table",
+            Value::String(_) => "string",
+            Value::Closure(_) => "function",
+            Value::Callable(_) => "function",
+            Value::Tuple(_) => "tuple",
+            Value::UserData(x) => x.type_name(),
         }
     }
     pub(crate) fn print(&self) -> String {
-        match self.data {
-            ValueData::Nil => String::from("nil"),
-            ValueData::Bool(t) => {
-                if t {
+        match self {
+            Value::Nil => String::from("nil"),
+            Value::Bool(t) => {
+                if *t {
                     String::from("true")
                 } else {
                     String::from("false")
                 }
             }
-            ValueData::Number(x) => x.to_string(),
-            ValueData::Table(table) => {
+            Value::Number(x) => x.to_string(),
+            Value::Table(table) => {
                 format!("table: 0x{:0x}", table.as_ptr() as u64)
             }
-            ValueData::String(s) => (*s).data.clone(),
-            ValueData::Closure(closure) => {
+            Value::String(s) => (*s).data.clone(),
+            Value::Closure(closure) => {
                 format!("function: 0x{:0x}", closure.as_ptr() as u64)
             }
-            ValueData::Callable(callable) => {
+            Value::Callable(callable) => {
                 format!("function: 0x{:0x}", callable.as_ptr() as u64)
             }
-            ValueData::UserData(p) => {
+            Value::UserData(p) => {
                 format!("userdata: 0x{:0x}", p.as_ptr() as u64)
             }
-            ValueData::Tuple(tuple) => {
+            Value::Tuple(tuple) => {
                 let mut s = String::from("(");
-                for (i, v) in  (*tuple).values.iter().enumerate()  {
+                for (i, v) in (*tuple).values.iter().enumerate() {
                     if i > 0 {
                         s.push(',');
                     }
@@ -338,9 +325,6 @@ impl Value {
 
 impl Default for Value {
     fn default() -> Self {
-        Self {
-            data: ValueData::Nil,
-            metatable: None,
-        }
+        Value::Nil
     }
 }
