@@ -1,4 +1,5 @@
 use crate::{
+    api::{BaseApi, CallApi, StateApi},
     bytecode::ByteCode,
     closure::{Callable, Closure},
     gc::{Gc, GcState, Traceable},
@@ -8,7 +9,13 @@ use crate::{
     vm::Instance,
     Stack,
 };
-use std::{any::TypeId, cell::{Cell, RefCell, UnsafeCell}, cmp::Ordering, marker::PhantomData, rc::{Rc, Weak}};
+use std::{
+    any::TypeId,
+    cell::{Cell, RefCell, UnsafeCell},
+    cmp::Ordering,
+    marker::PhantomData,
+    rc::{Rc, Weak},
+};
 
 pub const MAX_LOCALS: usize = 256;
 pub(crate) struct Frame {
@@ -113,79 +120,6 @@ impl<'a> CallContext<'a> {
             kind: ErrorKind::ExternalError,
             msg,
         })
-    }
-    pub fn create_number(&self, x: f64) -> ValueRef<'a> {
-        ValueRef::new(Value::from_number(x))
-    }
-    pub fn create_bool(&self, x: bool) -> ValueRef<'a> {
-        ValueRef::new(Value::from_bool(x))
-    }
-    // pub fn create_function_from_closure<F: Fn(&CallContext<'_>) -> Result<(), RuntimeError> + 'static>(&self, f:F) -> ValueRef<'a> {
-    //     ValueRef {
-    //         phantom: PhantomData {},
-    //         value:
-    //     }
-    // }
-    pub fn create_userdata<T: UserData + Traceable>(&self, userdata: T) -> ValueRef<'a> {
-        ValueRef::new(self.state.create_userdata(userdata))
-    }
-    pub fn create_string(&self, s: String) -> ValueRef<'a> {
-        ValueRef::new(self.state.create_string(s))
-    }
-    pub fn get_arg_count(&self) -> usize {
-        let frame = self.frames.last().unwrap();
-        frame.n_args
-    }
-    pub fn arg_or_nil(&'a self, i: usize) -> ValueRef<'a> {
-        let frame = self.frames.last().unwrap();
-        if i < frame.n_args {
-            ValueRef::new(frame.locals[i])
-            // Some(self.eval_stack.borrow()[frame.frame_bottom + i])
-        } else {
-            ValueRef::new(Value::nil())
-        }
-    }
-    pub fn arg(&'a self, i: usize) -> Result<ValueRef<'a>, RuntimeError> {
-        let frame = self.frames.last().unwrap();
-        if i < frame.n_args {
-            Ok(ValueRef::new(frame.locals[i]))
-            // Some(self.eval_stack.borrow()[frame.frame_bottom + i])
-        } else {
-            Err(RuntimeError {
-                kind: ErrorKind::ArgumentArityError,
-                msg: format!("arg {} is not supplied", i,),
-            })
-        }
-    }
-    pub fn table_set(
-        &self,
-        table: ValueRef<'a>,
-        key: ValueRef<'a>,
-        value: ValueRef<'a>,
-    ) -> Result<(), RuntimeError> {
-        self.state.table_set(table.value, key.value, value.value)
-    }
-    pub fn table_get(
-        &self,
-        table: ValueRef<'a>,
-        key: ValueRef<'a>,
-    ) -> Result<ValueRef<'a>, RuntimeError> {
-        Ok(ValueRef::new(self.state.table_get(table.value, key.value)?))
-    }
-    pub fn ret(&self, i: usize, value: ValueRef<'a>) {
-        let mut ret_values = self.ret_values.borrow_mut();
-        if i >= ret_values.len() {
-            ret_values.resize(i + 1, Value::nil());
-        }
-        ret_values[i] = value.value;
-    }
-    pub fn call(
-        &self,
-        closure: ValueRef<'a>,
-        args: &[ValueRef<'a>],
-    ) -> Result<ValueRef<'a>, RuntimeError> {
-        let args: Vec<_> = args.iter().map(|x| x.value).collect();
-        Ok(ValueRef::new(self.instance.call(closure.value, &args)?))
     }
     fn call_raw(&self, closure: Value, args: &[Value]) -> Result<Value, RuntimeError> {
         Ok(self.instance.call(closure, args)?)
@@ -536,5 +470,93 @@ impl State {
             Value::Tuple(t) => t.metatable.get(),
             Value::UserData(_) => todo!(),
         }
+    }
+}
+
+impl<'b> BaseApi for CallContext<'b> {
+    fn create_number<'a>(&'a self, x: f64) -> ValueRef<'a> {
+        ValueRef::new(Value::from_number(x))
+    }
+
+    fn create_bool<'a>(&self, x: bool) -> ValueRef<'a> {
+        ValueRef::new(Value::from_bool(x))
+    }
+
+    fn create_userdata<'a, T: UserData + Traceable>(&self, userdata: T) -> ValueRef<'a> {
+        ValueRef::new(self.state.create_userdata(userdata))
+    }
+
+    fn create_string<'a>(&self, s: String) -> ValueRef<'a> {
+        ValueRef::new(self.state.create_string(s))
+    }
+
+    fn upgrade<'a>(&'a self, v: ValueRef<'_>) -> crate::runtime::GcValue {
+        let instance = self.state.instance.upgrade().unwrap();
+        instance.upgrade(v)
+    }
+}
+
+impl<'b> StateApi for CallContext<'b> {
+    fn table_set<'a>(
+        &'a self,
+        table: ValueRef<'a>,
+        key: ValueRef<'a>,
+        value: ValueRef<'a>,
+    ) -> Result<(), RuntimeError> {
+        self.state.table_set(table.value, key.value, value.value)
+    }
+
+    fn table_get<'a>(
+        &'a self,
+        table: ValueRef<'a>,
+        key: ValueRef<'a>,
+    ) -> Result<ValueRef<'a>, RuntimeError> {
+        Ok(ValueRef::new(self.state.table_get(table.value, key.value)?))
+    }
+}
+impl<'b> CallApi for CallContext<'b> {
+    fn arg_count(&self) -> usize {
+        let frame = self.frames.last().unwrap();
+        frame.n_args
+    }
+
+    fn arg_or_nil<'a>(&'a self, i: usize) -> ValueRef<'a> {
+        let frame = self.frames.last().unwrap();
+        if i < frame.n_args {
+            ValueRef::new(frame.locals[i])
+            // Some(self.eval_stack.borrow()[frame.frame_bottom + i])
+        } else {
+            ValueRef::new(Value::nil())
+        }
+    }
+
+    fn arg<'a>(&'a self, i: usize) -> Result<ValueRef<'a>, RuntimeError> {
+        let frame = self.frames.last().unwrap();
+        if i < frame.n_args {
+            Ok(ValueRef::new(frame.locals[i]))
+            // Some(self.eval_stack.borrow()[frame.frame_bottom + i])
+        } else {
+            Err(RuntimeError {
+                kind: ErrorKind::ArgumentArityError,
+                msg: format!("arg {} is not supplied", i,),
+            })
+        }
+    }
+
+    fn ret<'a>(&'a self, i: usize, value: ValueRef<'a>) {
+        let mut ret_values = self.ret_values.borrow_mut();
+        if i >= ret_values.len() {
+            ret_values.resize(i + 1, Value::nil());
+        }
+        ret_values[i] = value.value;
+    }
+
+    fn call<'a>(
+        &self,
+        closure: ValueRef<'a>,
+        args: &[ValueRef<'a>],
+    ) -> Result<ValueRef<'a>, RuntimeError> {
+        let args: Vec<_> = args.iter().map(|x| x.value).collect();
+        Ok(ValueRef::new(self.instance.call(closure.value, &args)?))
     }
 }

@@ -6,16 +6,7 @@ use std::{
     rc::Rc,
 };
 
-use crate::{
-    bytecode::{u32_from_3xu8, ByteCode, ByteCodeModule, OpCode},
-    closure::{Callable, Closure, UpValue, UpValueInner},
-    gc::{Gc, GcState, Traceable},
-    runtime::{ErrorKind, RuntimeError, RuntimeInner},
-    state::{CallContext, Frame, State},
-    table::Table,
-    value::{Managed, ManagedCell, Value},
-    Stack,
-};
+use crate::{Stack, api::{BaseApi, StateApi}, bytecode::{u32_from_3xu8, ByteCode, ByteCodeModule, OpCode}, closure::{Callable, Closure, UpValue, UpValueInner}, gc::{Gc, GcState, Traceable}, runtime::{ErrorKind, RuntimeError, RuntimeInner, ValueRef}, state::{CallContext, Frame, State}, table::Table, value::{Managed, ManagedCell, Value}};
 
 /*
 The instances represents a thread
@@ -607,6 +598,45 @@ impl Instance {
         }
 
         Ok(())
+    }
+}
+impl BaseApi for Instance{
+    fn create_number<'a>(&'a self, x: f64) -> crate::runtime::ValueRef<'a> {
+        self.runtime.create_number(x)
+    }
+
+    fn create_bool<'a>(&self, x: bool) -> crate::runtime::ValueRef<'a> {
+        self.runtime.create_bool(x)
+    }
+
+    fn create_userdata<'a, T: crate::value::UserData + Traceable>(&self, userdata: T) -> crate::runtime::ValueRef<'a> {
+        self.runtime.create_userdata(userdata)
+    }
+
+    fn create_string<'a>(&self, s: String) -> crate::runtime::ValueRef<'a> {
+        self.runtime.create_string(s)
+    }
+
+    fn upgrade<'a>(&'a self, v: crate::runtime::ValueRef<'_>) -> crate::runtime::GcValue {
+        self.runtime.upgrade(v)
+    }
+}
+impl StateApi for Instance {
+    fn table_set<'a>(
+        &'a self,
+        table: crate::runtime::ValueRef<'a>,
+        key: crate::runtime::ValueRef<'a>,
+        value: crate::runtime::ValueRef<'a>,
+    ) -> Result<(), RuntimeError> {
+        self.state.table_set(table.value, key.value, value.value)
+    }
+
+    fn table_get<'a>(
+        &'a self,
+        table: crate::runtime::ValueRef<'a>,
+        key: crate::runtime::ValueRef<'a>,
+    ) -> Result<crate::runtime::ValueRef<'a>, RuntimeError> {
+        Ok(ValueRef::new(self.state.table_get(table.value, key.value)?))
     }
 }
 impl Traceable for Instance {

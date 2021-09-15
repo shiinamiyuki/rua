@@ -3,25 +3,13 @@ use std::{
     cell::{Cell, Ref, RefCell, RefMut, UnsafeCell},
     collections::HashMap,
     marker::PhantomData,
+    ops::{Deref, DerefMut},
     rc::{Rc, Weak},
 };
 
 use ordered_float::OrderedFloat;
 
-use crate::{
-    bytecode::ByteCodeModule,
-    closure::{Callable, NativeFunction},
-    compile::{compile, CompileError},
-    dummy_convert_ref,
-    gc::{GcState, Traceable},
-    parse::{parse_impl, tokenize},
-    state::{CallContext, State},
-    stdlib,
-    table::Table,
-    value::{Managed, UserData, Value},
-    vm::Instance,
-    Stack,
-};
+use crate::{Stack, api::{BaseApi, CallApi}, bytecode::ByteCodeModule, closure::{Callable, NativeFunction}, compile::{compile, CompileError}, dummy_convert_ref, gc::{GcState, Traceable}, parse::{parse_impl, tokenize}, state::{CallContext, State}, stdlib, table::Table, value::{Managed, UserData, Value}, vm::Instance};
 
 #[derive(Clone, Copy, Debug)]
 pub enum ErrorKind {
@@ -38,13 +26,38 @@ pub struct RuntimeError {
     pub kind: ErrorKind,
     pub msg: String,
 }
-
+pub(crate) struct GcValueList {
+    pub(crate) head: Box<ValueBox>,
+    pub(crate) tail: Box<ValueBox>,
+}
+impl GcValueList {
+    pub(crate) fn new() -> Self {
+        let head = Box::new(ValueBox {
+            prev: Cell::new(std::ptr::null()),
+            next: Cell::new(std::ptr::null()),
+            value: RefCell::new(Value::Nil),
+            _runtime: None,
+        });
+        let tail = Box::new(ValueBox {
+            prev: Cell::new(std::ptr::null()),
+            next: Cell::new(std::ptr::null()),
+            value: RefCell::new(Value::Nil),
+            _runtime: None,
+        });
+        {
+            head.next.set(tail.as_ref() as *const ValueBox);
+            tail.prev.set(head.as_ref() as *const ValueBox);
+        }
+        Self { head, tail }
+    }
+}
 pub(crate) struct RuntimeInner {
     pub(crate) gc: Rc<GcState>,
     pub(crate) globals: Value,
     pub(crate) constants: Rc<Vec<Value>>,
-    pub(crate) instances: Vec<Rc<Instance>>,
+    pub(crate) instances: Vec<Weak<Instance>>,
     pub(crate) string_pool: HashMap<String, Value>,
+    pub(crate) gc_value_list: GcValueList,
 }
 pub(crate) enum ConstantsIndex {
     MtNumber,
@@ -203,45 +216,45 @@ macro_rules! arg_string {
         }
     }};
 }
-macro_rules! arg_prim {
-    ($self:expr, $t:ty) => {
-       { let x = arg_f64!($self)?;
-        unsafe{
-            let prim = &mut *$self.prim.get();
-            if *prim != RustPrimitive::Unit {
-                return Err(RuntimeError {
-                    kind: ErrorKind::TypeError,
-                    msg: "this is an internal limitation, try let another = this_var; another.cast::<T>()".into(),
-                });
-            }
-            *prim = RustPrimitive::from(*x as $t);
-        }
-        x
-    }
-    };
-}
-macro_rules! arg_prim_full {
-    ($self:expr, $t:ty,$v:ident) => {
-       { let x = arg_f64!($self)?;
-        unsafe{
-            let prim = &mut *$self.prim.get();
-            if *prim != RustPrimitive::Unit {
-                return Err(RuntimeError {
-                    kind: ErrorKind::TypeError,
-                    msg: "this is an internal limitation, try let another = this_var; another.cast::<T>()".into(),
-                });
-            }
-            *prim = RustPrimitive::from(*x as $t);
-            let prim = & *$self.prim.get();
-            let x = match prim {
-                RustPrimitive::$v(x)=>x,
-                _=>unreachable!(),
-            };
-            Ok(dummy_convert_ref::<$t, T>(x))
-        }
-    }
-    };
-}
+// macro_rules! arg_prim {
+//     ($self:expr, $t:ty) => {
+//        { let x = arg_f64!($self)?;
+//         unsafe{
+//             let prim = &mut *$self.prim.get();
+//             if *prim != RustPrimitive::Unit {
+//                 return Err(RuntimeError {
+//                     kind: ErrorKind::TypeError,
+//                     msg: "this is an internal limitation, try let another = this_var; another.cast::<T>()".into(),
+//                 });
+//             }
+//             *prim = RustPrimitive::from(*x as $t);
+//         }
+//         x
+//     }
+//     };
+// }
+// macro_rules! arg_prim_full {
+//     ($self:expr, $t:ty,$v:ident) => {
+//        { let x = arg_f64!($self)?;
+//         unsafe{
+//             let prim = &mut *$self.prim.get();
+//             if *prim != RustPrimitive::Unit {
+//                 return Err(RuntimeError {
+//                     kind: ErrorKind::TypeError,
+//                     msg: "this is an internal limitation, try let another = this_var; another.cast::<T>()".into(),
+//                 });
+//             }
+//             *prim = RustPrimitive::from(*x as $t);
+//             let prim = & *$self.prim.get();
+//             let x = match prim {
+//                 RustPrimitive::$v(x)=>x,
+//                 _=>unreachable!(),
+//             };
+//             Ok(dummy_convert_ref::<$t, T>(x))
+//         }
+//     }
+//     };
+// }
 impl<'a> ValueRef<'a> {
     pub fn is_nil(&self) -> bool {
         self.value.is_nil()
@@ -340,11 +353,11 @@ impl<'a> ValueRef<'a> {
     }
 }
 
-struct ValueBox {
+pub(crate) struct ValueBox {
     next: Cell<*const ValueBox>,
     prev: Cell<*const ValueBox>,
     value: RefCell<Value>,
-    runtime: Rc<RefCell<RuntimeInner>>,
+    _runtime: Option<Rc<RefCell<RuntimeInner>>>,
 }
 /*
 Safe wrapper for Value
@@ -355,45 +368,65 @@ pub struct GcValue {
     inner: Box<ValueBox>,
 }
 pub struct RootBorrowMut<'a> {
-    inner: &'a ValueBox,
-    ref_: RefMut<'a, Value>,
+    // inner: &'a ValueBox,
+    _ref: RefMut<'a, Value>,
     value: ValueRef<'a>,
 }
 
 pub struct RootBorrow<'a> {
-    inner: &'a ValueBox,
-    ref_: Ref<'a, Value>,
+    // inner: &'a ValueBox,
+    _ref: Ref<'a, Value>,
     value: ValueRef<'a>,
+}
+impl<'a> Deref for RootBorrow<'a> {
+    type Target = ValueRef<'a>;
+    fn deref(&self) -> &Self::Target {
+        &self.value
+    }
+}
+impl<'a> Deref for RootBorrowMut<'a> {
+    type Target = ValueRef<'a>;
+    fn deref(&self) -> &Self::Target {
+        &self.value
+    }
+}
+impl<'a> DerefMut for RootBorrowMut<'a> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.value
+    }
 }
 impl GcValue {
     pub fn borrow_mut<'a>(&'a self) -> RootBorrowMut<'a> {
         let b = self.inner.value.borrow_mut();
         RootBorrowMut {
-            inner: self.inner.as_ref(),
-            value: ValueRef {
-                value: *b,
-                phantom: PhantomData {},
-                prim: UnsafeCell::new(RustPrimitive::Unit),
-            },
-            ref_: b,
+            // inner: self.inner.as_ref(),
+            value: ValueRef::new(*b),
+            _ref: b,
         }
     }
-    fn borrow<'a>(&'a self) -> RootBorrow<'a> {
+    pub fn borrow<'a>(&'a self) -> RootBorrow<'a> {
         let b = self.inner.value.borrow();
         RootBorrow {
-            inner: self.inner.as_ref(),
-            value: ValueRef {
-                value: *b,
-                phantom: PhantomData {},
-                prim: UnsafeCell::new(RustPrimitive::Unit),
-            },
-            ref_: b,
+            // inner: self.inner.as_ref(),
+            value: ValueRef::new(*b),
+            _ref: b,
         }
     }
 }
+impl Drop for GcValue {
+    fn drop(&mut self) {
+        unsafe {
+            let prev = self.inner.prev.get().as_ref().unwrap();
+            let next = self.inner.next.get().as_ref().unwrap();
+            prev.next.set(next as *const ValueBox);
+            next.prev.set(prev as *const ValueBox);
+        }
+    }
+}
+
 impl<'a> Drop for RootBorrowMut<'a> {
     fn drop(&mut self) {
-        *self.ref_ = self.value.value;
+        *self._ref = self.value.value;
     }
 }
 
@@ -533,7 +566,7 @@ impl RuntimeInner {
         // })
     }
     fn create_instance(&mut self, pself: Rc<RefCell<RuntimeInner>>) -> Rc<Instance> {
-        let mut instance = Rc::new(Instance {
+        let instance = Rc::new(Instance {
             gc: self.gc.clone(),
             runtime: pself.clone(),
             state: State {
@@ -552,12 +585,12 @@ impl RuntimeInner {
                 (*i).state.instance = p;
             }
         }
-        self.instances.push(instance.clone());
+        self.instances.push(Rc::downgrade(&instance));
         instance
     }
     fn add_std_lib(&mut self, pself: Rc<RefCell<RuntimeInner>>) {
         self.add_function("print".into(), |ctx| {
-            for i in 0..ctx.get_arg_count() {
+            for i in 0..ctx.arg_count() {
                 let arg = ctx.arg(i).unwrap();
                 if i > 0 {
                     print!(" ");
@@ -675,6 +708,7 @@ impl RuntimeInner {
             globals: Value::Table(gc.allocate(RefCell::new(Table::new()))),
             instances: vec![],
             constants: Rc::new(vec![]),
+            gc_value_list: GcValueList::new(),
         };
         let mut constants = vec![Value::Nil; ConstantsIndex::NumConstants as usize];
         constants[ConstantsIndex::MtBool as usize] =
@@ -709,10 +743,100 @@ impl Traceable for RuntimeInner {
             gc.trace(c);
         }
         for instance in &self.instances {
-            gc.trace(instance.as_ref());
+            if let Some(instance) = instance.upgrade() {
+                gc.trace(instance.as_ref());
+            }
         }
         for (_, s) in &self.string_pool {
             gc.trace(s);
+        }
+        unsafe {
+            let head = self.gc_value_list.head.as_ref() as *const ValueBox;
+            let tail = self.gc_value_list.tail.as_ref() as *const ValueBox;
+            let mut p = head;
+            while tail != p {
+                let v = p.as_ref().unwrap();
+                if p != head {
+                    let v = v.value.borrow();
+                    gc.trace(&*v);
+                }
+                p = v.next.get();
+            }
+        }
+    }
+}
+impl BaseApi for Runtime {
+    fn create_number<'a>(&'a self, x: f64) -> ValueRef<'a> {
+        self.inner.create_number(x)
+    }
+
+    fn create_bool<'a>(&self, x: bool) -> ValueRef<'a> {
+        self.inner.create_bool(x)
+    }
+
+    fn create_userdata<'a, T: UserData + Traceable>(&self, userdata: T) -> ValueRef<'a> {
+        self.inner.create_userdata(userdata)
+    }
+
+    fn create_string<'a>(&self, s: String) -> ValueRef<'a> {
+        self.inner.create_string(s)
+    }
+
+    fn upgrade<'a>(&'a self, v: ValueRef<'_>) -> GcValue {
+        self.inner.upgrade(v)
+    }
+}
+impl BaseApi for Rc<RefCell<RuntimeInner>> {
+    fn create_number<'a>(&'a self, x: f64) -> ValueRef<'a> {
+        ValueRef::new(Value::from_number(x))
+    }
+
+    fn create_bool<'a>(&self, x: bool) -> ValueRef<'a> {
+        ValueRef::new(Value::from_bool(x))
+    }
+
+    fn create_userdata<'a, T: UserData + Traceable>(&self, userdata: T) -> ValueRef<'a> {
+        let p: Box<dyn UserData> = Box::new(userdata);
+        let inner = self.borrow();
+        let gc = &inner.gc;
+        let s = gc.allocate(p);
+        ValueRef::new(Value::UserData(s))
+    }
+
+    fn create_string<'a>(&self, s: String) -> ValueRef<'a> {
+        let inner = self.borrow();
+        let gc = &inner.gc;
+        let s = gc.allocate(Managed { data: s });
+        ValueRef::new(Value::String(s))
+    }
+
+    fn upgrade<'a>(&'a self, v: ValueRef<'_>) -> GcValue {
+        let inner = self.borrow();
+        let head = inner.gc_value_list.head.as_ref();
+        let head_next = head.next.get();
+        // let tail = inner.gc_value_list.tail.as_ref();
+
+        let value_box = Box::new(ValueBox {
+            prev: Cell::new(head as *const ValueBox),
+            next: Cell::new(head_next),
+            value: RefCell::new(v.value),
+            _runtime: Some(self.clone()),
+        });
+        unsafe {
+            let head_next = head_next.as_ref().unwrap();
+            head_next.prev.set(value_box.as_ref() as *const ValueBox);
+            head.next.set(value_box.as_ref() as *const ValueBox);
+        }
+        GcValue { inner: value_box }
+    }
+}
+impl Drop for RuntimeInner {
+    fn drop(&mut self) {
+        for instance in self.instances.iter() {
+            assert!(
+                instance.upgrade().is_none(),
+                "Runtime dropped before instances"
+            );
         }
     }
 }
