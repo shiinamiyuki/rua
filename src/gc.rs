@@ -28,7 +28,7 @@ A garbage collected *raw* pointer
 Eq and Hash implemented on pointer value alone
 
 */
-pub struct Gc<T: Traceable + 'static + ?Sized> {
+pub(crate) struct Gc<T: Traceable + 'static + ?Sized> {
     ptr: NonNull<GcBox<T>>,
 }
 impl<T> Gc<T>
@@ -78,8 +78,7 @@ struct GcInner {
 }
 impl GcState {
     // move an object onto heap
-    pub fn allocate<T: Traceable + 'static>(&self, object: T) -> Gc<T> {
-        
+    pub(crate) fn allocate<T: Traceable + 'static>(&self, object: T) -> Gc<T> {
         let gc_box: *mut GcBox<T> = Box::into_raw(Box::new(GcBox {
             // color: Cell::new(Color::White),
             marked: Cell::new(false),
@@ -101,9 +100,8 @@ impl GcState {
             ptr: NonNull::new(gc_box).unwrap(),
         }
     }
-    pub fn trace_ptr<T: Traceable + ?Sized + 'static>(&self, obj: Gc<T>) {
+    pub(crate) fn trace_ptr<T: Traceable + ?Sized + 'static>(&self, obj: Gc<T>) {
         unsafe {
-            
             let ptr = obj.ptr;
             let gc_box = ptr.as_ref();
             // println!("tracing object {:0x} {}", obj.as_ptr().cast::<()>() as u64, gc_box.marked.get());
@@ -144,7 +142,7 @@ impl GcState {
                 } else {
                     object.marked.set(false);
                     prev = cur;
-                }                
+                }
                 cur = next;
             }
         }

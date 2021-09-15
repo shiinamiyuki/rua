@@ -12,6 +12,7 @@ pub mod table;
 pub mod value;
 pub mod vm;
 pub mod bind;
+pub mod api;
 
 pub(crate) const fn num_bits<T>() -> usize {
     std::mem::size_of::<T>() * 8

@@ -8,7 +8,7 @@ use crate::{
     vm::Instance,
     Stack,
 };
-use std::{any::TypeId, cell::{RefCell, UnsafeCell}, cmp::Ordering, marker::PhantomData, rc::{Rc, Weak}};
+use std::{any::TypeId, cell::{Cell, RefCell, UnsafeCell}, cmp::Ordering, marker::PhantomData, rc::{Rc, Weak}};
 
 pub const MAX_LOCALS: usize = 256;
 pub(crate) struct Frame {
@@ -44,7 +44,7 @@ pub struct State {
     pub(crate) constants: Rc<Vec<Value>>,
     pub(crate) frames: RefCell<Stack<Frame>>,
     pub(crate) eval_stack: RefCell<Vec<Value>>,
-    pub(crate) instance:Weak<Instance>,
+    pub(crate) instance: Weak<Instance>,
 }
 
 macro_rules! binary_op_impl {
@@ -187,11 +187,7 @@ impl<'a> CallContext<'a> {
         let args: Vec<_> = args.iter().map(|x| x.value).collect();
         Ok(ValueRef::new(self.instance.call(closure.value, &args)?))
     }
-    fn call_raw(
-        &self,
-        closure: Value,
-        args: &[Value],
-    ) -> Result<Value, RuntimeError> {
+    fn call_raw(&self, closure: Value, args: &[Value]) -> Result<Value, RuntimeError> {
         Ok(self.instance.call(closure, args)?)
     }
 }
@@ -207,6 +203,7 @@ impl<'a> Drop for CallContext<'a> {
             Value::Tuple(self.state.gc.allocate(Tuple {
                 values: rv,
                 unpack: TupleUnpack::TruncateFill,
+                metatable: Cell::new(Value::Nil),
             }))
         };
         let mut st = self.state.eval_stack.borrow_mut();
@@ -263,10 +260,10 @@ impl State {
             if !value.is_nil() || mt.is_nil() {
                 return Ok(value);
             }
-            if let Some(mt) = mt.as_table(){
+            if let Some(mt) = mt.as_table() {
                 let mt = mt.borrow();
                 table = mt.get(self.constants.as_ref()[ConstantsIndex::MtKeyIndex as usize]);
-                if table.as_callable().is_some() || table.as_closure().is_some(){
+                if table.as_callable().is_some() || table.as_closure().is_some() {
                     let instance = self.instance.upgrade().unwrap();
                     return instance.call(table, &[key]);
                 }
@@ -522,6 +519,22 @@ impl State {
                 kind: ErrorKind::ArithmeticError,
                 msg: format!(" attempt to get length of a {} value", a.type_of(),),
             }),
+        }
+    }
+    pub(crate) fn get_metatable(&self, a: Value) -> Value {
+        match a {
+            Value::Nil => Value::Nil,
+            Value::Bool(_) => self.constants[ConstantsIndex::MtBool as usize],
+            Value::Number(_) => self.constants[ConstantsIndex::MtNumber as usize],
+            Value::Table(t) => {
+                let t = t.borrow();
+                t.metatable
+            }
+            Value::String(_) => self.constants[ConstantsIndex::MtString as usize],
+            Value::Closure(_) => Value::Nil,
+            Value::Callable(_) => Value::Nil,
+            Value::Tuple(t) => t.metatable.get(),
+            Value::UserData(_) => todo!(),
         }
     }
 }

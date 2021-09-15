@@ -51,6 +51,19 @@ macro_rules! new_frame_direct {
         frame
     }};
 }
+struct RetGuard {
+    bomb: bool,
+}
+impl RetGuard {
+    fn disarm(&mut self) {
+        self.bomb = false;
+    }
+}
+impl Drop for RetGuard {
+    fn drop(&mut self) {
+        assert!(self.bomb == false);
+    }
+}
 impl Instance {
     /*
 
@@ -61,9 +74,7 @@ impl Instance {
     pub(crate) fn call(&self, closure: Value, args: &[Value]) -> Result<Value, RuntimeError> {
         match closure {
             Value::Closure(closure) => {
-                let frame = {
-                    new_frame_direct!(eval_stack, args, Some(closure))
-                };
+                let frame = { new_frame_direct!(eval_stack, args, Some(closure)) };
                 let level = {
                     let mut frames = self.state.frames.borrow_mut();
                     let level = frames.len();
@@ -78,9 +89,7 @@ impl Instance {
             }
             Value::Callable(callable) => {
                 let n_args = args.len();
-                let frame = {
-                    new_frame_direct!(eval_stack, args, None)
-                };
+                let frame = { new_frame_direct!(eval_stack, args, None) };
                 {
                     let mut frames = self.state.frames.borrow_mut();
                     frames.push(frame);
@@ -111,11 +120,10 @@ impl Instance {
         }
     }
     fn exec_frame(&self, state: &State) -> Result<Continue, RuntimeError> {
-        let mut frames = state.frames.borrow_mut();
-        let frame = frames.last_mut().unwrap();
-        let ip = &mut frame.ip;
-        let module = &*frame.closure.unwrap().module;
+        let mut guard = RetGuard{bomb:true};
         {
+            let mut frames = state.frames.borrow_mut();
+            let frame = frames.last_mut().unwrap();
             let closure = &frame.closure.unwrap();
             for (i, v) in closure.upvalues.iter().enumerate() {
                 let proto = &(*closure.module).protypes[closure.proto_idx];
@@ -128,8 +136,22 @@ impl Instance {
                 }
             }
         }
-
-        while *ip < module.code.len() {
+        let (mut ip, code_len, module) = {
+            let mut frames = state.frames.borrow_mut();
+            let frame = frames.last_mut().unwrap();
+            let module = frame.closure.unwrap().module.clone();
+            (frame.ip, module.code.len(), module)
+        };
+        macro_rules! on_return {
+            ($ret:expr) => {{
+                guard.disarm();
+                let mut frames = state.frames.borrow_mut();
+                let frame = frames.last_mut().unwrap();
+                frame.ip = ip;
+                return $ret;
+            }};
+        }
+        while ip < code_len {
             let mut eval_stack = state.eval_stack.borrow_mut();
             macro_rules! binary_op_impl {
                 ($func:ident) => {{
@@ -141,15 +163,16 @@ impl Instance {
                     *eval_stack.last_mut().unwrap() = lhs;
                 }};
             }
-            let instruction = module.code[*ip];
+            let instruction = module.code[ip];
             #[cfg(debug_assertions)]
             {
                 if let Ok(s) = std::env::var("PRINT_INST") {
                     if s == "1" {
-                        println!("{} {:?}", *ip, instruction);
+                        println!("{} {:?}", ip, instruction);
                     }
                 }
             }
+
             let mut ip_modified = false;
             match instruction {
                 ByteCode::Op(op) => match op {
@@ -189,17 +212,17 @@ impl Instance {
                     }
                     OpCode::LoadNumber => {
                         ip_modified = true;
-                        let lo = match module.code[*ip + 1] {
+                        let lo = match module.code[ip + 1] {
                             ByteCode::FloatLo(bytes) => bytes,
                             _ => unreachable!(),
                         };
-                        let hi = match module.code[*ip + 2] {
+                        let hi = match module.code[ip + 2] {
                             ByteCode::FloatHi(bytes) => bytes,
                             _ => unreachable!(),
                         };
                         let bytes = [lo[0], lo[1], lo[2], lo[3], hi[0], hi[1], hi[2], hi[3]];
                         eval_stack.push(Value::from_number(f64::from_le_bytes(bytes)));
-                        *ip += 3;
+                        ip += 3;
                     }
                     OpCode::LoadGlobal => {
                         let name = eval_stack.pop().unwrap();
@@ -284,11 +307,11 @@ impl Instance {
                     }
                     OpCode::Jump => {
                         ip_modified = true;
-                        let addr = match module.code[*ip + 1] {
+                        let addr = match module.code[ip + 1] {
                             ByteCode::Address(bytes) => u32::from_le_bytes(bytes),
                             _ => unreachable!(),
                         };
-                        *ip = addr as usize;
+                        ip = addr as usize;
                     }
                     OpCode::Return => {
                         break;
@@ -317,6 +340,8 @@ impl Instance {
                         let idx = u32_from_3xu8(operands);
                         let v = eval_stack.pop().unwrap();
                         {
+                            let mut frames = state.frames.borrow_mut();
+                            let frame = frames.last_mut().unwrap();
                             let c = frame.closure.as_ref().unwrap();
                             c.set_upvalue(idx, v);
                         }
@@ -324,16 +349,22 @@ impl Instance {
                     OpCode::LoadUpvalue => {
                         let idx = u32_from_3xu8(operands);
                         {
+                            let mut frames = state.frames.borrow_mut();
+                            let frame = frames.last_mut().unwrap();
                             let c = frame.closure.as_ref().unwrap();
                             eval_stack.push(c.get_upvalue(idx));
                         }
                     }
                     OpCode::LoadLocal => {
                         let idx = operands[0];
+                        let mut frames = state.frames.borrow_mut();
+                        let frame = frames.last_mut().unwrap();
                         eval_stack.push(frame.locals[idx as usize]);
                     }
                     OpCode::StoreLocal => {
                         let idx = operands[0];
+                        let mut frames = state.frames.borrow_mut();
+                        let frame = frames.last_mut().unwrap();
                         frame.locals[idx as usize] = eval_stack.pop().unwrap();
                     }
                     OpCode::TailCall => {
@@ -341,8 +372,10 @@ impl Instance {
                         let func = eval_stack.pop().unwrap();
                         match func {
                             Value::Closure(closure) => {
+                                let mut frames = state.frames.borrow_mut();
+                                let frame = frames.last_mut().unwrap();
                                 ip_modified = true;
-                                *ip = Frame::get_ip(Some(closure));
+                                ip = Frame::get_ip(Some(closure));
                                 for i in 0..n_args {
                                     frame.locals[i] = eval_stack[eval_stack.len() - n_args + i];
                                 }
@@ -351,14 +384,14 @@ impl Instance {
                                 eval_stack.resize(len - n_args, Value::nil());
                             }
                             Value::Callable(callable) => {
-                                *ip += 1;
+                                ip += 1;
                                 let mut frame = Frame::new(n_args, None);
                                 for i in 0..n_args {
                                     frame.locals[i] = eval_stack[eval_stack.len() - n_args + i];
                                 }
                                 let len = eval_stack.len();
                                 eval_stack.resize(len - n_args, Value::nil());
-                                return Ok(Continue::CallExt(callable, frame));
+                                on_return!(Ok(Continue::CallExt(callable, frame)));
                             }
                             _ => unreachable!(),
                         }
@@ -368,14 +401,14 @@ impl Instance {
                         let func = eval_stack.pop().unwrap();
                         match func {
                             Value::Closure(closure) => {
-                                *ip += 1;
+                                ip += 1;
                                 let frame = new_frame!(eval_stack, n_args, Some(closure));
-                                return Ok(Continue::NewFrame(frame));
+                                on_return!(Ok(Continue::NewFrame(frame)));
                             }
                             Value::Callable(callable) => {
-                                *ip += 1;
+                                ip += 1;
                                 let frame = new_frame!(eval_stack, n_args, None);
-                                return Ok(Continue::CallExt(callable, frame));
+                                on_return!(Ok(Continue::CallExt(callable, frame)));
                             }
                             _ => {
                                 unimplemented!()
@@ -385,7 +418,7 @@ impl Instance {
                     OpCode::TestJump => {
                         ip_modified = true;
                         let top = *eval_stack.last().unwrap();
-                        let addr = match module.code[*ip + 1] {
+                        let addr = match module.code[ip + 1] {
                             ByteCode::Address(bytes) => u32::from_le_bytes(bytes),
                             _ => unreachable!(),
                         };
@@ -393,12 +426,12 @@ impl Instance {
                         let pop_t = operands[1];
                         let pop_f = operands[1];
                         if top.to_bool() == (b != 0) {
-                            *ip = addr as usize;
+                            ip = addr as usize;
                             if pop_t != 0 {
                                 eval_stack.pop();
                             }
                         } else {
-                            *ip += 2;
+                            ip += 2;
                             if pop_f != 0 {
                                 eval_stack.pop();
                             }
@@ -408,10 +441,12 @@ impl Instance {
                         ip_modified = true;
                         let proto_idx = u32_from_3xu8(operands);
                         let proto = &module.protypes[proto_idx as usize];
-                        let entry = match module.code[*ip + 1] {
+                        let entry = match module.code[ip + 1] {
                             ByteCode::Address(bytes) => u32::from_le_bytes(bytes),
                             _ => unreachable!(),
                         };
+                        let mut frames = state.frames.borrow_mut();
+                        let frame = frames.last_mut().unwrap();
                         let parent = frame.closure.as_ref().unwrap();
                         let upvalues = proto
                             .upvalues
@@ -439,18 +474,18 @@ impl Instance {
                             called: Cell::new(false),
                         });
                         eval_stack.push(closure);
-                        *ip += 2;
+                        ip += 2;
                     }
                     _ => unreachable!(),
                 },
                 _ => unreachable!(),
             }
             if !ip_modified {
-                *ip += 1;
+                ip += 1;
             }
         }
+        on_return!(Ok(Continue::Return))
         // println!("{}", eval_stack.last().unwrap().print());
-        Ok(Continue::Return)
     }
     fn load_module_string(&self, mut module: ByteCodeModule) -> ByteCodeModule {
         {

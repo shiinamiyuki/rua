@@ -89,16 +89,18 @@ pub enum TupleUnpack {
 pub struct Tuple {
     pub(crate) values: Vec<Value>,
     pub(crate) unpack: TupleUnpack,
+    pub(crate) metatable: Cell<Value>,
 }
 impl Traceable for Tuple {
     fn trace(&self, gc: &GcState) {
         for v in &self.values {
             gc.trace(v);
         }
+        gc.trace(&self.metatable.get());
     }
 }
 
-pub enum Value {
+pub(crate) enum Value {
     Nil,
     Bool(bool),
     Number(OrderedFloat<f64>),
@@ -271,6 +273,7 @@ impl Value {
             None
         }
     }
+
     pub(crate) fn type_of(&self) -> &'static str {
         match self {
             Value::Nil => "nil",

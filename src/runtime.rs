@@ -344,12 +344,14 @@ struct ValueBox {
     next: Cell<*const ValueBox>,
     prev: Cell<*const ValueBox>,
     value: RefCell<Value>,
+    runtime: Rc<RefCell<RuntimeInner>>,
 }
 /*
 Safe wrapper for Value
-Local are gc roots
+Represent a gc root
+a Root is never collected as long as it is not dropped
 */
-pub struct RootValue {
+pub struct GcValue {
     inner: Box<ValueBox>,
 }
 pub struct RootBorrowMut<'a> {
@@ -363,7 +365,7 @@ pub struct RootBorrow<'a> {
     ref_: Ref<'a, Value>,
     value: ValueRef<'a>,
 }
-impl RootValue {
+impl GcValue {
     pub fn borrow_mut<'a>(&'a self) -> RootBorrowMut<'a> {
         let b = self.inner.value.borrow_mut();
         RootBorrowMut {
