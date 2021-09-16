@@ -43,6 +43,9 @@ pub enum TableField {
 }
 #[derive(Clone, Debug)]
 pub enum Expr {
+    VarArgs {
+        loc: SourceLocation,
+    },
     Const {
         // nil, true, false
         token: Token,
@@ -95,6 +98,7 @@ impl Expr {
     #[allow(dead_code)]
     pub fn loc(&self) -> &SourceLocation {
         match self {
+            Expr::VarArgs { loc } => loc,
             Expr::Literal { token } => token.loc(),
             Expr::Identifier { token } => token.loc(),
             Expr::BinaryExpr { op: _, lhs, rhs: _ } => lhs.loc(),
@@ -908,7 +912,7 @@ impl Parser {
     fn parse_atom(&mut self) -> Result<Rc<Expr>, ParseError> {
         let token = self.peek();
         let token = token.clone();
-        match token {
+        match &token {
             Token::Number { .. } => {
                 self.advance(1);
                 Ok(Rc::new(Expr::Literal {
@@ -935,6 +939,9 @@ impl Parser {
                     token: token.clone(),
                 }))
             }
+            Token::Symbol { value, .. } if value == "..." => Ok(Rc::new(Expr::VarArgs {
+                loc: token.loc().clone(),
+            })),
             Token::Symbol { value, .. } if value == "{" => self.parse_table(),
             Token::Keyword { value, loc: _ } if value == "function" => {
                 let expr = self.parse_function_expr()?;

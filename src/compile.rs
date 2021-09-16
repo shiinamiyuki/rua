@@ -121,6 +121,7 @@ pub(crate) struct UpValueInfo {
     pub(crate) id: u32,
     pub(crate) uid: u32,
     pub(crate) location: u32,
+    pub(crate) is_special: bool,
 }
 struct FuncInfo {
     upvalues: HashMap<u32, UpValueInfo>,
@@ -201,6 +202,7 @@ impl Compiler {
                                         id,
                                         uid: info.uid,
                                         location: info.location,
+                                        is_special: false,
                                     },
                                 );
                             }
@@ -228,6 +230,7 @@ impl Compiler {
                                         id,
                                         uid: info.uid,
                                         location,
+                                        is_special: false,
                                     },
                                 );
                                 tab.set(
@@ -250,6 +253,7 @@ impl Compiler {
 
     fn compile_expr(&mut self, expr: &Expr) -> Result<(), CompileError> {
         match expr {
+            Expr::VarArgs { loc } => unimplemented!(),
             Expr::Const { token } => match token {
                 Token::Keyword { value, .. } => {
                     match value.as_str() {
@@ -296,7 +300,16 @@ impl Compiler {
                     }
                 } else {
                     self.push_string(name);
-                    self.emit(ByteCode::Op(OpCode::LoadGlobal));
+                    let info = *self.symbols.get(&"_ENV".into()).unwrap();
+                    if info.is_upvalue {
+                        self.emit(ByteCode::Op3U8(
+                            OpCode::LoadUpvalue,
+                            get_3xu8(info.location),
+                        ));
+                    } else {
+                        self.emit(ByteCode::Op3U8(OpCode::LoadLocal, get_3xu8(info.location)));
+                    }
+                    self.emit(ByteCode::Op(OpCode::LoadTable));
                 }
                 Ok(())
             }
@@ -512,7 +525,7 @@ impl Compiler {
                                     _ => unreachable!(),
                                 };
                                 // if let None = self.symbols.get_cur(name) {
-                                    self.add_var(name.clone());
+                                self.add_var(name.clone());
                                 // }
                             }
                             _ => unreachable!(),
@@ -660,11 +673,44 @@ impl Compiler {
         self.emit(ByteCode::Label(end.to_le_bytes()));
         let entry = self.module.code.len() as u32;
         self.enter_scope(true);
+
+        if let None = self.symbols.get(&"_ENV".into()) {
+            let env_uid = self.new_var_uid();
+            self.symbols.set(
+                "_ENV".into(),
+                VarInfo {
+                    func_scope: self.funcs.len(),
+                    location: 0,
+                    uid: env_uid,
+                    is_upvalue: true,
+                },
+            );
+            let func = self.funcs.last_mut().unwrap();
+            func.upvalues.insert(
+                env_uid,
+                UpValueInfo {
+                    from_parent: true,
+                    id: 0,
+                    uid: env_uid,
+                    location: 0,
+                    is_special: false,
+                },
+            );
+        } else {
+            self.resolve_upvalue(&"_ENV".into());
+            let info = self.symbols.get(&"_ENV".into()).unwrap();
+            assert!(info.is_upvalue);
+            let func = self.funcs.last().unwrap();
+            let info = func.upvalues.get(&info.uid).unwrap();
+            assert_eq!(info.location, 0);
+            assert!(info.from_parent);
+            assert!(info.id == 0);
+        }
         let mut arg_offset = 0;
         match location {
             FunctionLocation::Global => match name.unwrap() {
                 FunctionName::Method {
-                    access_chain:_,
+                    access_chain: _,
                     method,
                 } => {
                     if method.is_some() {
@@ -750,20 +796,25 @@ impl Compiler {
                     for (_i, acc) in access_chain.iter().enumerate().rev() {
                         self.push_string(acc);
                     }
+                    {
+                        let info = *self.symbols.get(&"_ENV".into()).unwrap();
+                        if info.is_upvalue {
+                            self.emit(ByteCode::Op3U8(
+                                OpCode::LoadUpvalue,
+                                get_3xu8(info.location),
+                            ));
+                        } else {
+                            self.emit(ByteCode::Op3U8(OpCode::LoadLocal, get_3xu8(info.location)));
+                        }
+                    }
                     if let Some(_method) = method {
-                        for (i, _acc) in access_chain.iter().enumerate() {
-                            if i == 0 {
-                                self.emit(ByteCode::Op(OpCode::LoadGlobal));
-                            } else {
-                                self.emit(ByteCode::Op(OpCode::LoadTable));
-                            }
+                        for (_i, _acc) in access_chain.iter().enumerate() {
+                            self.emit(ByteCode::Op(OpCode::LoadTable));
                         }
                         self.emit(ByteCode::Op(OpCode::StoreTable));
                     } else {
                         for (i, _acc) in access_chain.iter().enumerate() {
-                            if i == 0 {
-                                self.emit(ByteCode::Op(OpCode::LoadGlobal));
-                            } else if i != access_chain.len() - 1 {
+                            if i != access_chain.len() - 1 {
                                 self.emit(ByteCode::Op(OpCode::LoadTable));
                             } else {
                                 self.emit(ByteCode::Op(OpCode::StoreTable));
@@ -774,7 +825,16 @@ impl Compiler {
                 FunctionName::Function { name } => match name {
                     Token::Identifier { value, .. } => {
                         self.push_string(value);
-                        self.emit(ByteCode::Op(OpCode::StoreGlobal));
+                        let info = *self.symbols.get(&"_ENV".into()).unwrap();
+                        if info.is_upvalue {
+                            self.emit(ByteCode::Op3U8(
+                                OpCode::LoadUpvalue,
+                                get_3xu8(info.location),
+                            ));
+                        } else {
+                            self.emit(ByteCode::Op3U8(OpCode::LoadLocal, get_3xu8(info.location)));
+                        }
+                        self.emit(ByteCode::Op(OpCode::StoreTable));
                     }
                     _ => unreachable!(),
                 },
@@ -823,7 +883,16 @@ impl Compiler {
                     }
                 } else {
                     self.push_string(name);
-                    self.emit(ByteCode::Op(OpCode::StoreGlobal));
+                    let info = *self.symbols.get(&"_ENV".into()).unwrap();
+                    if info.is_upvalue {
+                        self.emit(ByteCode::Op3U8(
+                            OpCode::LoadUpvalue,
+                            get_3xu8(info.location),
+                        ));
+                    } else {
+                        self.emit(ByteCode::Op3U8(OpCode::LoadLocal, get_3xu8(info.location)));
+                    }
+                    self.emit(ByteCode::Op(OpCode::StoreTable));
                 }
                 Ok(())
             }
@@ -875,6 +944,19 @@ impl Compiler {
     }
     fn run(&mut self, block: Rc<Stmt>) -> Result<ByteCodeModule, CompileError> {
         self.enter_scope(true);
+        {
+            let env_uid = self.new_var_uid();
+            self.symbols.set(
+                "_ENV".into(),
+                VarInfo {
+                    func_scope: self.funcs.len(),
+                    location: 0,
+                    uid: env_uid,
+                    is_upvalue: true,
+                },
+            );
+        }
+
         self.compile_stmt(&*block)?;
         self.leave_scope(true);
         self.resolve_labels();

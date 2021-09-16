@@ -9,7 +9,21 @@ use std::{
 
 use ordered_float::OrderedFloat;
 
-use crate::{Stack, api::{BaseApi, CallApi}, bytecode::ByteCodeModule, closure::{Callable, NativeFunction}, compile::{compile, CompileError}, dummy_convert_ref, gc::{GcState, Traceable}, parse::{parse_impl, tokenize}, state::{CallContext, State}, stdlib, table::Table, value::{Managed, UserData, Value}, vm::Instance};
+use crate::{
+    api::{BaseApi, CallApi},
+    bytecode::ByteCodeModule,
+    closure::{Callable, NativeFunction},
+    compile::{compile, CompileError},
+    dummy_convert_ref,
+    gc::{GcState, Traceable},
+    parse::{parse_impl, tokenize},
+    state::{CallContext, State},
+    stdlib,
+    table::Table,
+    value::{Managed, UserData, Value},
+    vm::Instance,
+    Stack,
+};
 
 #[derive(Clone, Copy, Debug)]
 pub enum ErrorKind {
@@ -70,6 +84,7 @@ pub(crate) enum ConstantsIndex {
     MtKeyMul,
     MtKeyDiv,
     MtKeyMod,
+    MtKeyPow,
     MtKeyEq,
     NumConstants,
 }
@@ -732,6 +747,8 @@ impl RuntimeInner {
             runtime.create_pooled_string(&String::from("__div"));
         constants[ConstantsIndex::MtKeyMod as usize] =
             runtime.create_pooled_string(&String::from("__mod"));
+        constants[ConstantsIndex::MtKeyPow as usize] =
+            runtime.create_pooled_string(&String::from("__pow"));
         runtime.constants = Rc::new(constants);
         runtime
     }

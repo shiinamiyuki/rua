@@ -1,12 +1,21 @@
 use std::{
-    borrow::Borrow,
     cell::{Cell, RefCell, RefMut},
     collections::HashMap,
     iter::FromIterator,
     rc::Rc,
 };
 
-use crate::{Stack, api::{BaseApi, StateApi}, bytecode::{u32_from_3xu8, ByteCode, ByteCodeModule, OpCode}, closure::{Callable, Closure, UpValue, UpValueInner}, gc::{Gc, GcState, Traceable}, runtime::{ErrorKind, RuntimeError, RuntimeInner, ValueRef}, state::{CallContext, Frame, State}, table::Table, value::{Managed, ManagedCell, Value}};
+use crate::{
+    api::{BaseApi, StateApi},
+    bytecode::{u32_from_3xu8, ByteCode, ByteCodeModule, OpCode},
+    closure::{Callable, Closure, UpValue, UpValueInner},
+    gc::{Gc, GcState, Traceable},
+    runtime::{ErrorKind, RuntimeError, RuntimeInner, ValueRef},
+    state::{CallContext, Frame, State},
+    table::Table,
+    value::{Managed, ManagedCell, Value},
+    Stack,
+};
 
 /*
 The instances represents a thread
@@ -79,7 +88,6 @@ impl Instance {
                 }
             }
             Value::Callable(callable) => {
-                let n_args = args.len();
                 let frame = { new_frame_direct!(eval_stack, args, None) };
                 {
                     let mut frames = self.state.frames.borrow_mut();
@@ -105,28 +113,39 @@ impl Instance {
                     Ok(eval_stack.pop().unwrap())
                 }
             }
-            _ => {
-                unimplemented!()
-            }
+            _ => Err(RuntimeError {
+                kind: ErrorKind::ArithmeticError,
+                msg: format!("attempt to call a {} value", closure.type_of()),
+            }),
         }
     }
     fn exec_frame(&self, state: &State) -> Result<Continue, RuntimeError> {
-        let mut guard = RetGuard{bomb:true};
-        {
+        let mut guard = RetGuard { bomb: false };
+        let cur_closure = {
             let mut frames = state.frames.borrow_mut();
             let frame = frames.last_mut().unwrap();
             let closure = &frame.closure.unwrap();
-            for (i, v) in closure.upvalues.iter().enumerate() {
-                let proto = &(*closure.module).protypes[closure.proto_idx];
-                let info = &proto.upvalues[i];
-                if !info.from_parent {
-                    let mut v = v.inner.borrow_mut();
-                    *v = Rc::new(Cell::new(UpValueInner::Open(
-                        &mut frame.locals[info.location as usize] as *mut Value,
-                    )));
+            if closure.proto_idx == usize::MAX {
+                assert!(closure.upvalues.len() == 1);
+            } else {
+                for (i, v) in closure.upvalues.iter().enumerate() {
+                    let proto = &(*closure.module).protypes[closure.proto_idx];
+                    let info = &proto.upvalues[i];
+                    if i == 0 && info.is_special {
+                        let mut v = v.inner.borrow_mut();
+                        *v = Rc::new(Cell::new(UpValueInner::Closed(self.state.globals)));
+                    } else {
+                        if !info.from_parent {
+                            let mut v = v.inner.borrow_mut();
+                            *v = Rc::new(Cell::new(UpValueInner::Open(
+                                &mut frame.locals[info.location as usize] as *mut Value,
+                            )));
+                        }
+                    }
                 }
             }
-        }
+            closure.clone()
+        };
         let (mut ip, code_len, module) = {
             let mut frames = state.frames.borrow_mut();
             let frame = frames.last_mut().unwrap();
@@ -215,10 +234,20 @@ impl Instance {
                         eval_stack.push(Value::from_number(f64::from_le_bytes(bytes)));
                         ip += 3;
                     }
-                    OpCode::LoadGlobal => {
-                        let name = eval_stack.pop().unwrap();
-                        eval_stack.push(self.state.get_global(name));
-                    }
+                    // OpCode::LoadGlobal => {
+                    //     let name = eval_stack.pop().unwrap();
+                    //     std::mem::drop(eval_stack);
+                    //     {
+                    //         let globals = cur_closure.upvalues[0].inner.borrow();
+                    //         let globals = match globals.get() {
+                    //             UpValueInner::Closed(v) => v,
+                    //             _ => unreachable!(),
+                    //         };
+                    //         let v = self.state.table_get(globals, name)?;
+                    //         let mut eval_stack = state.eval_stack.borrow_mut();
+                    //         eval_stack.push(v);
+                    //     }
+                    // }
                     OpCode::LoadTable => {
                         let table = eval_stack.pop().unwrap();
                         let key = eval_stack.pop().unwrap();
@@ -232,13 +261,22 @@ impl Instance {
                         let key = eval_stack.pop().unwrap();
                         let value = eval_stack.pop().unwrap();
                         std::mem::drop(eval_stack);
-                        state.table_set(table, key, value)?;
+                        self.state.table_set(table, key, value)?;
                     }
-                    OpCode::StoreGlobal => {
-                        let name = eval_stack.pop().unwrap();
-                        let v = eval_stack.pop().unwrap();
-                        self.state.set_global(name, v);
-                    }
+                    // OpCode::StoreGlobal => {
+                    //     let name = eval_stack.pop().unwrap();
+                    //     let v = eval_stack.pop().unwrap();
+                    //     std::mem::drop(eval_stack);
+                    //     {
+                    //         let globals = cur_closure.upvalues[0].inner.borrow();
+                    //         let globals = match globals.get() {
+                    //             UpValueInner::Closed(v) => v,
+                    //             _ => unreachable!(),
+                    //         };
+                    //         self.state.table_set(globals, name, v)?;
+                    //     }
+                    //     // self.state.set_global(name, v);
+                    // }
                     OpCode::LoadNil => {
                         eval_stack.push(Value::nil());
                     }
@@ -265,6 +303,9 @@ impl Instance {
                     }
                     OpCode::Mod => {
                         binary_op_impl!(mod_)
+                    }
+                    OpCode::Pow => {
+                        binary_op_impl!(pow)
                     }
                     OpCode::Div => {
                         binary_op_impl!(div)
@@ -368,7 +409,7 @@ impl Instance {
                                 ip_modified = true;
                                 ip = Frame::get_ip(Some(closure));
                                 for i in 0..n_args {
-                                    frame.locals[i] = eval_stack[eval_stack.len() - n_args + i];
+                                    frame.locals[i] = eval_stack[eval_stack.len() - 1 - i];
                                 }
                                 frame.n_args = n_args;
                                 let len = eval_stack.len();
@@ -378,7 +419,7 @@ impl Instance {
                                 ip += 1;
                                 let mut frame = Frame::new(n_args, None);
                                 for i in 0..n_args {
-                                    frame.locals[i] = eval_stack[eval_stack.len() - n_args + i];
+                                    frame.locals[i] = eval_stack[eval_stack.len() - 1 - i];
                                 }
                                 let len = eval_stack.len();
                                 eval_stack.resize(len - n_args, Value::nil());
@@ -402,7 +443,10 @@ impl Instance {
                                 on_return!(Ok(Continue::CallExt(callable, frame)));
                             }
                             _ => {
-                                unimplemented!()
+                                on_return!(Err(RuntimeError {
+                                    kind: ErrorKind::TypeError,
+                                    msg: format!("attempt to call a {} value", func.type_of())
+                                }))
                             }
                         }
                     }
@@ -498,7 +542,7 @@ impl Instance {
                 return Err(e);
             }
         }
-        assert!(self.state.borrow().eval_stack.borrow().is_empty());
+        assert!(self.state.eval_stack.borrow().is_empty());
         Ok(())
     }
     fn reset(&self) {
@@ -516,9 +560,9 @@ impl Instance {
                 return Err(e);
             }
         }
-        assert!(self.state.borrow().eval_stack.borrow().len() <= 1);
-        if self.state.borrow().eval_stack.borrow().len() == 1 {
-            let mut st = self.state.borrow().eval_stack.borrow_mut();
+        assert!(self.state.eval_stack.borrow().len() <= 1);
+        if self.state.eval_stack.borrow().len() == 1 {
+            let mut st = self.state.eval_stack.borrow_mut();
             let v = st.pop().unwrap();
             println!("{}", v.print());
         }
@@ -531,7 +575,9 @@ impl Instance {
             n_args: 0,
             // n_locals: 0,
             module: Rc::new(module),
-            upvalues: vec![],
+            upvalues: vec![UpValue {
+                inner: RefCell::new(Rc::new(Cell::new(UpValueInner::Closed(self.state.globals)))),
+            }],
             called: Cell::new(false),
             proto_idx: usize::MAX,
         });
@@ -600,7 +646,7 @@ impl Instance {
         Ok(())
     }
 }
-impl BaseApi for Instance{
+impl BaseApi for Instance {
     fn create_number<'a>(&'a self, x: f64) -> crate::runtime::ValueRef<'a> {
         self.runtime.create_number(x)
     }
@@ -609,7 +655,10 @@ impl BaseApi for Instance{
         self.runtime.create_bool(x)
     }
 
-    fn create_userdata<'a, T: crate::value::UserData + Traceable>(&self, userdata: T) -> crate::runtime::ValueRef<'a> {
+    fn create_userdata<'a, T: crate::value::UserData + Traceable>(
+        &self,
+        userdata: T,
+    ) -> crate::runtime::ValueRef<'a> {
         self.runtime.create_userdata(userdata)
     }
 

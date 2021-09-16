@@ -35,8 +35,8 @@ pub enum OpCode {
     Dup,
     RotBCA, // stack: A B C -> B C A
 
-    LoadGlobal,  // TOS = name
-    StoreGlobal, // TOS~1=value TOS=name global[name]= value
+    // LoadGlobal,  // TOS = name
+    // StoreGlobal, // TOS~1=value TOS=name global[name]= value
 
     // 3xu8 operand
     /*union _3xu8{

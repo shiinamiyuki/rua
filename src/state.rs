@@ -54,21 +54,45 @@ pub struct State {
     pub(crate) instance: Weak<Instance>,
 }
 
-macro_rules! binary_op_impl {
-    ($op:tt,$a:expr,$b:expr) => {
+macro_rules! binary_op_impl_closue {
+    ($self:expr, $op:expr, $op_str:expr, $a:expr,$b:expr,$metamethod:ident) => {
         if let (Some(a), Some(b)) = ($a.number(), $b.number()) {
-            Ok(Value::from_number(a $op b))
+            Ok(Value::from_number($op(a, b)))
         } else {
+            let mt = $self.get_metatable($a);
+            if !mt.is_nil() {
+                let method = $self.table_get(
+                    mt,
+                    $self.constants.as_ref()[ConstantsIndex::$metamethod as usize],
+                )?;
+                let instance = $self.instance.upgrade().unwrap();
+                return instance.call(method, &[$a, $b]);
+            }
+            let mt = $self.get_metatable($b);
+            if !mt.is_nil() {
+                let method = $self.table_get(
+                    mt,
+                    $self.constants.as_ref()[ConstantsIndex::$metamethod as usize],
+                )?;
+                let instance = $self.instance.upgrade().unwrap();
+                return instance.call(method, &[$a, $b]);
+            }
             Err(RuntimeError {
-                kind:ErrorKind::ArithmeticError,
+                kind: ErrorKind::ArithmeticError,
                 msg: format!(
                     "attempt to perform arithmetic operation '{}' between {} and {}",
-                    stringify!($op),
+                    $op_str,
                     $a.type_of(),
                     $b.type_of()
                 ),
             })
         }
+    };
+}
+
+macro_rules! binary_op_impl {
+    ($self:expr, $op:tt,$a:expr,$b:expr,$metamethod:ident) => {
+        binary_op_impl_closue!($self, |x,y|x $op y, stringify!($op), $a,$b,$metamethod)
     };
 }
 
@@ -145,16 +169,16 @@ impl<'a> Drop for CallContext<'a> {
     }
 }
 impl State {
-    pub(crate) fn get_global(&self, name: Value) -> Value {
-        let globals = self.globals.as_table().unwrap();
-        let globals = globals.borrow();
-        globals.get(name)
-    }
-    pub(crate) fn set_global(&self, name: Value, value: Value) {
-        let globals = self.globals.as_table().unwrap();
-        let mut globals = globals.borrow_mut();
-        globals.set(name, value)
-    }
+    // pub(crate) fn get_global(&self, name: Value) -> Value {
+    //     let globals = self.globals.as_table().unwrap();
+    //     let globals = globals.borrow();
+    //     globals.get(name)
+    // }
+    // pub(crate) fn set_global(&self, name: Value, value: Value) {
+    //     let globals = self.globals.as_table().unwrap();
+    //     let mut globals = globals.borrow_mut();
+    //     globals.set(name, value)
+    // }
     // fn get_arg_count(&self) -> usize {
     //     let frames = self.frames.borrow();
     //     let frame = frames.last().unwrap();
@@ -283,33 +307,22 @@ impl State {
         Value::Closure(c)
     }
     pub(crate) fn add(&self, a: Value, b: Value) -> Result<Value, RuntimeError> {
-        binary_op_impl!(+, a,b)
+        binary_op_impl!(self, +, a,b, MtKeyAdd)
     }
     pub(crate) fn sub(&self, a: Value, b: Value) -> Result<Value, RuntimeError> {
-        binary_op_impl!(-, a,b)
+        binary_op_impl!(self, -, a,b, MtKeySub)
     }
     pub(crate) fn mul(&self, a: Value, b: Value) -> Result<Value, RuntimeError> {
-        binary_op_impl!(*, a,b)
+        binary_op_impl!(self, *, a,b, MtKeyMul)
     }
     pub(crate) fn div(&self, a: Value, b: Value) -> Result<Value, RuntimeError> {
-        binary_op_impl!(/, a,b)
+        binary_op_impl!(self,/, a,b, MtKeyDiv)
     }
     pub(crate) fn mod_(&self, a: Value, b: Value) -> Result<Value, RuntimeError> {
-        binary_op_impl!(%, a,b)
+        binary_op_impl!(self,%, a,b,MtKeyMod)
     }
     pub(crate) fn pow(&self, a: Value, b: Value) -> Result<Value, RuntimeError> {
-        if let (Some(a), Some(b)) = (a.number(), b.number()) {
-            Ok(Value::from_number(a.powf(b)))
-        } else {
-            Err(RuntimeError {
-                kind: ErrorKind::ArithmeticError,
-                msg: format!(
-                    "attempt to perform arithmetic operation '^' between {} and {}",
-                    a.type_of(),
-                    b.type_of()
-                ),
-            })
-        }
+        binary_op_impl_closue!(self, |a:f64, b:f64|->f64 {a.powf(b)}, "^", a, b, MtKeyPow)
     }
     pub(crate) fn bitwise_and(&self, a: Value, b: Value) -> Result<Value, RuntimeError> {
         int_binary_op_impl!(&, a, b)
