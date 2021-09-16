@@ -157,7 +157,7 @@ impl Compiler {
         self.emit(ByteCode::FloatLo([bytes[0], bytes[1], bytes[2], bytes[3]]));
         self.emit(ByteCode::FloatHi([bytes[4], bytes[5], bytes[6], bytes[7]]));
     }
-    fn push_string(&mut self, s: &String) {
+    fn string_pool_index(&mut self, s: &String) -> u32 {
         let idx = if let Some(idx) = self.str_map.get(s) {
             *idx
         } else {
@@ -166,6 +166,10 @@ impl Compiler {
             self.str_map.insert(s.clone(), idx);
             idx
         } as u32;
+        idx
+    }
+    fn push_string(&mut self, s: &String) {
+        let idx = self.string_pool_index(s);
         let bytes = idx.to_le_bytes();
         assert!(bytes[3] == 0);
         self.emit(ByteCode::Op3U8(
@@ -250,7 +254,52 @@ impl Compiler {
             }
         }
     }
-
+    fn is_string_literal(expr: &Expr) -> bool {
+        match expr {
+            Expr::Literal { token } => match token {
+                Token::String { .. } => {
+                    return true;
+                }
+                _ => {}
+            },
+            _ => {}
+        }
+        false
+    }
+    fn is_identifier(expr: &Expr) -> bool {
+        match expr {
+            Expr::Identifier { .. } => true,
+            _ => false,
+        }
+    }
+    fn load_identifier(&mut self, name:&String)-> Result<(), CompileError>{
+        self.resolve_upvalue(name);
+        if let Some(info) = self.symbols.get(name).map(|x| *x) {
+            if info.is_upvalue {
+                self.emit(ByteCode::Op3U8(
+                    OpCode::LoadUpvalue,
+                    get_3xu8(info.location),
+                ));
+            } else {
+                self.emit(ByteCode::Op3U8(OpCode::LoadLocal, get_3xu8(info.location)));
+            }
+        } else {
+            // self.push_string(name);
+            let idx = self.string_pool_index(name);
+            let info = *self.symbols.get(&"_ENV".into()).unwrap();
+            if info.is_upvalue {
+                self.emit(ByteCode::Op3U8(
+                    OpCode::LoadUpvalue,
+                    get_3xu8(info.location),
+                ));
+            } else {
+                self.emit(ByteCode::Op3U8(OpCode::LoadLocal, get_3xu8(info.location)));
+            }
+            // self.emit(ByteCode::Op(OpCode::LoadTable));
+            self.emit(ByteCode::Op3U8(OpCode::LoadTableStringKey, get_3xu8(idx)));
+        }
+        Ok(())
+    }
     fn compile_expr(&mut self, expr: &Expr) -> Result<(), CompileError> {
         match expr {
             Expr::VarArgs { token } => unimplemented!(),
@@ -288,29 +337,7 @@ impl Compiler {
                     Token::Identifier { value, .. } => value,
                     _ => unreachable!(),
                 };
-                self.resolve_upvalue(name);
-                if let Some(info) = self.symbols.get(name).map(|x| *x) {
-                    if info.is_upvalue {
-                        self.emit(ByteCode::Op3U8(
-                            OpCode::LoadUpvalue,
-                            get_3xu8(info.location),
-                        ));
-                    } else {
-                        self.emit(ByteCode::Op3U8(OpCode::LoadLocal, get_3xu8(info.location)));
-                    }
-                } else {
-                    self.push_string(name);
-                    let info = *self.symbols.get(&"_ENV".into()).unwrap();
-                    if info.is_upvalue {
-                        self.emit(ByteCode::Op3U8(
-                            OpCode::LoadUpvalue,
-                            get_3xu8(info.location),
-                        ));
-                    } else {
-                        self.emit(ByteCode::Op3U8(OpCode::LoadLocal, get_3xu8(info.location)));
-                    }
-                    self.emit(ByteCode::Op(OpCode::LoadTable));
-                }
+                self.load_identifier(name)?;
                 Ok(())
             }
             Expr::BinaryExpr { op, lhs, rhs } => {
@@ -376,9 +403,22 @@ impl Compiler {
                 Ok(())
             }
             Expr::IndexExpr { loc: _, lhs, rhs } => {
-                self.compile_expr(rhs)?;
-                self.compile_expr(lhs)?;
-                self.emit(ByteCode::Op(OpCode::LoadTable));
+                if Self::is_string_literal(rhs) {
+                    match &**rhs {
+                        Expr::Literal {
+                            token: Token::String { value, .. },
+                        } => {
+                            let idx = self.string_pool_index(value);
+                            self.compile_expr(lhs)?;
+                            self.emit(ByteCode::Op3U8(OpCode::LoadTableStringKey, get_3xu8(idx)));
+                        }
+                        _ => unreachable!(),
+                    }
+                } else {
+                    self.compile_expr(rhs)?;
+                    self.compile_expr(lhs)?;
+                    self.emit(ByteCode::Op(OpCode::LoadTable));
+                }
                 Ok(())
             }
             Expr::DotExpr {
@@ -794,12 +834,12 @@ impl Compiler {
                         Token::Identifier { value, .. } => value,
                         _ => unreachable!(),
                     });
-                    if let Some(method) = method {
-                        self.push_string(method);
-                    }
-                    for (_i, acc) in access_chain.iter().enumerate().rev() {
-                        self.push_string(acc);
-                    }
+                    // if let Some(method) = method {
+                    //     self.push_string(method);
+                    // }
+                    // for (_i, acc) in access_chain.iter().enumerate().rev() {
+                    //     self.push_string(acc);
+                    // }
                     {
                         let info = *self.symbols.get(&"_ENV".into()).unwrap();
                         if info.is_upvalue {
@@ -811,17 +851,20 @@ impl Compiler {
                             self.emit(ByteCode::Op3U8(OpCode::LoadLocal, get_3xu8(info.location)));
                         }
                     }
-                    if let Some(_method) = method {
-                        for (_i, _acc) in access_chain.iter().enumerate() {
-                            self.emit(ByteCode::Op(OpCode::LoadTable));
+                    if let Some(method) = method {
+                        for (_i, acc) in access_chain.iter().enumerate() {
+                            let idx = self.string_pool_index(*acc);
+                            self.emit(ByteCode::Op3U8(OpCode::LoadTableStringKey,get_3xu8(idx)));
                         }
-                        self.emit(ByteCode::Op(OpCode::StoreTable));
+                        let idx = self.string_pool_index(method);
+                        self.emit(ByteCode::Op3U8(OpCode::StoreTableStringKey,get_3xu8(idx)));
                     } else {
-                        for (i, _acc) in access_chain.iter().enumerate() {
+                        for (i, acc) in access_chain.iter().enumerate() {
+                            let idx = self.string_pool_index(*acc);
                             if i != access_chain.len() - 1 {
-                                self.emit(ByteCode::Op(OpCode::LoadTable));
+                                self.emit(ByteCode::Op3U8(OpCode::LoadTableStringKey,get_3xu8(idx)));
                             } else {
-                                self.emit(ByteCode::Op(OpCode::StoreTable));
+                                self.emit(ByteCode::Op3U8(OpCode::StoreTableStringKey,get_3xu8(idx)));
                             }
                         }
                     }
@@ -886,7 +929,7 @@ impl Compiler {
                         self.emit(ByteCode::Op3U8(OpCode::StoreLocal, get_3xu8(info.location)));
                     }
                 } else {
-                    self.push_string(name);
+                    // self.push_string(name);
                     let info = *self.symbols.get(&"_ENV".into()).unwrap();
                     if info.is_upvalue {
                         self.emit(ByteCode::Op3U8(
@@ -896,7 +939,8 @@ impl Compiler {
                     } else {
                         self.emit(ByteCode::Op3U8(OpCode::LoadLocal, get_3xu8(info.location)));
                     }
-                    self.emit(ByteCode::Op(OpCode::StoreTable));
+                    let idx = self.string_pool_index(name);
+                    self.emit(ByteCode::Op3U8(OpCode::StoreTableStringKey,get_3xu8(idx)));
                 }
                 Ok(())
             }

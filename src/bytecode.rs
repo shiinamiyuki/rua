@@ -51,9 +51,11 @@ pub enum OpCode {
     LoadLocal,  // PUSH  local[i]
     StoreLocal, // local[i] = TOS;POP
     Unpack,     // Unpack TOS to n values,
+    LoadTableStringKey, 
+    StoreTableStringKey,
 
     LoadTable,    // TOS = key, table
-    StoreTable,   // TOS = value, key, table
+    StoreTable,   // TOS = value, key, table   
     LoadUpvalue,  // TOS=upvalue, push upvalue[i]
     StoreUpvalue, // TOS~1=upvalue, TOS=value upvalue[i] = value
 

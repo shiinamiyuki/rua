@@ -368,6 +368,23 @@ impl Instance {
                         // eval_stack
                         // .push(state.create_string(module.string_pool[idx as usize].clone()));
                     }
+                    OpCode::LoadTableStringKey=>{
+                        let table = eval_stack.pop().unwrap();
+                        let idx = u32_from_3xu8(operands);
+                        let key = module.string_pool_cache[idx as usize];
+                        std::mem::drop(eval_stack);
+                        let v = state.table_get(table, key)?;
+                        let mut eval_stack = state.eval_stack.borrow_mut();
+                        eval_stack.push(v);
+                    }
+                    OpCode::StoreTableStringKey=>{
+                        let table = eval_stack.pop().unwrap();
+                        let value = eval_stack.pop().unwrap();
+                        let idx = u32_from_3xu8(operands);
+                        let key = module.string_pool_cache[idx as usize];
+                        std::mem::drop(eval_stack);
+                        self.state.table_set(table, key, value)?;
+                    }
                     OpCode::StoreUpvalue => {
                         let idx = u32_from_3xu8(operands);
                         let v = eval_stack.pop().unwrap();
