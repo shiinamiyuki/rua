@@ -552,12 +552,17 @@ impl Runtime {
 
 impl RuntimeInner {
     pub fn add_module(&mut self, name: String, module: Module) {
+        let name = self.create_pooled_string(&name);
         let globals = self.globals.as_table().unwrap();
         let mut globals = globals.borrow_mut();
-        globals.set(
-            Value::String(self.gc.allocate(Managed { data: name })),
-            module.module,
-        );
+        globals.set(name, module.module);
+    }
+    pub fn add_var(&mut self, name: String, var: Value) {
+        let name = self.create_pooled_string(&name);
+        let globals = self.globals.as_table().unwrap();
+        let mut globals = globals.borrow_mut();
+
+        globals.set(name, var);
     }
     fn add_function<'a, F: Fn(&CallContext<'_>) -> Result<(), RuntimeError> + 'static>(
         &'a mut self,
@@ -569,12 +574,10 @@ impl RuntimeInner {
     fn add_callable<'a>(&'a mut self, name: String, callable: Box<dyn Callable>)
     /*->Option<Local<'a>>*/
     {
+        let name = self.create_pooled_string(&name);
         let globals = self.globals.as_table().unwrap();
         let mut globals = globals.borrow_mut();
-        globals.set(
-            Value::String(self.gc.allocate(Managed { data: name })),
-            Value::Callable(self.gc.allocate(callable)),
-        );
+        globals.set(name, Value::Callable(self.gc.allocate(callable)));
         // Some(Local{
         //     value:v,
         //     phantom:PhantomData{},
@@ -750,6 +753,7 @@ impl RuntimeInner {
         constants[ConstantsIndex::MtKeyPow as usize] =
             runtime.create_pooled_string(&String::from("__pow"));
         runtime.constants = Rc::new(constants);
+        runtime.add_var("_G".into(), runtime.globals);
         runtime
     }
 }

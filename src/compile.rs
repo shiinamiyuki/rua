@@ -253,7 +253,7 @@ impl Compiler {
 
     fn compile_expr(&mut self, expr: &Expr) -> Result<(), CompileError> {
         match expr {
-            Expr::VarArgs { loc } => unimplemented!(),
+            Expr::VarArgs { token } => unimplemented!(),
             Expr::Const { token } => match token {
                 Token::Keyword { value, .. } => {
                     match value.as_str() {
@@ -734,6 +734,10 @@ impl Compiler {
         for (i, arg) in args.iter().enumerate() {
             let name = match arg {
                 Token::Identifier { value, .. } => value,
+                Token::Symbol { value, .. } => {
+                    assert!(i == args.len() - 1);
+                    value
+                }
                 _ => unreachable!(),
             };
             let uid = self.new_var_uid();

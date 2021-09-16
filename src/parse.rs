@@ -44,7 +44,7 @@ pub enum TableField {
 #[derive(Clone, Debug)]
 pub enum Expr {
     VarArgs {
-        loc: SourceLocation,
+        token: Token,
     },
     Const {
         // nil, true, false
@@ -98,7 +98,7 @@ impl Expr {
     #[allow(dead_code)]
     pub fn loc(&self) -> &SourceLocation {
         match self {
-            Expr::VarArgs { loc } => loc,
+            Expr::VarArgs { token } => token.loc(),
             Expr::Literal { token } => token.loc(),
             Expr::Identifier { token } => token.loc(),
             Expr::BinaryExpr { op: _, lhs, rhs: _ } => lhs.loc(),
@@ -882,9 +882,19 @@ impl Parser {
         self.advance(1);
         let args = self.parse_expr_list(false)?;
         let mut func_args = vec![];
-        for arg in args {
-            match &*arg {
+        for (i, arg) in args.iter().enumerate() {
+            match &**arg {
                 Expr::Identifier { token } => func_args.push(token.clone()),
+                Expr::VarArgs { token } => {
+                    if i != args.len() - 1 {
+                        return Err(self.error(
+                            ErrorKind::SyntaxError,
+                            "varargs must be the last parameter!",
+                            arg.loc().clone(),
+                        ));
+                    }
+                    func_args.push(token.clone())
+                }
                 _ => {
                     return Err(self.error(
                         ErrorKind::SyntaxError,
@@ -939,9 +949,10 @@ impl Parser {
                     token: token.clone(),
                 }))
             }
-            Token::Symbol { value, .. } if value == "..." => Ok(Rc::new(Expr::VarArgs {
-                loc: token.loc().clone(),
-            })),
+            Token::Symbol { value, .. } if value == "..." => {
+                self.advance(1);
+                Ok(Rc::new(Expr::VarArgs { token }))
+            }
             Token::Symbol { value, .. } if value == "{" => self.parse_table(),
             Token::Keyword { value, loc: _ } if value == "function" => {
                 let expr = self.parse_function_expr()?;
@@ -1392,13 +1403,23 @@ impl Parser {
         }
         let args = self.parse_expr_list(false)?;
         let mut func_args = vec![];
-        for arg in args {
-            match &*arg {
+        for (i, arg) in args.iter().enumerate() {
+            match &**arg {
                 Expr::Identifier { token } => func_args.push(token.clone()),
+                Expr::VarArgs { token } => {
+                    if i != args.len() - 1 {
+                        return Err(self.error(
+                            ErrorKind::SyntaxError,
+                            "varargs must be the last parameter!",
+                            arg.loc().clone(),
+                        ));
+                    }
+                    func_args.push(token.clone())
+                }
                 _ => {
                     return Err(self.error(
                         ErrorKind::SyntaxError,
-                        "unexpected expression function definition",
+                        "unexpected expression in function definition",
                         arg.loc().clone(),
                     ));
                 }
