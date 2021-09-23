@@ -32,10 +32,30 @@ enum Continue {
     CallExt(Gc<Box<dyn Callable>>, Frame, u8),
 }
 macro_rules! new_frame {
-    ($eval_stack:expr, $n_args:expr,$closure:expr) => {{
+    ($gc:expr, $eval_stack:expr, $n_args:expr,$closure:expr) => {{
+        let closure:Option<Gc<Closure>> = $closure;
         let mut frame = Frame::new($n_args, $closure);
-        for i in 0..$n_args {
+        let is_ext = closure.is_none();
+        let n_parameters:usize = closure.map_or(u8::MAX as usize, |c|{c.n_args});
+        let has_varargs = closure.map_or(false, |c| c.has_varargs);
+        let n_arg_to_local = if is_ext {
+            $n_args
+        }else{
+            ($n_args).min(n_parameters)
+        };
+        for i in 0..n_arg_to_local {
             frame.locals[i] = $eval_stack[$eval_stack.len() - 1 - i];
+        }
+        if !is_ext && has_varargs{
+            let mut tv = smallvec![];
+            for i in n_parameters..$n_args {
+                tv.push($eval_stack[$eval_stack.len() - 1 - i]);
+            }
+            frame.locals[n_parameters] = Value::Tuple($gc.allocate(Tuple{
+                values:RefCell::new(tv),
+                flag:TupleFlag::VarArgs,
+                metatable:Cell::new(Value::Nil),
+            }));
         }
         let len = $eval_stack.len();
         $eval_stack.resize(len - $n_args, Value::nil());
@@ -43,10 +63,31 @@ macro_rules! new_frame {
     }};
 }
 macro_rules! new_frame_direct {
-    ($eval_stack:expr, $args:expr,$closure:expr) => {{
-        let mut frame = Frame::new($args.len(), $closure);
-        for i in 0..$args.len() {
+    ($gc:expr, $args:expr,$closure:expr) => {{
+        let n_args = $args.len();
+        let closure:Option<Gc<Closure>> = $closure;
+        let mut frame = Frame::new(n_args, $closure);
+        let is_ext = closure.is_none();
+        let n_parameters:usize = closure.map_or(u8::MAX as usize, |c|{c.n_args});
+        let has_varargs = closure.map_or(false, |c| c.has_varargs);
+        let n_arg_to_local = if is_ext {
+            n_args
+        }else{
+            (n_args).min(n_parameters)
+        };
+        for i in 0..n_arg_to_local {
             frame.locals[i] = $args[i];
+        }
+        if !is_ext && has_varargs{
+            let mut tv = smallvec![];
+            for i in n_parameters..n_args {
+                tv.push( $args[i]);
+            }
+            frame.locals[n_parameters] = Value::Tuple($gc.allocate(Tuple{
+                values:RefCell::new(tv),
+                flag:TupleFlag::VarArgs,
+                metatable:Cell::new(Value::Nil),
+            }));
         }
         frame
     }};
@@ -74,7 +115,7 @@ impl Instance {
     pub(crate) fn call(&self, closure: Value, args: &[Value]) -> Result<Value, RuntimeError> {
         match closure {
             Value::Closure(closure) => {
-                let frame = { new_frame_direct!(eval_stack, args, Some(closure)) };
+                let frame = { new_frame_direct!(self.gc, args, Some(closure)) };
                 let level = {
                     let mut frames = self.state.frames.borrow_mut();
                     let level = frames.len();
@@ -88,7 +129,7 @@ impl Instance {
                 }
             }
             Value::Callable(callable) => {
-                let frame = { new_frame_direct!(eval_stack, args, None) };
+                let frame = { new_frame_direct!(self.gc, args, None) };
                 {
                     let mut frames = self.state.frames.borrow_mut();
                     frames.push(frame);
@@ -558,12 +599,12 @@ impl Instance {
                         match func {
                             Value::Closure(closure) => {
                                 ip += 1;
-                                let frame = new_frame!(eval_stack, n_args, Some(closure));
+                                let frame = new_frame!(self.gc, eval_stack, n_args, Some(closure));
                                 on_return!(Ok(Continue::NewFrame(frame, operands[1])));
                             }
                             Value::Callable(callable) => {
                                 ip += 1;
-                                let frame = new_frame!(eval_stack, n_args, None);
+                                let frame = new_frame!(self.gc, eval_stack, n_args, None);
                                 on_return!(Ok(Continue::CallExt(callable, frame, operands[1])));
                             }
                             _ => {
@@ -630,6 +671,7 @@ impl Instance {
                             entry: entry as usize,
                             module: frame.closure.unwrap().module.clone(),
                             upvalues,
+                            has_varargs:proto.has_varargs,
                             called: Cell::new(false),
                         });
                         eval_stack.push(closure);
@@ -698,6 +740,7 @@ impl Instance {
             entry: 0,
             n_args: 0,
             // n_locals: 0,
+            has_varargs:false,
             module: Rc::new(module),
             upvalues: vec![UpValue {
                 inner: RefCell::new(Rc::new(Cell::new(UpValueInner::Closed(self.state.globals)))),

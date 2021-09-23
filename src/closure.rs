@@ -55,6 +55,7 @@ pub(crate) struct UpValue {
 pub struct ClosurePrototype {
     pub(crate) entry: usize,
     pub(crate) n_args: usize,
+    pub(crate) has_varargs: bool,
     // pub(crate) n_locals: usize,
     pub(crate) upvalues: Vec<UpValueInfo>,
 }
@@ -63,6 +64,7 @@ pub struct Closure {
     pub(crate) called: Cell<bool>,
     pub(crate) entry: usize,
     pub(crate) n_args: usize,
+    pub(crate) has_varargs: bool,
     // pub(crate) n_locals: usize,
     pub(crate) module: Rc<ByteCodeModule>,
     pub(crate) upvalues: Vec<UpValue>,

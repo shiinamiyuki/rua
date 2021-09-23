@@ -314,7 +314,7 @@ impl Compiler {
             Expr::ParenExpr { expr, .. } => {
                 self.compile_expr(expr, CompileExprExtra { n_expect_values: 1 })
             }
-            Expr::VarArgs { token:_ } => self.load_identifier(&"...".into()),
+            Expr::VarArgs { token: _ } => self.load_identifier(&"...".into()),
             Expr::Const { token } => match token {
                 Token::Keyword { value, .. } => {
                     match value.as_str() {
@@ -939,11 +939,13 @@ impl Compiler {
             },
             _ => {}
         }
+        let mut has_varargs = false;
         for (i, arg) in args.iter().enumerate() {
             let name = match arg {
                 Token::Identifier { value, .. } => value,
                 Token::Symbol { value, .. } => {
-                    assert!(i == args.len() - 1);
+                    debug_assert!(value == "..." && i == args.len() - 1);
+                    has_varargs = true;
                     value
                 }
                 _ => unreachable!(),
@@ -964,7 +966,12 @@ impl Compiler {
         self.emit(ByteCode::Op(OpCode::LoadNil));
         self.emit(ByteCode::Op(OpCode::Return));
         let proto = ClosurePrototype {
-            n_args: args.len(),
+            n_args: if has_varargs {
+                args.len() - 1
+            } else {
+                args.len()
+            },
+            has_varargs,
             upvalues: {
                 let mut tmp: Vec<_> = self
                     .funcs
