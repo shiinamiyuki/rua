@@ -2,15 +2,19 @@ use smallvec::{smallvec, SmallVec};
 
 use crate::{
     api::{BaseApi, CallApi, StateApi},
-    closure::{Closure},
+    closure::Closure,
     gc::{Gc, GcState, Traceable},
-    runtime::{ConstantsIndex, ErrorKind, RuntimeError, ValueRef},
+    runtime::{ConstantsIndex, ErrorKind, GlobalState, RuntimeError, ValueRef},
     table::Table,
     value::{Managed, Tuple, UserData, Value},
     vm::Instance,
     Stack,
 };
-use std::{cell::{Cell, RefCell}, cmp::Ordering, rc::{Rc, Weak}};
+use std::{
+    cell::{Cell, RefCell},
+    cmp::Ordering,
+    rc::{Rc, Weak},
+};
 
 pub const MAX_LOCALS: usize = 256;
 pub(crate) struct Frame {
@@ -43,7 +47,7 @@ A runtime has multiple instances
 pub struct State {
     pub(crate) gc: Rc<GcState>,
     pub(crate) globals: Value,
-    pub(crate) constants: Rc<Vec<Value>>,
+    pub(crate) global_state: Rc<GlobalState>,
     pub(crate) frames: RefCell<Stack<Frame>>,
     pub(crate) eval_stack: RefCell<Vec<Value>>,
     pub(crate) instance: Weak<Instance>,
@@ -58,7 +62,7 @@ macro_rules! binary_op_impl_closue {
             if !mt.is_nil() {
                 let method = $self.table_get(
                     mt,
-                    $self.constants.as_ref()[ConstantsIndex::$metamethod as usize],
+                    $self.global_state.constants[ConstantsIndex::$metamethod as usize].get(),
                 )?;
                 let instance = $self.instance.upgrade().unwrap();
                 return instance.call(method, &[$a, $b]);
@@ -67,7 +71,7 @@ macro_rules! binary_op_impl_closue {
             if !mt.is_nil() {
                 let method = $self.table_get(
                     mt,
-                    $self.constants.as_ref()[ConstantsIndex::$metamethod as usize],
+                    $self.global_state.constants[ConstantsIndex::$metamethod as usize].get(),
                 )?;
                 let instance = $self.instance.upgrade().unwrap();
                 return instance.call(method, &[$a, $b]);
@@ -156,7 +160,7 @@ impl<'a> Drop for CallContext<'a> {
             Value::Tuple(self.state.gc.allocate(Tuple {
                 values: RefCell::new(rv),
                 metatable: Cell::new(Value::Nil),
-                flag:crate::value::TupleFlag::VarArgs,
+                flag: crate::value::TupleFlag::VarArgs,
             }))
         };
         let mut st = self.state.eval_stack.borrow_mut();
@@ -231,40 +235,61 @@ impl State {
         Ok(())
     }
     pub(crate) fn table_get(&self, mut table: Value, key: Value) -> Result<Value, RuntimeError> {
+        self.table_get_impl(table, key, 0)
+    }
+    pub(crate) fn table_get_impl(
+        &self,
+        mut table: Value,
+        key: Value,
+        mut depth: u32,
+    ) -> Result<Value, RuntimeError> {
         loop {
+            if depth >= 32 {
+                return Err(RuntimeError {
+                    kind: ErrorKind::KeyError,
+                    msg: format!("__index chain too long,possible loop",),
+                });
+            }
             let (value, mt) = {
-                let table = match table.as_table() {
-                    Some(x) => x,
-                    None => {
-                        return Err(RuntimeError {
-                            kind: ErrorKind::TypeError,
-                            msg: format!(
-                                " attempt to index a {} value, key:{}",
-                                table.type_of(),
-                                key.print()
-                            ),
-                        })
+                let mt = self.get_metatable(table);
+                match table.as_table() {
+                    Some(x) => {
+                        let table = x.borrow();
+                        (table.get(key), mt)
                     }
-                };
-
-                let table = table.borrow();
-                let mt = table.metatable;
-                (table.get(key), mt)
+                    None => {
+                        if mt.is_nil() {
+                            return Err(RuntimeError {
+                                kind: ErrorKind::TypeError,
+                                msg: format!(
+                                    " attempt to index a {} value, key:{}",
+                                    table.type_of(),
+                                    key.print()
+                                ),
+                            });
+                        } else {
+                            (Value::Nil, mt)
+                        }
+                    }
+                }
             };
             if !value.is_nil() || mt.is_nil() {
                 return Ok(value);
             }
-            if let Some(mt) = mt.as_table() {
-                let mt = mt.borrow();
-                table = mt.get(self.constants.as_ref()[ConstantsIndex::MtKeyIndex as usize]);
-                if table.as_callable().is_some() || table.as_closure().is_some() {
-                    let instance = self.instance.upgrade().unwrap();
-                    return instance.call(table, &[key]);
-                }
-                if table.as_table().is_none() {
-                    return Ok(Value::Nil);
-                }
+
+            table = self.table_get_impl(
+                mt,
+                self.global_state.constants[ConstantsIndex::MtKeyIndex as usize].get(),
+                depth + 1,
+            )?;
+            if table.as_callable().is_some() || table.as_closure().is_some() {
+                let instance = self.instance.upgrade().unwrap();
+                return instance.call(table, &[key]);
             }
+            if table.as_table().is_none() {
+                return Ok(Value::Nil);
+            }
+            depth += 1;
         }
     }
     pub(crate) fn table_set(
@@ -273,6 +298,28 @@ impl State {
         key: Value,
         value: Value,
     ) -> Result<(), RuntimeError> {
+        self.table_set_impl(table, key, value, 0)
+    }
+    pub(crate) fn table_set_impl(
+        &self,
+        table: Value,
+        key: Value,
+        value: Value,
+        depth: u32,
+    ) -> Result<(), RuntimeError> {
+        let newindex = self.table_get_impl(
+            table,
+            self.global_state.constants[ConstantsIndex::MtKeyNewIndex as usize].get(),
+            depth + 1,
+        )?;
+        if newindex.as_table().is_some() {
+            return self.table_set_impl(newindex, key, value, depth + 1);
+        }
+        if newindex.as_callable().is_some() || newindex.as_closure().is_some() {
+            let instance = self.instance.upgrade().unwrap();
+            instance.call(newindex, &[key, value])?;
+            return Ok(());
+        }
         let table = match table.as_table() {
             Some(x) => x,
             None => {
@@ -291,47 +338,15 @@ impl State {
         table.set(key, value);
         Ok(())
     }
-    // pub fn call(&self, closure: Value, args: &[Value]) -> Result<Value, RuntimeError> {
-    //     unsafe {
-    //         match closure.data {
-    //             Value::Closure(closure) => {
-    //                 ip_modified = true;
-    //                 *ip = Frame::get_ip(closure);
-    //                 for i in 0..n_args {
-    //                     frame.locals[i] = eval_stack[eval_stack.len() - n_args + i];
-    //                 }
-    //                 frame.n_args = n_args;
-    //                 let len = eval_stack.len();
-    //                 eval_stack.resize(len - n_args, Value::nil());
-    //             }
-    //             Value::Callable(callable) => {
-    //                 *ip += 1;
-    //                 let mut frame = Frame::new(eval_stack.len() - n_args, n_args, std::ptr::null());
-    //                 for i in 0..n_args {
-    //                     frame.locals[i] = eval_stack[eval_stack.len() - n_args + i];
-    //                 }
-    //                 let len = eval_stack.len();
-    //                 eval_stack.resize(len - n_args, Value::nil());
-    //                 return Ok(Continue::CallExt(callable, frame));
-    //             }
-    //             _ => unreachable!(),
-    //         }
-    //     }
-    // }
+
     pub(crate) fn create_userdata<T: UserData + Traceable>(&self, userdata: T) -> Value {
         let p: Box<dyn UserData> = Box::new(userdata);
         let s = self.gc.allocate(p);
         Value::UserData(s)
     }
-    // pub(crate) fn create_callable<T: Callable>(&self, f: T) -> Value {
-    //     let s = self.gc.allocate(p);
-    //     Value {
-    //         data: Value::UserData(s),
-    //         metatable: None,
-    //     }
-    // }
+
     pub(crate) fn create_string(&self, s: String) -> Value {
-        let s = self.gc.allocate(Managed { data: s });
+        let s = self.gc.allocate(Managed::new(s));
         Value::String(s)
     }
     pub(crate) fn create_table(&self, t: Table) -> Value {
@@ -477,7 +492,7 @@ impl State {
         }
     }
     pub(crate) fn not(&self, a: Value) -> Result<Value, RuntimeError> {
-        Ok(Value::from_bool(!a.to_bool())) 
+        Ok(Value::from_bool(!a.to_bool()))
     }
     pub(crate) fn bitwise_not(&self, a: Value) -> Result<Value, RuntimeError> {
         match a {
@@ -512,20 +527,7 @@ impl State {
         }
     }
     pub(crate) fn get_metatable(&self, a: Value) -> Value {
-        match a {
-            Value::Nil => Value::Nil,
-            Value::Bool(_) => self.constants[ConstantsIndex::MtBool as usize],
-            Value::Number(_) => self.constants[ConstantsIndex::MtNumber as usize],
-            Value::Table(t) => {
-                let t = t.borrow();
-                t.metatable
-            }
-            Value::String(_) => self.constants[ConstantsIndex::MtString as usize],
-            Value::Closure(_) => Value::Nil,
-            Value::Callable(_) => Value::Nil,
-            Value::Tuple(t) => t.metatable.get(),
-            Value::UserData(_) => todo!(),
-        }
+        self.global_state.get_metatable(a)
     }
 }
 
@@ -549,6 +551,39 @@ impl<'b> BaseApi for CallContext<'b> {
     fn upgrade<'a>(&'a self, v: ValueRef<'_>) -> crate::runtime::GcValue {
         let instance = self.state.instance.upgrade().unwrap();
         instance.upgrade(v)
+    }
+
+    fn create_closure<'a>(&self, closure: Box<dyn crate::closure::Callable>) -> ValueRef<'a> {
+        ValueRef::new(Value::Callable(self.state.gc.allocate(closure)))
+    }
+
+    fn create_table<'a>(&self) -> ValueRef<'a> {
+        ValueRef::new(self.state.create_table(Table::new()))
+    }
+
+    fn set_metatable<'a>(&self, v: ValueRef<'a>, mt: ValueRef<'a>) {
+        self.state.global_state.set_metatable(v.value, mt.value)
+    }
+
+    fn get_metatable<'a>(&self, v: ValueRef<'a>) -> ValueRef<'a> {
+        ValueRef::new(self.state.global_state.get_metatable(v.value))
+    }
+
+    fn table_rawset<'a>(
+        &'a self,
+        table: ValueRef<'a>,
+        key: ValueRef<'a>,
+        value: ValueRef<'a>,
+    ) -> Result<(), RuntimeError> {
+        todo!()
+    }
+
+    fn table_rawget<'a>(
+        &'a self,
+        table: ValueRef<'a>,
+        key: ValueRef<'a>,
+    ) -> Result<ValueRef<'a>, RuntimeError> {
+        todo!()
     }
 }
 

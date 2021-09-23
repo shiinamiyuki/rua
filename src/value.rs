@@ -13,12 +13,14 @@ use crate::{
     bytecode::ByteCodeModule,
     closure::{Callable, Closure},
     gc::{Gc, GcState, Traceable},
+    runtime::ValueRef,
     state::State,
     table::Table,
 };
 
-pub struct Managed<T: ?Sized + 'static> {
+pub struct Managed<T: 'static> {
     pub data: T,
+    // metatable:Cell<Value>,
 }
 pub type LightUserData<T> = Managed<T>;
 impl<T> Managed<T> {
@@ -27,7 +29,9 @@ impl<T> Managed<T> {
     }
 }
 impl<T> Traceable for Managed<T> {
-    fn trace(&self, _gc: &GcState) {}
+    fn trace(&self, _gc: &GcState) {
+        // gc.trace(&self.metatable.get());
+    }
 }
 
 pub type ManagedCell<T> = Managed<RefCell<T>>;
@@ -36,6 +40,8 @@ pub trait UserData: Traceable + Any {
     fn as_traceable(&self) -> &dyn Traceable;
     fn as_any(&self) -> &dyn Any;
     fn type_name(&self) -> &'static str;
+    fn set_metatable(&self, v: ValueRef<'_>);
+    fn get_metatable<'a>(&'a self) -> ValueRef<'a>;
 }
 impl<T> UserData for Managed<T> {
     fn as_traceable(&self) -> &dyn Traceable {
@@ -47,6 +53,15 @@ impl<T> UserData for Managed<T> {
     fn type_name(&self) -> &'static str {
         std::any::type_name::<T>()
     }
+
+    fn set_metatable(&self, _v: ValueRef<'_>) {
+        // self.metatable.set(v.value);
+    }
+
+    fn get_metatable<'a>(&'a self) -> ValueRef<'a> {
+        // ValueRef::new(self.metatable.get())
+        ValueRef::new(Value::Nil)
+    }
 }
 impl Traceable for Box<dyn UserData> {
     fn trace(&self, gc: &GcState) {
@@ -55,7 +70,7 @@ impl Traceable for Box<dyn UserData> {
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
-pub(crate) enum TupleFlag{
+pub(crate) enum TupleFlag {
     Empty,
     VarArgs,
 }
@@ -63,7 +78,7 @@ pub(crate) enum TupleFlag{
 pub struct Tuple {
     pub(crate) values: RefCell<SmallVec<[Value; 8]>>,
     pub(crate) metatable: Cell<Value>,
-    pub(crate) flag:TupleFlag,
+    pub(crate) flag: TupleFlag,
 }
 impl Traceable for Tuple {
     fn trace(&self, gc: &GcState) {

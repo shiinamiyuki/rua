@@ -1160,7 +1160,7 @@ impl Parser {
             return Err(self.error(ErrorKind::UnexpectedEOF, "unexpected EOF in for loop", loc));
         }
         match &name {
-            Token::Symbol { .. } => {}
+            Token::Identifier { .. } => {}
             _ => {
                 return Err(self.error(
                     ErrorKind::SyntaxError,

@@ -65,10 +65,13 @@ impl GcValueList {
         Self { head, tail }
     }
 }
+pub(crate) struct GlobalState {
+    pub(crate) constants: Vec<Cell<Value>>,
+}
 pub(crate) struct RuntimeInner {
     pub(crate) gc: Rc<GcState>,
     pub(crate) globals: Value,
-    pub(crate) constants: Rc<Vec<Value>>,
+    pub(crate) global_state: Option<Rc<GlobalState>>,
     pub(crate) instances: Vec<Weak<Instance>>,
     pub(crate) string_pool: HashMap<String, Value>,
     pub(crate) gc_value_list: GcValueList,
@@ -79,6 +82,7 @@ pub(crate) enum ConstantsIndex {
     MtBool,
     MtClosure,
     MtKeyIndex,
+    MtKeyNewIndex,
     MtKeyAdd,
     MtKeySub,
     MtKeyMul,
@@ -592,7 +596,7 @@ impl RuntimeInner {
                 globals: self.globals,
                 frames: RefCell::new(Stack::new()),
                 eval_stack: RefCell::new(vec![]),
-                constants: self.constants.clone(),
+                global_state: self.global_state.clone().unwrap(),
                 instance: Weak::new(),
             },
         });
@@ -626,14 +630,18 @@ impl RuntimeInner {
         self.add_function("rawget".into(), |ctx| {
             let table = ctx.arg_or_nil(0);
             let key = ctx.arg_or_nil(1);
-            ctx.ret(0, ValueRef::new(ctx.state.table_rawget(table.value, key.value)?));
+            ctx.ret(
+                0,
+                ValueRef::new(ctx.state.table_rawget(table.value, key.value)?),
+            );
             Ok(())
         });
         self.add_function("rawset".into(), |ctx| {
             let table = ctx.arg_or_nil(0);
             let key = ctx.arg_or_nil(1);
             let value = ctx.arg_or_nil(2);
-            ctx.state.table_rawset(table.value, key.value, value.value)?;
+            ctx.state
+                .table_rawset(table.value, key.value, value.value)?;
             Ok(())
         });
         self.add_function("type".into(), |ctx| {
@@ -738,7 +746,7 @@ impl RuntimeInner {
             string_pool: HashMap::new(),
             globals: Value::Table(gc.allocate(RefCell::new(Table::new()))),
             instances: vec![],
-            constants: Rc::new(vec![]),
+            global_state: None,
             gc_value_list: GcValueList::new(),
         };
         let mut constants = vec![Value::Nil; ConstantsIndex::NumConstants as usize];
@@ -753,6 +761,8 @@ impl RuntimeInner {
 
         constants[ConstantsIndex::MtKeyIndex as usize] =
             runtime.create_pooled_string(&String::from("__index"));
+        constants[ConstantsIndex::MtKeyNewIndex as usize] =
+            runtime.create_pooled_string(&String::from("__newindex"));
         constants[ConstantsIndex::MtKeyAdd as usize] =
             runtime.create_pooled_string(&String::from("__add"));
         constants[ConstantsIndex::MtKeySub as usize] =
@@ -765,16 +775,55 @@ impl RuntimeInner {
             runtime.create_pooled_string(&String::from("__mod"));
         constants[ConstantsIndex::MtKeyPow as usize] =
             runtime.create_pooled_string(&String::from("__pow"));
-        runtime.constants = Rc::new(constants);
+        let global_state = GlobalState {
+            constants: constants.into_iter().map(|x| Cell::new(x)).collect(),
+        };
+        runtime.global_state = Some(Rc::new(global_state));
         runtime.add_var("_G".into(), runtime.globals);
         runtime
+    }
+}
+impl GlobalState {
+    pub(crate) fn get_metatable(&self, v: Value) -> Value {
+        match v {
+            Value::Nil => Value::Nil,
+            Value::Bool(_) => self.constants[ConstantsIndex::MtBool as usize].get(),
+            Value::Number(_) => self.constants[ConstantsIndex::MtNumber as usize].get(),
+            Value::Table(t) => {
+                let t = t.borrow();
+                t.metatable
+            }
+            Value::String(_) => self.constants[ConstantsIndex::MtString as usize].get(),
+            Value::Closure(_) => Value::Nil,
+            Value::Callable(_) => Value::Nil,
+            Value::Tuple(t) => t.metatable.get(),
+            Value::UserData(_) => todo!(),
+        }
+    }
+    pub(crate) fn set_metatable(&self, v: Value, mt: Value) {
+        match v {
+            Value::Nil => {}
+            Value::Bool(_) => self.constants[ConstantsIndex::MtBool as usize].set(mt),
+            Value::Number(_) => self.constants[ConstantsIndex::MtNumber as usize].set(mt),
+            Value::Table(t) => {
+                let mut t = t.borrow_mut();
+                t.metatable = mt;
+            }
+            Value::String(_) => self.constants[ConstantsIndex::MtString as usize].set(mt),
+            Value::Closure(_) => {}
+            Value::Callable(_) => {}
+            Value::Tuple(t) => {
+                t.metatable.set(mt);
+            }
+            Value::UserData(_) => todo!(),
+        }
     }
 }
 impl Traceable for RuntimeInner {
     fn trace(&self, gc: &GcState) {
         gc.trace(&self.globals);
-        for c in &*self.constants {
-            gc.trace(c);
+        for c in self.global_state.as_ref().unwrap().constants.iter() {
+            gc.trace(&c.get());
         }
         for instance in &self.instances {
             if let Some(instance) = instance.upgrade() {
@@ -819,6 +868,39 @@ impl BaseApi for Runtime {
     fn upgrade<'a>(&'a self, v: ValueRef<'_>) -> GcValue {
         self.inner.upgrade(v)
     }
+
+    fn create_closure<'a>(&self, closure: Box<dyn Callable>) -> ValueRef<'a> {
+        todo!()
+    }
+
+    fn create_table<'a>(&self) -> ValueRef<'a> {
+        todo!()
+    }
+
+    fn set_metatable<'a>(&self, v: ValueRef<'a>, mt: ValueRef<'a>) {
+        todo!()
+    }
+
+    fn get_metatable<'a>(&self, v: ValueRef<'a>) -> ValueRef<'a> {
+        todo!()
+    }
+
+    fn table_rawset<'a>(
+        &'a self,
+        table: ValueRef<'a>,
+        key: ValueRef<'a>,
+        value: ValueRef<'a>,
+    ) -> Result<(), RuntimeError> {
+        todo!()
+    }
+
+    fn table_rawget<'a>(
+        &'a self,
+        table: ValueRef<'a>,
+        key: ValueRef<'a>,
+    ) -> Result<ValueRef<'a>, RuntimeError> {
+        todo!()
+    }
 }
 impl BaseApi for Rc<RefCell<RuntimeInner>> {
     fn create_number<'a>(&'a self, x: f64) -> ValueRef<'a> {
@@ -840,7 +922,7 @@ impl BaseApi for Rc<RefCell<RuntimeInner>> {
     fn create_string<'a>(&self, s: String) -> ValueRef<'a> {
         let inner = self.borrow();
         let gc = &inner.gc;
-        let s = gc.allocate(Managed { data: s });
+        let s = gc.allocate(Managed::new(s));
         ValueRef::new(Value::String(s))
     }
 
@@ -862,6 +944,49 @@ impl BaseApi for Rc<RefCell<RuntimeInner>> {
             head.next.set(value_box.as_ref() as *const ValueBox);
         }
         GcValue { inner: value_box }
+    }
+
+    fn create_closure<'a>(&self, closure: Box<dyn Callable>) -> ValueRef<'a> {
+        let inner = self.borrow();
+        let gc = &inner.gc;
+        ValueRef::new(Value::Callable(gc.allocate(closure)))
+    }
+
+    fn create_table<'a>(&self) -> ValueRef<'a> {
+        let inner = self.borrow();
+        let gc = &inner.gc;
+        ValueRef::new(Value::Table(gc.allocate(RefCell::new(Table::new()))))
+    }
+
+    fn set_metatable<'a>(&self, v: ValueRef<'a>, mt: ValueRef<'a>) {
+        let inner = self.borrow();
+        inner
+            .global_state
+            .as_ref()
+            .unwrap()
+            .set_metatable(v.value, mt.value)
+    }
+
+    fn get_metatable<'a>(&self, v: ValueRef<'a>) -> ValueRef<'a> {
+        let inner = self.borrow();
+        ValueRef::new(inner.global_state.as_ref().unwrap().get_metatable(v.value))
+    }
+
+    fn table_rawset<'a>(
+        &'a self,
+        table: ValueRef<'a>,
+        key: ValueRef<'a>,
+        value: ValueRef<'a>,
+    ) -> Result<(), RuntimeError> {
+        todo!()
+    }
+
+    fn table_rawget<'a>(
+        &'a self,
+        table: ValueRef<'a>,
+        key: ValueRef<'a>,
+    ) -> Result<ValueRef<'a>, RuntimeError> {
+        todo!()
     }
 }
 impl Drop for RuntimeInner {

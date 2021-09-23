@@ -2,6 +2,7 @@ use std::{
     cell::{Ref, RefCell},
     collections::{HashMap, HashSet},
     convert::TryInto,
+    fmt::format,
     rc::Rc,
     vec,
 };
@@ -820,14 +821,17 @@ impl Compiler {
                 Ok(())
             }
             Stmt::While { loc, cond, body } => {
-                let start = self.module.code.len();
+                // let start = self.module.code.len();
+                let begin = self.new_label();
+                self.emit_label(begin);
                 self.compile_expr(cond, Default::default())?;
                 self.emit(ByteCode::Op3U8(OpCode::TestJump, [0, 1, 1]));
                 let l = self.new_label();
                 self.emit(ByteCode::Label(l.to_le_bytes()));
                 self.compile_stmt(body)?;
                 self.emit(ByteCode::Op(OpCode::Jump));
-                self.emit(ByteCode::Address((start as u32).to_le_bytes()));
+                self.emit(ByteCode::Label(begin.to_le_bytes()));
+                // self.emit(ByteCode::Address((start as u32).to_le_bytes()));
                 self.emit_label(l);
                 Ok(())
             }
@@ -838,7 +842,68 @@ impl Compiler {
                 end,
                 step,
                 body,
-            } => todo!(),
+            } => {
+                let var = match name {
+                    Token::Identifier { value, .. } => value,
+                    _ => {
+                        return Err(CompileError {
+                            kind: ErrorKind::SemanticError,
+                            msg: "illegal induction variable".into(),
+                            loc: name.loc().clone(),
+                        })
+                    }
+                };
+                self.enter_scope(false);
+                self.add_var(var.clone());
+                self.compile_expr(init, Default::default())?;
+                self.store_variable(var)?;
+                let step_var = format!("##step{}", self.module.code.len());
+                self.add_var(step_var.clone());
+                if let Some(step) = step {
+                    self.compile_expr(step, Default::default())?;
+                } else {
+                    self.push_number(1.0);
+                }
+                self.emit(ByteCode::Op(OpCode::Dup));
+                self.store_variable(&step_var)?;
+                macro_rules! gen_for_loop {
+                    ($op:ident) => {
+                        let begin = self.new_label();
+                        self.emit_label(begin);
+                        self.load_identifier(var)?;
+                        self.compile_expr(end, Default::default())?;
+                        self.emit(ByteCode::Op(OpCode::$op));
+                        self.emit(ByteCode::Op3U8(OpCode::TestJump, [0, 1, 1]));
+                        let l = self.new_label();
+                        self.emit(ByteCode::Label(l.to_le_bytes()));
+                        self.enter_scope(false);
+                        self.compile_stmt(body)?;
+                        self.leave_scope(false);
+                        self.load_identifier(var)?;
+                        self.load_identifier(&step_var)?;
+                        self.emit(ByteCode::Op(OpCode::Add));
+                        self.store_variable(var)?;
+                        self.emit(ByteCode::Op(OpCode::Jump));
+                        self.emit(ByteCode::Label(begin.to_le_bytes()));
+                        self.emit_label(l);
+                    };
+                }
+
+                self.push_number(0.0);
+                self.emit(ByteCode::Op(OpCode::GreaterThan));
+                self.emit(ByteCode::Op3U8(OpCode::TestJump, [0, 1, 1]));
+                let l = self.new_label();
+                self.emit(ByteCode::Label(l.to_le_bytes()));
+                gen_for_loop!(LessThanEqual);
+                let end = self.new_label();
+                self.emit(ByteCode::Op(OpCode::Jump));
+                self.emit(ByteCode::Label(end.to_le_bytes()));
+                self.emit_label(l);
+                gen_for_loop!(GreaterThanEqual);
+                self.emit_label(end);
+                self.leave_scope(false);
+                Ok(())
+            }
             Stmt::ForIn { name, range, body } => todo!(),
             Stmt::Assign { loc, lhs, rhs } => {
                 // assert!(lhs.len() == 1 && rhs.len() == 1);
@@ -1088,7 +1153,34 @@ impl Compiler {
         };
         Ok(())
     }
-
+    fn store_variable(&mut self, name: &String) -> Result<(), CompileError> {
+        let info = self.symbols.get(name).map(|x| *x);
+        self.resolve_upvalue(name);
+        if let Some(info) = info {
+            if info.is_upvalue {
+                self.emit(ByteCode::Op3U8(
+                    OpCode::StoreUpvalue,
+                    get_3xu8(info.location),
+                ));
+            } else {
+                self.emit(ByteCode::Op3U8(OpCode::StoreLocal, get_3xu8(info.location)));
+            }
+        } else {
+            // self.push_string(name);
+            let info = *self.symbols.get(&"_ENV".into()).unwrap();
+            if info.is_upvalue {
+                self.emit(ByteCode::Op3U8(
+                    OpCode::LoadUpvalue,
+                    get_3xu8(info.location),
+                ));
+            } else {
+                self.emit(ByteCode::Op3U8(OpCode::LoadLocal, get_3xu8(info.location)));
+            }
+            let idx = self.string_pool_index(name);
+            self.emit(ByteCode::Op3U8(OpCode::StoreTableStringKey, get_3xu8(idx)));
+        }
+        Ok(())
+    }
     fn emit_store(&mut self, expr: &Expr) -> Result<(), CompileError> {
         match expr {
             // Expr::Const { token } => todo!(),
@@ -1098,32 +1190,7 @@ impl Compiler {
                     Token::Identifier { value, .. } => value,
                     _ => unreachable!(),
                 };
-                let info = self.symbols.get(name).map(|x| *x);
-                self.resolve_upvalue(name);
-                if let Some(info) = info {
-                    if info.is_upvalue {
-                        self.emit(ByteCode::Op3U8(
-                            OpCode::StoreUpvalue,
-                            get_3xu8(info.location),
-                        ));
-                    } else {
-                        self.emit(ByteCode::Op3U8(OpCode::StoreLocal, get_3xu8(info.location)));
-                    }
-                } else {
-                    // self.push_string(name);
-                    let info = *self.symbols.get(&"_ENV".into()).unwrap();
-                    if info.is_upvalue {
-                        self.emit(ByteCode::Op3U8(
-                            OpCode::LoadUpvalue,
-                            get_3xu8(info.location),
-                        ));
-                    } else {
-                        self.emit(ByteCode::Op3U8(OpCode::LoadLocal, get_3xu8(info.location)));
-                    }
-                    let idx = self.string_pool_index(name);
-                    self.emit(ByteCode::Op3U8(OpCode::StoreTableStringKey, get_3xu8(idx)));
-                }
-                Ok(())
+                self.store_variable(name)
             }
             // Expr::BinaryExpr { op, lhs, rhs } => todo!(),
             // Expr::UnaryExpr { op, arg } => todo!(),
