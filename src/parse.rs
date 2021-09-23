@@ -56,6 +56,10 @@ pub enum Expr {
     Identifier {
         token: Token,
     },
+    ParenExpr{
+        loc:SourceLocation,
+        expr:Rc<Expr>,
+    },
     BinaryExpr {
         op: Token,
         lhs: Rc<Expr>,
@@ -98,6 +102,7 @@ impl Expr {
     #[allow(dead_code)]
     pub fn loc(&self) -> &SourceLocation {
         match self {
+            Expr::ParenExpr{loc,..}=>loc,
             Expr::VarArgs { token } => token.loc(),
             Expr::Literal { token } => token.loc(),
             Expr::Identifier { token } => token.loc(),
@@ -106,7 +111,7 @@ impl Expr {
             Expr::IndexExpr {
                 loc: _,
                 lhs,
-                rhs: _,
+                rhs: _, 
             } => lhs.loc(),
             Expr::DotExpr {
                 loc: _,
@@ -144,7 +149,7 @@ pub enum FunctionName {
 pub enum Stmt {
     Return {
         loc: SourceLocation,
-        expr: Option<Rc<Expr>>,
+        expr: Vec<Rc<Expr>>,
     },
     LocalVar {
         loc: SourceLocation,
@@ -716,6 +721,7 @@ impl Parser {
     }
     fn parse_primary_expr(&mut self) -> Result<Rc<Expr>, ParseError> {
         if self.has("(") {
+            let paren_loc = self.peek().loc().clone();
             self.advance(1);
             let e = self.parse_expr()?;
             let loc = self.peek().loc().clone();
@@ -723,7 +729,10 @@ impl Parser {
                 return Err(self.error(ErrorKind::SyntaxError, "expected ')'", loc));
             }
             self.advance(1);
-            Ok(e)
+            Ok(Rc::new(Expr::ParenExpr{
+                loc:paren_loc,
+                expr:e
+            }))
         } else {
             let token = self.peek().clone();
             match token {
@@ -1133,12 +1142,12 @@ impl Parser {
         let loc = self.peek().loc().clone();
         self.advance(1);
         if self.has("end") {
-            Ok(Rc::new(Stmt::Return { loc, expr: None }))
+            Ok(Rc::new(Stmt::Return { loc, expr: vec![] }))
         } else {
-            let expr = self.parse_expr()?;
+            let expr = self.parse_expr_list(true)?;
             Ok(Rc::new(Stmt::Return {
                 loc,
-                expr: Some(expr),
+                expr,
             }))
         }
     }

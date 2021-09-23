@@ -1,5 +1,7 @@
 use std::{any::TypeId, marker::PhantomData, mem::size_of};
 
+pub mod api;
+pub mod bind;
 pub mod bytecode;
 pub mod closure;
 pub mod compile;
@@ -11,8 +13,6 @@ pub mod stdlib;
 pub mod table;
 pub mod value;
 pub mod vm;
-pub mod bind;
-pub mod api;
 
 pub(crate) const fn num_bits<T>() -> usize {
     std::mem::size_of::<T>() * 8
@@ -64,8 +64,11 @@ impl<T> Stack<T> {
         self.last = node;
         self.len += 1;
     }
-    pub(crate) fn iter<'a>(&'a self)->StackIterator<'a, T>{
-        StackIterator { node: self.last, phantom:PhantomData{} }
+    pub(crate) fn iter<'a>(&'a self) -> StackIterator<'a, T> {
+        StackIterator {
+            node: self.last,
+            phantom: PhantomData {},
+        }
     }
     pub(crate) fn last<'a>(&'a self) -> Option<&'a T> {
         unsafe {
@@ -115,7 +118,6 @@ impl<T> Drop for Stack<T> {
         }
     }
 }
-
 
 pub(crate) fn dummy_convert_ref<T: 'static, U: 'static>(x: &T) -> &U {
     if TypeId::of::<T>() == TypeId::of::<U>() {

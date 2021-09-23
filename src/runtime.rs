@@ -623,6 +623,19 @@ impl RuntimeInner {
             assert!(v.value.to_bool());
             Ok(())
         });
+        self.add_function("rawget".into(), |ctx| {
+            let table = ctx.arg_or_nil(0);
+            let key = ctx.arg_or_nil(1);
+            ctx.ret(0, ValueRef::new(ctx.state.table_rawget(table.value, key.value)?));
+            Ok(())
+        });
+        self.add_function("rawset".into(), |ctx| {
+            let table = ctx.arg_or_nil(0);
+            let key = ctx.arg_or_nil(1);
+            let value = ctx.arg_or_nil(2);
+            ctx.state.table_rawset(table.value, key.value, value.value)?;
+            Ok(())
+        });
         self.add_function("type".into(), |ctx| {
             let v = ctx.arg(0).unwrap();
             ctx.ret(0, ctx.create_string(String::from(v.type_of())));

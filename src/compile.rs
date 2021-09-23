@@ -43,6 +43,15 @@ struct SymbolTable {
     func_scope: usize,
     parent: *mut SymbolTable,
 }
+#[derive(Clone, Copy)]
+struct CompileExprExtra {
+    n_expect_values: u8,
+}
+impl Default for CompileExprExtra {
+    fn default() -> Self {
+        Self { n_expect_values: 1 }
+    }
+}
 impl SymbolTable {
     fn set(&mut self, var: String, info: VarInfo) {
         self.vars.insert(var, info);
@@ -272,7 +281,7 @@ impl Compiler {
             _ => false,
         }
     }
-    fn load_identifier(&mut self, name:&String)-> Result<(), CompileError>{
+    fn load_identifier(&mut self, name: &String) -> Result<(), CompileError> {
         self.resolve_upvalue(name);
         if let Some(info) = self.symbols.get(name).map(|x| *x) {
             if info.is_upvalue {
@@ -300,9 +309,12 @@ impl Compiler {
         }
         Ok(())
     }
-    fn compile_expr(&mut self, expr: &Expr) -> Result<(), CompileError> {
+    fn compile_expr(&mut self, expr: &Expr, ext: CompileExprExtra) -> Result<(), CompileError> {
         match expr {
-            Expr::VarArgs { token } => unimplemented!(),
+            Expr::ParenExpr { expr, .. } => {
+                self.compile_expr(expr, CompileExprExtra { n_expect_values: 1 })
+            }
+            Expr::VarArgs { token:_ } => self.load_identifier(&"...".into()),
             Expr::Const { token } => match token {
                 Token::Keyword { value, .. } => {
                     match value.as_str() {
@@ -344,19 +356,19 @@ impl Compiler {
                 let opcode = match op {
                     Token::Keyword { value, .. } => match value.as_str() {
                         "and" => {
-                            self.compile_expr(lhs)?;
+                            self.compile_expr(lhs, Default::default())?;
                             self.emit(ByteCode::Op3U8(OpCode::TestJump, [0, 0, 1]));
                             let l = self.new_label();
                             self.emit(ByteCode::Label(l.to_le_bytes()));
-                            self.compile_expr(rhs)?;
+                            self.compile_expr(rhs, Default::default())?;
                             self.emit_label(l);
                             return Ok(());
                         }
                         "or" => {
-                            self.compile_expr(lhs)?;
+                            self.compile_expr(lhs, Default::default())?;
                             self.emit(ByteCode::Op3U8(OpCode::TestJump, [1, 0, 1]));
                             let l = self.new_label();
-                            self.compile_expr(rhs)?;
+                            self.compile_expr(rhs, Default::default())?;
                             self.emit_label(l);
                             return Ok(());
                         }
@@ -382,13 +394,13 @@ impl Compiler {
                     _ => unreachable!(),
                 };
 
-                self.compile_expr(lhs)?;
-                self.compile_expr(rhs)?;
+                self.compile_expr(lhs, Default::default())?;
+                self.compile_expr(rhs, Default::default())?;
                 self.emit(ByteCode::Op(opcode));
                 Ok(())
             }
             Expr::UnaryExpr { op, arg } => {
-                self.compile_expr(arg)?;
+                self.compile_expr(arg, Default::default())?;
                 let opcode = match op {
                     Token::Symbol { value, .. } => match value.as_str() {
                         "~" => OpCode::BitwiseNot,
@@ -409,14 +421,14 @@ impl Compiler {
                             token: Token::String { value, .. },
                         } => {
                             let idx = self.string_pool_index(value);
-                            self.compile_expr(lhs)?;
+                            self.compile_expr(lhs, Default::default())?;
                             self.emit(ByteCode::Op3U8(OpCode::LoadTableStringKey, get_3xu8(idx)));
                         }
                         _ => unreachable!(),
                     }
                 } else {
-                    self.compile_expr(rhs)?;
-                    self.compile_expr(lhs)?;
+                    self.compile_expr(rhs, Default::default())?;
+                    self.compile_expr(lhs, Default::default())?;
                     self.emit(ByteCode::Op(OpCode::LoadTable));
                 }
                 Ok(())
@@ -432,16 +444,24 @@ impl Compiler {
                 };
                 self.push_string(name);
 
-                self.compile_expr(lhs)?;
+                self.compile_expr(lhs, Default::default())?;
                 self.emit(ByteCode::Op(OpCode::LoadTable));
                 Ok(())
             }
             Expr::CallExpr { callee, args } => {
-                for arg in args.iter().rev() {
-                    self.compile_expr(&**arg)?;
+                for (i, arg) in args.iter().rev().enumerate() {
+                    self.compile_expr(
+                        &**arg,
+                        CompileExprExtra {
+                            n_expect_values: if i == 0 { u8::MAX } else { 1 },
+                        },
+                    )?;
                 }
-                self.compile_expr(&*callee)?;
-                self.emit(ByteCode::Op3U8(OpCode::Call, [args.len() as u8, 0, 0]));
+                self.compile_expr(&*callee, Default::default())?;
+                self.emit(ByteCode::Op3U8(
+                    OpCode::Call,
+                    [args.len() as u8, ext.n_expect_values, 0],
+                ));
                 Ok(())
             }
             Expr::MethodCallExpr {
@@ -450,60 +470,94 @@ impl Compiler {
                 args,
             } => {
                 // todo!()
-                for arg in args.iter().rev() {
-                    self.compile_expr(&**arg)?;
+                for (i, arg) in args.iter().rev().enumerate() {
+                    self.compile_expr(
+                        &**arg,
+                        CompileExprExtra {
+                            n_expect_values: if i == 0 { u8::MAX } else { 1 },
+                        },
+                    )?;
                 }
-                self.compile_expr(callee)?;
+                self.compile_expr(callee, Default::default())?;
                 let method = match method {
                     Token::Identifier { value, .. } => value,
                     _ => unreachable!(),
                 };
                 self.push_string(method);
                 self.emit(ByteCode::Op(OpCode::Self_));
-                self.emit(ByteCode::Op3U8(OpCode::Call, [args.len() as u8 + 1, 0, 0]));
+                self.emit(ByteCode::Op3U8(
+                    OpCode::Call,
+                    [args.len() as u8 + 1, ext.n_expect_values, 0],
+                ));
                 Ok(())
             }
             Expr::FunctionExpr { loc, args, body } => {
                 self.compile_function(None, args, body, FunctionLocation::Stack)
             }
             Expr::Table { loc: _, fields } => {
-                let n_arrays = fields
+                let array: Vec<_> = fields
                     .iter()
                     .filter(|f| match f {
                         TableField::ArrayEntry(_) => true,
                         _ => false,
                     })
-                    .count();
-                let n_hash = fields.len() - n_arrays;
-                let n_arrays: u16 = n_arrays.min(u16::MAX as usize).try_into().unwrap();
+                    .collect();
+                let table: Vec<_> = fields
+                    .iter()
+                    .filter(|f| match f {
+                        TableField::ArrayEntry(_) => false,
+                        _ => true,
+                    })
+                    .collect();
                 self.emit(ByteCode::Op3U8(
                     OpCode::NewTable,
                     [
-                        n_arrays.to_le_bytes()[0],
-                        n_arrays.to_le_bytes()[1],
-                        log_2(n_hash).unwrap_or(0).try_into().unwrap(),
+                        (array.len() as u32).to_le_bytes()[0],
+                        (table.len() as u32).to_le_bytes()[1],
+                        log_2(table.len()).unwrap_or(0).try_into().unwrap(),
                     ],
                 ));
-                let mut array_entry_cnt = 1;
-                for field in fields {
+                {
+                    self.emit(ByteCode::Op(OpCode::Dup));
+                    for (i, el) in array.iter().enumerate() {
+                        match el {
+                            TableField::ArrayEntry(v) => {
+                                self.compile_expr(
+                                    v,
+                                    CompileExprExtra {
+                                        n_expect_values: if i + 1 == array.len() {
+                                            u8::MAX
+                                        } else {
+                                            1
+                                        },
+                                    },
+                                )?;
+                            }
+                            _ => unreachable!(),
+                        }
+                    }
+                    self.emit(ByteCode::Op3U8(
+                        OpCode::StoreTableArray,
+                        get_3xu8(array.len() as u32),
+                    ));
+                }
+                for field in table {
                     self.emit(ByteCode::Op(OpCode::Dup));
                     match field {
                         TableField::ExprPair(k, v) => {
-                            self.compile_expr(v)?;
-                            self.compile_expr(k)?;
+                            self.compile_expr(v, Default::default())?;
+                            self.compile_expr(k, Default::default())?;
                         }
                         TableField::NamePair(k, v) => {
                             let name = match k {
                                 Token::Identifier { value, .. } => value,
                                 _ => unreachable!(),
                             };
-                            self.compile_expr(v)?;
+                            self.compile_expr(v, Default::default())?;
                             self.push_string(name);
                         }
                         TableField::ArrayEntry(x) => {
-                            self.compile_expr(x)?;
-                            self.push_number(array_entry_cnt as f64);
-                            array_entry_cnt += 1;
+                            unreachable!()
                         }
                     };
                     self.emit(ByteCode::Op(OpCode::RotBCA));
@@ -527,12 +581,79 @@ impl Compiler {
         );
         self.symbols.n_locals += 1;
     }
+    fn compile_assign(
+        &mut self,
+        loc: &SourceLocation,
+        lhs: &Vec<Rc<Expr>>,
+        rhs: &Vec<Rc<Expr>>,
+        is_local_var_def: bool,
+    ) -> Result<(), CompileError> {
+        if lhs.len() >= u8::MAX as usize - 1 || rhs.len() >= u8::MAX as usize - 1 {
+            return Err(CompileError {
+                loc: loc.clone(),
+                kind: ErrorKind::TooManyLocals,
+                msg: "number of variables in assignment exceed limit (u8::MAX - 1)".into(),
+            });
+        }
+        let n_vars = lhs.len();
+        let is_last_expr_call = if let Some(e) = rhs.last() {
+            match &**e {
+                Expr::CallExpr { .. } => true,
+                Expr::MethodCallExpr { .. } => true,
+                _ => false,
+            }
+        } else {
+            false
+        };
+        for (i, e) in rhs.iter().enumerate() {
+            if i + 1 < rhs.len() {
+                self.compile_expr(e, Default::default())?;
+            } else {
+                if n_vars >= rhs.len() {
+                    self.compile_expr(
+                        e,
+                        CompileExprExtra {
+                            n_expect_values: (n_vars + 1 - rhs.len()) as u8,
+                        },
+                    )?;
+                } else {
+                    self.compile_expr(e, Default::default())?;
+                    self.emit(ByteCode::Op(OpCode::Pop));
+                }
+            }
+        }
+        if !is_last_expr_call && rhs.len() < n_vars {
+            for _ in rhs.len()..n_vars {
+                self.emit(ByteCode::Op(OpCode::LoadNil));
+            }
+        }
+        if is_local_var_def {
+            for var in lhs {
+                match &**var {
+                    Expr::Identifier { token } => {
+                        let name = match token {
+                            Token::Identifier { value, .. } => value,
+                            _ => unreachable!(),
+                        };
+                        // if let None = self.symbols.get_cur(name) {
+                        self.add_var(name.clone());
+                        // }
+                    }
+                    _ => unreachable!(),
+                };
+            }
+        }
+        for var in lhs.iter().rev() {
+            self.emit_store(var)?;
+        }
+        Ok(())
+    }
     fn compile_stmt(&mut self, block: &Stmt) -> Result<(), CompileError> {
         match &*block {
             Stmt::Return { loc: _, expr } => {
-                if let Some(expr) = expr {
-                    self.compile_expr(&*expr)?;
-                    match &**expr {
+                if expr.len() == 1 {
+                    self.compile_expr(&expr[0], Default::default())?;
+                    match &*expr[0] {
                         Expr::CallExpr { .. } => {
                             let last = *self.module.code.last().unwrap();
                             match last {
@@ -547,31 +668,77 @@ impl Compiler {
                         }
                         _ => {}
                     }
-                } else {
+                } else if expr.is_empty() {
                     self.emit(ByteCode::Op(OpCode::LoadNil));
+                } else {
+                    for e in expr {
+                        self.compile_expr(e, Default::default())?;
+                    }
+                    self.emit(ByteCode::Op3U8(OpCode::Pack, get_3xu8(expr.len() as u32)));
                 }
                 self.emit(ByteCode::Op(OpCode::Return));
                 Ok(())
             }
-            Stmt::LocalVar { loc: _, vars } => match &**vars {
+            Stmt::LocalVar { loc, vars } => match &**vars {
                 Stmt::Assign { lhs, rhs, .. } => {
-                    assert!(lhs.len() == 1 && rhs.len() == 1);
-                    self.compile_expr(&*rhs[0])?;
-                    for var in lhs {
-                        match &**var {
-                            Expr::Identifier { token } => {
-                                let name = match token {
-                                    Token::Identifier { value, .. } => value,
-                                    _ => unreachable!(),
-                                };
-                                // if let None = self.symbols.get_cur(name) {
-                                self.add_var(name.clone());
-                                // }
-                            }
-                            _ => unreachable!(),
-                        };
-                    }
-                    self.emit_store(&*lhs[0])
+                    // if lhs.len() >= u8::MAX as usize - 1 || rhs.len() >= u8::MAX as usize - 1 {
+                    //     return Err(CompileError {
+                    //         loc: loc.clone(),
+                    //         kind: ErrorKind::TooManyLocals,
+                    //         msg: "number of variables in assignment exceed limit (u8::MAX - 1)"
+                    //             .into(),
+                    //     });
+                    // }
+                    // assert!(lhs.len() == 1 && rhs.len() == 1);
+                    // self.compile_expr(&*rhs[0], Default::default())?;
+                    // for var in lhs {
+                    //     match &**var {
+                    //         Expr::Identifier { token } => {
+                    //             let name = match token {
+                    //                 Token::Identifier { value, .. } => value,
+                    //                 _ => unreachable!(),
+                    //             };
+                    //             // if let None = self.symbols.get_cur(name) {
+                    //             self.add_var(name.clone());
+                    //             // }
+                    //         }
+                    //         _ => unreachable!(),
+                    //     };
+                    // }
+                    // self.emit_store(&*lhs[0])
+                    // let n_vars = lhs.len();
+                    // for (i, e) in rhs.iter().enumerate() {
+                    //     if i + 1 < rhs.len() {
+                    //         self.compile_expr(e, Default::default())?;
+                    //     } else {
+                    //         if n_vars >= rhs.len() {
+                    //             self.compile_expr(
+                    //                 e,
+                    //                 CompileExprExtra {
+                    //                     n_expect_values: (n_vars + 1 - rhs.len()) as u8,
+                    //                 },
+                    //             )?;
+                    //         } else {
+                    //             self.compile_expr(e, Default::default())?;
+                    //             self.emit(ByteCode::Op(OpCode::Pop));
+                    //         }
+                    //     }
+                    // }
+                    // for var in lhs.iter().rev() {
+                    //     match &**var {
+                    //         Expr::Identifier { token } => {
+                    //             let name = match token {
+                    //                 Token::Identifier { value, .. } => value,
+                    //                 _ => unreachable!(),
+                    //             };
+                    //             self.add_var(name.clone());
+                    //         }
+                    //         _ => unreachable!(),
+                    //     };
+                    //     self.emit_store(var)?;
+                    // }
+                    // Ok(())
+                    self.compile_assign(loc, lhs, rhs, true)
                 }
                 Stmt::Expr { expr, .. } => match &**expr {
                     Expr::Identifier { token, .. } => {
@@ -623,14 +790,14 @@ impl Compiler {
                 else_ifs,
                 else_,
             } => {
-                self.compile_expr(cond)?;
+                self.compile_expr(cond, Default::default())?;
                 self.emit(ByteCode::Op3U8(OpCode::TestJump, [0, 1, 1]));
                 let mut jmp_end = vec![];
                 let l = self.new_label();
                 self.emit(ByteCode::Label(l.to_le_bytes()));
                 self.compile_stmt(then)?;
                 for (cond, then) in else_ifs {
-                    self.compile_expr(cond)?;
+                    self.compile_expr(cond, Default::default())?;
                     self.emit(ByteCode::Op3U8(OpCode::TestJump, [0, 1, 1]));
                     let l = self.new_label();
                     self.emit(ByteCode::Label(l.to_le_bytes()));
@@ -654,7 +821,7 @@ impl Compiler {
             }
             Stmt::While { loc, cond, body } => {
                 let start = self.module.code.len();
-                self.compile_expr(cond)?;
+                self.compile_expr(cond, Default::default())?;
                 self.emit(ByteCode::Op3U8(OpCode::TestJump, [0, 1, 1]));
                 let l = self.new_label();
                 self.emit(ByteCode::Label(l.to_le_bytes()));
@@ -674,12 +841,13 @@ impl Compiler {
             } => todo!(),
             Stmt::ForIn { name, range, body } => todo!(),
             Stmt::Assign { loc, lhs, rhs } => {
-                assert!(lhs.len() == 1 && rhs.len() == 1);
-                self.compile_expr(&*rhs[0])?;
-                self.emit_store(&*lhs[0])
+                // assert!(lhs.len() == 1 && rhs.len() == 1);
+                // self.compile_expr(&*rhs[0], Default::default())?;
+                // self.emit_store(&*lhs[0])
+                self.compile_assign(loc, lhs, rhs, false)
             }
             Stmt::Expr { loc, expr } => {
-                self.compile_expr(expr)?;
+                self.compile_expr(expr, Default::default())?;
                 self.emit(ByteCode::Op(OpCode::Pop));
                 Ok(())
             }
@@ -854,17 +1022,23 @@ impl Compiler {
                     if let Some(method) = method {
                         for (_i, acc) in access_chain.iter().enumerate() {
                             let idx = self.string_pool_index(*acc);
-                            self.emit(ByteCode::Op3U8(OpCode::LoadTableStringKey,get_3xu8(idx)));
+                            self.emit(ByteCode::Op3U8(OpCode::LoadTableStringKey, get_3xu8(idx)));
                         }
                         let idx = self.string_pool_index(method);
-                        self.emit(ByteCode::Op3U8(OpCode::StoreTableStringKey,get_3xu8(idx)));
+                        self.emit(ByteCode::Op3U8(OpCode::StoreTableStringKey, get_3xu8(idx)));
                     } else {
                         for (i, acc) in access_chain.iter().enumerate() {
                             let idx = self.string_pool_index(*acc);
                             if i != access_chain.len() - 1 {
-                                self.emit(ByteCode::Op3U8(OpCode::LoadTableStringKey,get_3xu8(idx)));
+                                self.emit(ByteCode::Op3U8(
+                                    OpCode::LoadTableStringKey,
+                                    get_3xu8(idx),
+                                ));
                             } else {
-                                self.emit(ByteCode::Op3U8(OpCode::StoreTableStringKey,get_3xu8(idx)));
+                                self.emit(ByteCode::Op3U8(
+                                    OpCode::StoreTableStringKey,
+                                    get_3xu8(idx),
+                                ));
                             }
                         }
                     }
@@ -940,15 +1114,15 @@ impl Compiler {
                         self.emit(ByteCode::Op3U8(OpCode::LoadLocal, get_3xu8(info.location)));
                     }
                     let idx = self.string_pool_index(name);
-                    self.emit(ByteCode::Op3U8(OpCode::StoreTableStringKey,get_3xu8(idx)));
+                    self.emit(ByteCode::Op3U8(OpCode::StoreTableStringKey, get_3xu8(idx)));
                 }
                 Ok(())
             }
             // Expr::BinaryExpr { op, lhs, rhs } => todo!(),
             // Expr::UnaryExpr { op, arg } => todo!(),
             Expr::IndexExpr { loc: _, lhs, rhs } => {
-                self.compile_expr(rhs)?;
-                self.compile_expr(lhs)?;
+                self.compile_expr(rhs, Default::default())?;
+                self.compile_expr(lhs, Default::default())?;
                 self.emit(ByteCode::Op(OpCode::StoreTable));
                 Ok(())
             }
@@ -963,7 +1137,7 @@ impl Compiler {
                 };
                 self.push_string(name);
 
-                self.compile_expr(lhs)?;
+                self.compile_expr(lhs, Default::default())?;
                 self.emit(ByteCode::Op(OpCode::StoreTable));
                 Ok(())
             }
@@ -1045,9 +1219,13 @@ impl Compiler {
     }
     fn leave_scope(&mut self, function_scope: bool) {
         unsafe {
+            let n_locals = self.symbols.n_locals;
             let parent = self.symbols.parent;
             std::mem::swap(&mut self.symbols, parent.as_mut().unwrap());
             Box::from_raw(parent);
+            if !function_scope {
+                self.symbols.n_locals = n_locals;
+            }
         }
         if function_scope {
             self.funcs.pop().unwrap();

@@ -1,21 +1,16 @@
+use smallvec::{smallvec, SmallVec};
+
 use crate::{
     api::{BaseApi, CallApi, StateApi},
-    bytecode::ByteCode,
-    closure::{Callable, Closure},
+    closure::{Closure},
     gc::{Gc, GcState, Traceable},
     runtime::{ConstantsIndex, ErrorKind, RuntimeError, ValueRef},
     table::Table,
-    value::{Managed, ManagedCell, Tuple, TupleUnpack, UserData, Value},
+    value::{Managed, Tuple, UserData, Value},
     vm::Instance,
     Stack,
 };
-use std::{
-    any::TypeId,
-    cell::{Cell, RefCell, UnsafeCell},
-    cmp::Ordering,
-    marker::PhantomData,
-    rc::{Rc, Weak},
-};
+use std::{cell::{Cell, RefCell}, cmp::Ordering, rc::{Rc, Weak}};
 
 pub const MAX_LOCALS: usize = 256;
 pub(crate) struct Frame {
@@ -134,7 +129,7 @@ macro_rules! int_binary_op_impl {
 pub struct CallContext<'a> {
     pub(crate) state: &'a State,
     pub(crate) instance: &'a Instance,
-    pub(crate) ret_values: RefCell<Vec<Value>>,
+    pub(crate) ret_values: RefCell<SmallVec<[Value; 8]>>,
     pub(crate) frames: &'a Stack<Frame>,
 }
 
@@ -157,11 +152,11 @@ impl<'a> Drop for CallContext<'a> {
         } else if ret_values.len() == 1 {
             ret_values[0]
         } else {
-            let rv = std::mem::replace(&mut *ret_values, vec![]);
+            let rv = std::mem::replace(&mut *ret_values, smallvec![]);
             Value::Tuple(self.state.gc.allocate(Tuple {
-                values: rv,
-                unpack: TupleUnpack::TruncateFill,
+                values: RefCell::new(rv),
                 metatable: Cell::new(Value::Nil),
+                flag:crate::value::TupleFlag::VarArgs,
             }))
         };
         let mut st = self.state.eval_stack.borrow_mut();
@@ -194,6 +189,47 @@ impl State {
     //         Value::nil()
     //     }
     // }
+    pub(crate) fn table_rawget(&self, table: Value, key: Value) -> Result<Value, RuntimeError> {
+        let table = match table.as_table() {
+            Some(x) => x,
+            None => {
+                return Err(RuntimeError {
+                    kind: ErrorKind::TypeError,
+                    msg: format!(
+                        " attempt to index a {} value, key:{}",
+                        table.type_of(),
+                        key.print()
+                    ),
+                })
+            }
+        };
+        let table = table.borrow();
+        Ok(table.get(key))
+    }
+    pub(crate) fn table_rawset(
+        &self,
+        table: Value,
+        key: Value,
+        value: Value,
+    ) -> Result<(), RuntimeError> {
+        let table = match table.as_table() {
+            Some(x) => x,
+            None => {
+                return Err(RuntimeError {
+                    kind: ErrorKind::TypeError,
+                    msg: format!(
+                        " attempt to index a {} value, key:{}, value:{}",
+                        table.type_of(),
+                        key.print(),
+                        value.print()
+                    ),
+                })
+            }
+        };
+        let mut table = table.borrow_mut();
+        table.set(key, value);
+        Ok(())
+    }
     pub(crate) fn table_get(&self, mut table: Value, key: Value) -> Result<Value, RuntimeError> {
         loop {
             let (value, mt) = {
@@ -322,7 +358,14 @@ impl State {
         binary_op_impl!(self,%, a,b,MtKeyMod)
     }
     pub(crate) fn pow(&self, a: Value, b: Value) -> Result<Value, RuntimeError> {
-        binary_op_impl_closue!(self, |a:f64, b:f64|->f64 {a.powf(b)}, "^", a, b, MtKeyPow)
+        binary_op_impl_closue!(
+            self,
+            |a: f64, b: f64| -> f64 { a.powf(b) },
+            "^",
+            a,
+            b,
+            MtKeyPow
+        )
     }
     pub(crate) fn bitwise_and(&self, a: Value, b: Value) -> Result<Value, RuntimeError> {
         int_binary_op_impl!(&, a, b)
@@ -426,7 +469,7 @@ impl State {
             Value::String(x) => Ok(Value::from_number((*x).data.len() as f64)),
             // Value::Closure(_) => todo!(),
             // Value::Callable(_) => todo!(),
-            Value::Tuple(x) => Ok(Value::from_number((*x).values.len() as f64)),
+            Value::Tuple(x) => Ok(Value::from_number((*x).values.borrow().len() as f64)),
             _ => Err(RuntimeError {
                 kind: ErrorKind::ArithmeticError,
                 msg: format!(" attempt to get length of a {} value", a.type_of(),),
@@ -434,7 +477,7 @@ impl State {
         }
     }
     pub(crate) fn not(&self, a: Value) -> Result<Value, RuntimeError> {
-        Ok(Value::from_bool(!a.to_bool()))
+        Ok(Value::from_bool(!a.to_bool())) 
     }
     pub(crate) fn bitwise_not(&self, a: Value) -> Result<Value, RuntimeError> {
         match a {

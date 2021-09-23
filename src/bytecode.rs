@@ -50,7 +50,9 @@ pub enum OpCode {
     LoadStr,
     LoadLocal,  // PUSH  local[i]
     StoreLocal, // local[i] = TOS;POP
+    Pack,
     Unpack,     // Unpack TOS to n values,
+    StoreTableArray, 
     LoadTableStringKey, 
     StoreTableStringKey,
 

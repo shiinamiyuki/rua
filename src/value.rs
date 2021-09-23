@@ -7,6 +7,7 @@ use std::{
 };
 
 use ordered_float::OrderedFloat;
+use smallvec::SmallVec;
 
 use crate::{
     bytecode::ByteCodeModule,
@@ -52,48 +53,22 @@ impl Traceable for Box<dyn UserData> {
         self.as_ref().trace(gc)
     }
 }
-
-/*
-function f(x) return 1,2 end
-function g(x) return tuple(1,2) end
-
-x,y = f(x) -- x:1, y:2
-x,y = g(x) -- x:tuple(1,2), y:nil
-x,y = tuple.unpack(f(x)) -- x:1,y:2
-x,y = tuple.unpack(g(x)) -- x:1,y:2
-
-x,y = tuple(1,2) -- x: tuple(1,2), y:nil
-x,y= tuple.unpack(tuple(1, 2)) -- good
-x = tuple.unpack(tuple(1,2)) --error
-
-Exact unpack:
-Upon assignment and paremeter passing, tuple is treated as in Python
-tuple(args...) is always Exact
-args, ... = tuple.unpack(values, ...) is always Exact
-
-TruncateFill:
-Upon assignment and paremeter passing, tuple is treated as in Lua
-args... is always TruncateFill
-args, ... = values, ... is always TruncateFill
-
-unpack(tuple) does unpacking as if tuple were TruncateFill
-
-tuple.unpack(tuple) does unpacking as if tuple were Exact
-
-*/
-#[derive(Clone, Copy)]
-pub enum TupleUnpack {
-    Exact,
-    TruncateFill,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub(crate) enum TupleFlag{
+    Empty,
+    VarArgs,
 }
+
 pub struct Tuple {
-    pub(crate) values: Vec<Value>,
-    pub(crate) unpack: TupleUnpack,
+    pub(crate) values: RefCell<SmallVec<[Value; 8]>>,
     pub(crate) metatable: Cell<Value>,
+    pub(crate) flag:TupleFlag,
 }
 impl Traceable for Tuple {
     fn trace(&self, gc: &GcState) {
-        for v in &self.values {
+        let values = self.values.borrow();
+        for v in values.iter() {
             gc.trace(v);
         }
         gc.trace(&self.metatable.get());
@@ -313,7 +288,8 @@ impl Value {
             }
             Value::Tuple(tuple) => {
                 let mut s = String::from("(");
-                for (i, v) in (*tuple).values.iter().enumerate() {
+                let values = tuple.values.borrow();
+                for (i, v) in values.iter().enumerate() {
                     if i > 0 {
                         s.push(',');
                     }

@@ -1,20 +1,20 @@
-use std::{
-    cell::{Cell, RefCell, RefMut},
-    collections::HashMap,
-    iter::FromIterator,
-    rc::Rc,
-};
-
 use crate::{
     api::{BaseApi, StateApi},
-    bytecode::{u32_from_3xu8, ByteCode, ByteCodeModule, OpCode},
+    bytecode::{get_3xu8, u32_from_3xu8, ByteCode, ByteCodeModule, OpCode},
     closure::{Callable, Closure, UpValue, UpValueInner},
     gc::{Gc, GcState, Traceable},
     runtime::{ErrorKind, RuntimeError, RuntimeInner, ValueRef},
     state::{CallContext, Frame, State},
     table::Table,
-    value::{Managed, ManagedCell, Value},
+    value::{Managed, ManagedCell, Tuple, TupleFlag, Value},
     Stack,
+};
+use smallvec::smallvec;
+use std::{
+    cell::{Cell, RefCell, RefMut},
+    collections::HashMap,
+    iter::FromIterator,
+    rc::Rc,
 };
 
 /*
@@ -28,8 +28,8 @@ pub struct Instance {
 
 enum Continue {
     Return,
-    NewFrame(Frame),
-    CallExt(Gc<Box<dyn Callable>>, Frame),
+    NewFrame(Frame, u8),
+    CallExt(Gc<Box<dyn Callable>>, Frame, u8),
 }
 macro_rules! new_frame {
     ($eval_stack:expr, $n_args:expr,$closure:expr) => {{
@@ -99,7 +99,7 @@ impl Instance {
                         instance: self,
                         state: &self.state,
                         frames: &*frames,
-                        ret_values: RefCell::new(vec![]),
+                        ret_values: RefCell::new(smallvec![]),
                     };
                     let func = { &(*callable) };
                     func.call(&ctx)?;
@@ -119,7 +119,7 @@ impl Instance {
             }),
         }
     }
-    fn exec_frame(&self, state: &State) -> Result<Continue, RuntimeError> {
+    fn exec_frame(&self, state: &State, mut n_expected_rets: u8) -> Result<Continue, RuntimeError> {
         let mut guard = RetGuard { bomb: false };
         let cur_closure = {
             let mut frames = state.frames.borrow_mut();
@@ -346,11 +346,73 @@ impl Instance {
                         ip = addr as usize;
                     }
                     OpCode::Return => {
+                        assert!(n_expected_rets > 0);
+                        if n_expected_rets != u8::MAX {
+                            let ret = *eval_stack.last().unwrap();
+                            match ret {
+                                Value::Tuple(tuple) => {
+                                    if tuple.flag == TupleFlag::VarArgs {
+                                        eval_stack.pop();
+                                        let values = tuple.values.borrow();
+                                        for i in 0..(n_expected_rets as usize).min(values.len()) {
+                                            eval_stack.push(values[i]);
+                                        }
+                                        for _ in values.len()..(n_expected_rets as usize) {
+                                            eval_stack.push(Value::Nil);
+                                        }
+                                    }
+                                }
+                                _ => {
+                                    if n_expected_rets > 1 {
+                                        for _ in 1..n_expected_rets {
+                                            eval_stack.push(Value::Nil);
+                                        }
+                                    }
+                                }
+                            };
+                            // *eval_stack.last_mut().unwrap() = ret;
+                        }
                         break;
                     }
                     _ => panic!("unreachable, instruction is {:#?}", instruction),
                 },
                 ByteCode::Op3U8(op, operands) => match op {
+                    // OpCode::Unpack => {
+                    //     let cnt = u32_from_3xu8(operands) as usize;
+                    //     let v = eval_stack.pop().unwrap();
+                    //     match v {
+                    //         Value::Tuple(t) => {
+                    //             if t.flag == TupleFlag::VarArgs {
+
+                    //             } else {
+                    //                 eval_stack.push(v);
+                    //                 for _ in 1..cnt {
+                    //                     eval_stack.push(Value::Nil);
+                    //                 }
+                    //             }
+                    //         }
+                    //         _ => {
+                    //             eval_stack.push(v);
+                    //             for _ in 1..cnt {
+                    //                 eval_stack.push(Value::Nil);
+                    //             }
+                    //         }
+                    //     }
+                    // }
+                    OpCode::Pack => {
+                        let cnt = u32_from_3xu8(operands) as usize;
+                        let mut tv = smallvec![];
+                        for i in 0..cnt {
+                            tv.push(eval_stack[eval_stack.len() + i - cnt]);
+                        }
+                        let st_len = eval_stack.len() - cnt;
+                        eval_stack.resize(st_len, Value::Nil);
+                        eval_stack.push(Value::Tuple(self.gc.allocate(Tuple {
+                            values: RefCell::new(tv),
+                            flag: TupleFlag::VarArgs,
+                            metatable: Cell::new(Value::nil()),
+                        })));
+                    }
                     OpCode::NewTable => {
                         let n_array = u16::from_le_bytes([operands[0], operands[1]]) as usize;
                         let n_hash = operands[2] as usize;
@@ -368,7 +430,7 @@ impl Instance {
                         // eval_stack
                         // .push(state.create_string(module.string_pool[idx as usize].clone()));
                     }
-                    OpCode::LoadTableStringKey=>{
+                    OpCode::LoadTableStringKey => {
                         let table = eval_stack.pop().unwrap();
                         let idx = u32_from_3xu8(operands);
                         let key = module.string_pool_cache[idx as usize];
@@ -377,7 +439,7 @@ impl Instance {
                         let mut eval_stack = state.eval_stack.borrow_mut();
                         eval_stack.push(v);
                     }
-                    OpCode::StoreTableStringKey=>{
+                    OpCode::StoreTableStringKey => {
                         let table = eval_stack.pop().unwrap();
                         let value = eval_stack.pop().unwrap();
                         let idx = u32_from_3xu8(operands);
@@ -416,6 +478,50 @@ impl Instance {
                         let frame = frames.last_mut().unwrap();
                         frame.locals[idx as usize] = eval_stack.pop().unwrap();
                     }
+                    OpCode::StoreTableArray => {
+                        let cnt = u32_from_3xu8(operands);
+                        let table = eval_stack[eval_stack.len() - cnt as usize - 1];
+                        if cnt > 0 {
+                            for i in 0..(cnt - 1) {
+                                self.state.table_rawset(
+                                    table,
+                                    Value::from_number((i + 1) as f64),
+                                    eval_stack[eval_stack.len() + i as usize - cnt as usize],
+                                )?;
+                            }
+                            let last = eval_stack[eval_stack.len() - 1];
+                            match last {
+                                Value::Tuple(tuple) => match tuple.flag {
+                                    crate::value::TupleFlag::Empty => {
+                                        self.state.table_rawset(
+                                            table,
+                                            Value::from_number(cnt as f64),
+                                            last,
+                                        )?;
+                                    }
+                                    crate::value::TupleFlag::VarArgs => {
+                                        let values = tuple.values.borrow();
+                                        for (i, v) in values.iter().enumerate() {
+                                            self.state.table_rawset(
+                                                table,
+                                                Value::from_number((cnt + i as u32) as f64),
+                                                *v,
+                                            )?;
+                                        }
+                                    }
+                                },
+                                _ => {
+                                    self.state.table_rawset(
+                                        table,
+                                        Value::from_number(cnt as f64),
+                                        last,
+                                    )?;
+                                }
+                            }
+                        }
+                        let len = eval_stack.len();
+                        eval_stack.resize(len - cnt as usize - 1, Value::Nil);
+                    }
                     OpCode::TailCall => {
                         let n_args = operands[0] as usize;
                         let func = eval_stack.pop().unwrap();
@@ -431,6 +537,7 @@ impl Instance {
                                 frame.n_args = n_args;
                                 let len = eval_stack.len();
                                 eval_stack.resize(len - n_args, Value::nil());
+                                n_expected_rets = operands[1];
                             }
                             Value::Callable(callable) => {
                                 ip += 1;
@@ -440,7 +547,7 @@ impl Instance {
                                 }
                                 let len = eval_stack.len();
                                 eval_stack.resize(len - n_args, Value::nil());
-                                on_return!(Ok(Continue::CallExt(callable, frame)));
+                                on_return!(Ok(Continue::CallExt(callable, frame, operands[1])));
                             }
                             _ => unreachable!(),
                         }
@@ -452,12 +559,12 @@ impl Instance {
                             Value::Closure(closure) => {
                                 ip += 1;
                                 let frame = new_frame!(eval_stack, n_args, Some(closure));
-                                on_return!(Ok(Continue::NewFrame(frame)));
+                                on_return!(Ok(Continue::NewFrame(frame, operands[1])));
                             }
                             Value::Callable(callable) => {
                                 ip += 1;
                                 let frame = new_frame!(eval_stack, n_args, None);
-                                on_return!(Ok(Continue::CallExt(callable, frame)));
+                                on_return!(Ok(Continue::CallExt(callable, frame, operands[1])));
                             }
                             _ => {
                                 on_return!(Err(RuntimeError {
@@ -606,10 +713,12 @@ impl Instance {
     }
 
     fn exec_frames_loop(&self, level: usize) -> Result<(), RuntimeError> {
+        let mut n_expected_rets = 1;
         loop {
-            let cont = self.exec_frame(&self.state)?;
+            let cont = self.exec_frame(&self.state, n_expected_rets)?;
             match cont {
-                Continue::CallExt(callable, frame) => {
+                Continue::CallExt(callable, frame, n_expected_rets2) => {
+                    n_expected_rets = n_expected_rets2;
                     {
                         let mut frames = self.state.frames.borrow_mut();
                         frames.push(frame);
@@ -621,7 +730,7 @@ impl Instance {
                             instance: self,
                             state: &self.state,
                             frames: &*frames,
-                            ret_values: RefCell::new(vec![]),
+                            ret_values: RefCell::new(smallvec![]),
                         };
                         func.call(&ctx)?;
                     }
@@ -630,7 +739,8 @@ impl Instance {
                         frames.pop().unwrap();
                     }
                 }
-                Continue::NewFrame(frame) => {
+                Continue::NewFrame(frame, n_expected_rets2) => {
+                    n_expected_rets = n_expected_rets2;
                     let mut frames = self.state.frames.borrow_mut();
                     frames.push(frame);
                 }
