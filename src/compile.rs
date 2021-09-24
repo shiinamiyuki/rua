@@ -306,7 +306,7 @@ impl Compiler {
                                     name.clone(),
                                     VarInfo {
                                         func_scope: tab.func_scope,
-                                        location,
+                                        location:id,
                                         uid: info.uid,
                                         // is_on_stack: false,
                                         is_upvalue: true,
@@ -444,7 +444,7 @@ impl Compiler {
                         ">=" => OpCode::GreaterThanEqual,
                         ">" => OpCode::GreaterThan,
                         "==" => OpCode::Equal,
-                        "!=" => OpCode::NotEqual,
+                        "~=" => OpCode::NotEqual,
                         ".." => OpCode::Concat,
                         _ => unreachable!(),
                     },

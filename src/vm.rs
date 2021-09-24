@@ -163,7 +163,7 @@ impl Instance {
     }
     fn exec_frame(&self, state: &State, mut n_expected_rets: u8) -> Result<Continue, RuntimeError> {
         let mut guard = RetGuard { bomb: false };
-        let cur_closure = {
+         {
             let mut frames = state.frames.borrow_mut();
             let frame = frames.last_mut().unwrap();
             let closure = &frame.closure.unwrap();
@@ -185,8 +185,7 @@ impl Instance {
                         }
                     }
                 }
-            }
-            closure.clone()
+            } 
         };
         let (mut ip, code_len, module) = {
             let mut frames = state.frames.borrow_mut();
