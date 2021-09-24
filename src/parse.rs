@@ -56,9 +56,9 @@ pub enum Expr {
     Identifier {
         token: Token,
     },
-    ParenExpr{
-        loc:SourceLocation,
-        expr:Rc<Expr>,
+    ParenExpr {
+        loc: SourceLocation,
+        expr: Rc<Expr>,
     },
     BinaryExpr {
         op: Token,
@@ -102,7 +102,7 @@ impl Expr {
     #[allow(dead_code)]
     pub fn loc(&self) -> &SourceLocation {
         match self {
-            Expr::ParenExpr{loc,..}=>loc,
+            Expr::ParenExpr { loc, .. } => loc,
             Expr::VarArgs { token } => token.loc(),
             Expr::Literal { token } => token.loc(),
             Expr::Identifier { token } => token.loc(),
@@ -111,7 +111,7 @@ impl Expr {
             Expr::IndexExpr {
                 loc: _,
                 lhs,
-                rhs: _, 
+                rhs: _,
             } => lhs.loc(),
             Expr::DotExpr {
                 loc: _,
@@ -185,8 +185,8 @@ pub enum Stmt {
         body: Rc<Stmt>,
     },
     ForIn {
-        name: Token,
-        range: Rc<Expr>,
+        vars: Vec<Rc<Expr>>,
+        range: Vec<Rc<Expr>>,
         body: Rc<Stmt>,
     },
     Assign {
@@ -239,10 +239,10 @@ impl Stmt {
                 body: _,
             } => name.loc(),
             Stmt::ForIn {
-                name,
+                vars,
                 range: _,
                 body: _,
-            } => name.loc(),
+            } => vars[0].loc(),
             Stmt::Assign {
                 loc,
                 lhs: _,
@@ -729,9 +729,9 @@ impl Parser {
                 return Err(self.error(ErrorKind::SyntaxError, "expected ')'", loc));
             }
             self.advance(1);
-            Ok(Rc::new(Expr::ParenExpr{
-                loc:paren_loc,
-                expr:e
+            Ok(Rc::new(Expr::ParenExpr {
+                loc: paren_loc,
+                expr: e,
             }))
         } else {
             let token = self.peek().clone();
@@ -1145,10 +1145,7 @@ impl Parser {
             Ok(Rc::new(Stmt::Return { loc, expr: vec![] }))
         } else {
             let expr = self.parse_expr_list(true)?;
-            Ok(Rc::new(Stmt::Return {
-                loc,
-                expr,
-            }))
+            Ok(Rc::new(Stmt::Return { loc, expr }))
         }
     }
     fn parse_for_stmt(&mut self) -> Result<Rc<Stmt>, ParseError> {
@@ -1202,9 +1199,18 @@ impl Parser {
                 step,
                 body,
             }))
-        } else if self.has("in") {
+        } else {
+            self.pos -= 1;
+            let vars = self.parse_expr_list(true)?;
+            if !self.has("in") {
+                return Err(self.error(
+                    ErrorKind::SyntaxError,
+                    "expected 'in' in generic for loop",
+                    loc,
+                ));
+            }
             self.advance(1);
-            let range = self.parse_expr()?;
+            let range = self.parse_expr_list(true)?;
             let loc = self.peek().loc().clone();
             if !self.has("do") {
                 return Err(self.error(ErrorKind::SyntaxError, "expected 'do' in for", loc));
@@ -1216,15 +1222,16 @@ impl Parser {
                 return Err(self.error(ErrorKind::SyntaxError, "expected 'end' in for", loc));
             }
             self.advance(1);
-            Ok(Rc::new(Stmt::ForIn { range, body, name }))
-        } else {
-            let loc = self.peek().loc().clone();
-            Err(self.error(
-                ErrorKind::SyntaxError,
-                "expected 'in' or '=' in for loop",
-                loc,
-            ))
+            Ok(Rc::new(Stmt::ForIn { range, body, vars }))
         }
+        // else {
+        //     let loc = self.peek().loc().clone();
+        //     Err(self.error(
+        //         ErrorKind::SyntaxError,
+        //         "expected 'in' or '=' in for loop",
+        //         loc,
+        //     ))
+        // }
     }
     fn parse_while_stmt(&mut self) -> Result<Rc<Stmt>, ParseError> {
         assert!(self.has("while"));

@@ -135,6 +135,7 @@ pub struct CallContext<'a> {
     pub(crate) instance: &'a Instance,
     pub(crate) ret_values: RefCell<SmallVec<[Value; 8]>>,
     pub(crate) frames: &'a Stack<Frame>,
+    pub(crate) n_expected_rets: u8,
 }
 
 impl<'a> CallContext<'a> {
@@ -151,20 +152,28 @@ impl<'a> CallContext<'a> {
 impl<'a> Drop for CallContext<'a> {
     fn drop(&mut self) {
         let mut ret_values = self.ret_values.borrow_mut();
-        let ret = if ret_values.is_empty() {
-            Value::nil()
-        } else if ret_values.len() == 1 {
-            ret_values[0]
+        if self.n_expected_rets == u8::MAX {
+            let ret = if ret_values.is_empty() {
+                Value::nil()
+            } else if ret_values.len() == 1 {
+                ret_values[0]
+            } else {
+                let rv = std::mem::replace(&mut *ret_values, smallvec![]);
+                Value::Tuple(self.state.gc.allocate(Tuple {
+                    values: RefCell::new(rv),
+                    metatable: Cell::new(Value::Nil),
+                    flag: crate::value::TupleFlag::VarArgs,
+                }))
+            };
+            let mut st = self.state.eval_stack.borrow_mut();
+            st.push(ret);
         } else {
-            let rv = std::mem::replace(&mut *ret_values, smallvec![]);
-            Value::Tuple(self.state.gc.allocate(Tuple {
-                values: RefCell::new(rv),
-                metatable: Cell::new(Value::Nil),
-                flag: crate::value::TupleFlag::VarArgs,
-            }))
-        };
-        let mut st = self.state.eval_stack.borrow_mut();
-        st.push(ret);
+            ret_values.resize(self.n_expected_rets as usize, Value::Nil);
+            let mut st = self.state.eval_stack.borrow_mut();
+            for v in ret_values.iter() {
+                st.push(*v);
+            }
+        }
     }
 }
 impl State {

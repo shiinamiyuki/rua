@@ -141,6 +141,7 @@ impl Instance {
                         state: &self.state,
                         frames: &*frames,
                         ret_values: RefCell::new(smallvec![]),
+                        n_expected_rets:u8::MAX,
                     };
                     let func = { &(*callable) };
                     func.call(&ctx)?;
@@ -773,6 +774,7 @@ impl Instance {
                             instance: self,
                             state: &self.state,
                             frames: &*frames,
+                            n_expected_rets,
                             ret_values: RefCell::new(smallvec![]),
                         };
                         func.call(&ctx)?;

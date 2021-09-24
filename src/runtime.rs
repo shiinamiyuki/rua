@@ -709,14 +709,13 @@ impl RuntimeInner {
             )?;
             let table = table.borrow();
             let next = table.next(key.value)?;
-            ctx.ret(
-                0,
-                ValueRef {
-                    value: next,
-                    phantom: PhantomData {},
-                    prim: UnsafeCell::new(RustPrimitive::Unit),
-                },
-            );
+            let value = if !next.is_nil() {
+                table.get(next)
+            } else {
+                Value::Nil
+            };
+            ctx.ret(0, ValueRef::new(next));
+            ctx.ret(1, ValueRef::new(value));
             Ok(())
         });
         // let pself = self as *mut RuntimeInner;

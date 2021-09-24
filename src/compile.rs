@@ -145,7 +145,62 @@ struct Compiler {
     label_gen: u32,
     labels: HashMap<u32, usize>,
 }
-
+macro_rules! compile_assign_impl {
+    ($self:expr, $loc:expr, $lhs:expr, $rhs:expr, $is_local_var_def:expr,$handle_var_def:expr, $compile_lhs:expr) => {{
+        let loc = $loc;
+        let lhs = $lhs;
+        let rhs = $rhs;
+        let is_local_var_def = $is_local_var_def;
+        if lhs.len() >= u8::MAX as usize - 1 || rhs.len() >= u8::MAX as usize - 1 {
+            return Err(CompileError {
+                loc: loc.clone(),
+                kind: ErrorKind::TooManyLocals,
+                msg: "number of variables in assignment exceed limit (u8::MAX - 1)".into(),
+            });
+        }
+        let n_vars = lhs.len();
+        let is_last_expr_call = if let Some(e) = rhs.last() {
+            match &**e {
+                Expr::CallExpr { .. } => true,
+                Expr::MethodCallExpr { .. } => true,
+                _ => false,
+            }
+        } else {
+            false
+        };
+        for (i, e) in rhs.iter().enumerate() {
+            if i + 1 < rhs.len() {
+                $self.compile_expr(e, Default::default())?;
+            } else {
+                if n_vars >= rhs.len() {
+                    $self.compile_expr(
+                        e,
+                        CompileExprExtra {
+                            n_expect_values: (n_vars + 1 - rhs.len()) as u8,
+                        },
+                    )?;
+                } else {
+                    $self.compile_expr(e, Default::default())?;
+                    $self.emit(ByteCode::Op(OpCode::Pop));
+                }
+            }
+        }
+        if !is_last_expr_call && rhs.len() < n_vars {
+            for _ in rhs.len()..n_vars {
+                $self.emit(ByteCode::Op(OpCode::LoadNil));
+            }
+        }
+        if is_local_var_def {
+            for var in lhs {
+                ($handle_var_def)($self, var)?;
+            }
+        }
+        for var in lhs.iter().rev() {
+            ($compile_lhs)($self, var)?;
+        }
+        // Ok(())
+    }};
+}
 impl Compiler {
     fn emit(&mut self, inst: ByteCode) {
         // let ret = self.module.code.len();
@@ -589,47 +644,13 @@ impl Compiler {
         rhs: &Vec<Rc<Expr>>,
         is_local_var_def: bool,
     ) -> Result<(), CompileError> {
-        if lhs.len() >= u8::MAX as usize - 1 || rhs.len() >= u8::MAX as usize - 1 {
-            return Err(CompileError {
-                loc: loc.clone(),
-                kind: ErrorKind::TooManyLocals,
-                msg: "number of variables in assignment exceed limit (u8::MAX - 1)".into(),
-            });
-        }
-        let n_vars = lhs.len();
-        let is_last_expr_call = if let Some(e) = rhs.last() {
-            match &**e {
-                Expr::CallExpr { .. } => true,
-                Expr::MethodCallExpr { .. } => true,
-                _ => false,
-            }
-        } else {
-            false
-        };
-        for (i, e) in rhs.iter().enumerate() {
-            if i + 1 < rhs.len() {
-                self.compile_expr(e, Default::default())?;
-            } else {
-                if n_vars >= rhs.len() {
-                    self.compile_expr(
-                        e,
-                        CompileExprExtra {
-                            n_expect_values: (n_vars + 1 - rhs.len()) as u8,
-                        },
-                    )?;
-                } else {
-                    self.compile_expr(e, Default::default())?;
-                    self.emit(ByteCode::Op(OpCode::Pop));
-                }
-            }
-        }
-        if !is_last_expr_call && rhs.len() < n_vars {
-            for _ in rhs.len()..n_vars {
-                self.emit(ByteCode::Op(OpCode::LoadNil));
-            }
-        }
-        if is_local_var_def {
-            for var in lhs {
+        compile_assign_impl!(
+            self,
+            loc,
+            lhs,
+            rhs,
+            is_local_var_def,
+            |pself: &mut Self, var: &Rc<Expr>| {
                 match &**var {
                     Expr::Identifier { token } => {
                         let name = match token {
@@ -637,16 +658,15 @@ impl Compiler {
                             _ => unreachable!(),
                         };
                         // if let None = self.symbols.get_cur(name) {
-                        self.add_var(name.clone());
+                        pself.add_var(name.clone());
                         // }
                     }
                     _ => unreachable!(),
-                };
-            }
-        }
-        for var in lhs.iter().rev() {
-            self.emit_store(var)?;
-        }
+                }
+                Ok(())
+            },
+            |pself: &mut Self, var| { pself.emit_store(var) }
+        );
         Ok(())
     }
     fn compile_stmt(&mut self, block: &Stmt) -> Result<(), CompileError> {
@@ -904,7 +924,70 @@ impl Compiler {
                 self.leave_scope(false);
                 Ok(())
             }
-            Stmt::ForIn { name, range, body } => todo!(),
+            Stmt::ForIn { vars, range, body } => {
+                let f_var = format!("##_f{}", self.module.code.len());
+                let s_var = format!("##_s{}", self.module.code.len());
+                let ctrl_var = format!("##_var{}", self.module.code.len());
+                self.enter_scope(false);
+                let loc = block.loc();
+                for var in vars {
+                    match &**var {
+                        Expr::Identifier{token}=>{
+                            match token{
+                                Token::Identifier{value,..}=>{
+                                    self.add_var(value.clone());
+                                }
+                                _=>unreachable!()
+                            }
+                        }
+                        _=>{
+                            return Err(CompileError{
+                                loc:loc.clone(),
+                                kind:ErrorKind::SemanticError,
+                                msg:"generic for loop expect identifiers".into(),
+                            });
+                        }
+                    }
+                }
+                //  local _f, _s, _var = explist
+                compile_assign_impl!(
+                    self,
+                    loc,
+                    &vec![&f_var, &s_var, &ctrl_var],
+                    range,
+                    true,
+                    |pself: &mut Self, var: &String| {
+                        pself.add_var(var.clone());
+                        Ok(())
+                    },
+                    |pself: &mut Self, var| { pself.store_variable(var) }
+                );
+
+                let end = self.new_label();
+                let begin = self.new_label();
+                self.emit_label(begin);
+                self.load_identifier(&ctrl_var)?;
+                self.load_identifier(&s_var)?;
+                self.load_identifier(&f_var)?;
+                self.emit(ByteCode::Op3U8(OpCode::Call, [2, vars.len() as u8, 0])); // local var_1, ... , var_n = _f(_s, _var)
+                for var in vars.iter().rev() {
+                    self.emit_store(var)?;
+                }
+                self.compile_expr(&vars[0], Default::default())?;
+                self.emit(ByteCode::Op(OpCode::Dup));
+                self.store_variable(&ctrl_var)?;
+                self.emit(ByteCode::Op3U8(OpCode::TestJump, [0, 1, 1])); //  if _var == nil then break end
+                self.emit(ByteCode::Label(end.to_le_bytes()));
+
+                self.enter_scope(false);
+                self.compile_stmt(body)?;
+                self.leave_scope(false);     
+                self.emit(ByteCode::Op(OpCode::Jump));            
+                self.emit(ByteCode::Label(begin.to_le_bytes()));
+                self.emit_label(end);
+                self.leave_scope(false);
+                Ok(())
+            }
             Stmt::Assign { loc, lhs, rhs } => {
                 // assert!(lhs.len() == 1 && rhs.len() == 1);
                 // self.compile_expr(&*rhs[0], Default::default())?;
