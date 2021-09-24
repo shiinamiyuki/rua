@@ -367,18 +367,18 @@ impl State {
         Value::Closure(c)
     }
     pub(crate) fn concat(&self, a: Value, b: Value) -> Result<Value, RuntimeError> {
-        match (a,b) {
-            (Value::String(a), Value::String(b))=>{
+        match (a, b) {
+            (Value::String(a), Value::String(b)) => {
                 let mut a = a.data.clone();
                 a.push_str(&b.data);
                 Ok(self.create_string(a))
             }
-            (Value::String(a), Value::Number(b))=>{
+            (Value::String(a), Value::Number(b)) => {
                 let mut a = a.data.clone();
                 a.push_str(&b.to_string());
                 Ok(self.create_string(a))
             }
-            _=>{
+            _ => {
                 let mt_a = self.get_metatable(a);
                 let mt_b = self.get_metatable(b);
                 if !mt_a.is_nil() {
@@ -491,11 +491,26 @@ impl State {
             _ => {
                 let mt_a = self.get_metatable(a);
                 let mt_b = self.get_metatable(b);
+                macro_rules! error {
+                    () => {
+                        Err(RuntimeError {
+                            kind: ErrorKind::ArithmeticError,
+                            msg: format!(
+                                "attempt to perform compare {} with {}",
+                                a.type_of(),
+                                b.type_of()
+                            ),
+                        })
+                    };
+                }
                 if !mt_a.is_nil() {
                     let method = self.table_get(
                         mt_a,
                         self.global_state.constants[ConstantsIndex::MtKeyLt as usize].get(),
                     )?;
+                    if method.is_nil() {
+                        return error!();
+                    }
                     let instance = self.instance.upgrade().unwrap();
                     return instance.call(method, &[a, b]);
                 } else if !mt_b.is_nil() {
@@ -503,6 +518,9 @@ impl State {
                         mt_b,
                         self.global_state.constants[ConstantsIndex::MtKeyLt as usize].get(),
                     )?;
+                    if method.is_nil() {
+                        return error!();
+                    }
                     let instance = self.instance.upgrade().unwrap();
                     return instance.call(method, &[a, b]);
                 } else {
@@ -527,6 +545,18 @@ impl State {
                 Ok(Value::from_bool(a <= b))
             }
             _ => {
+                macro_rules! error {
+                    () => {
+                        Err(RuntimeError {
+                            kind: ErrorKind::ArithmeticError,
+                            msg: format!(
+                                "attempt to perform compare {} with {}",
+                                a.type_of(),
+                                b.type_of()
+                            ),
+                        })
+                    };
+                }
                 let mt_a = self.get_metatable(a);
                 let mt_b = self.get_metatable(b);
                 if !mt_a.is_nil() {
@@ -534,6 +564,9 @@ impl State {
                         mt_a,
                         self.global_state.constants[ConstantsIndex::MtKeyLe as usize].get(),
                     )?;
+                    if method.is_nil() {
+                        return error!();
+                    }
                     let instance = self.instance.upgrade().unwrap();
                     return instance.call(method, &[a, b]);
                 } else if !mt_b.is_nil() {
@@ -541,6 +574,9 @@ impl State {
                         mt_b,
                         self.global_state.constants[ConstantsIndex::MtKeyLe as usize].get(),
                     )?;
+                    if method.is_nil() {
+                        return error!();
+                    }
                     let instance = self.instance.upgrade().unwrap();
                     return instance.call(method, &[a, b]);
                 } else {
@@ -577,11 +613,26 @@ impl State {
             _ => {
                 let mt_a = self.get_metatable(a);
                 let mt_b = self.get_metatable(b);
+                macro_rules! error {
+                    () => {
+                        Err(RuntimeError {
+                            kind: ErrorKind::ArithmeticError,
+                            msg: format!(
+                                "attempt to perform compare {} with {}",
+                                a.type_of(),
+                                b.type_of()
+                            ),
+                        })
+                    };
+                }
                 if !mt_a.is_nil() {
                     let method = self.table_get(
                         mt_a,
                         self.global_state.constants[ConstantsIndex::MtKeyEq as usize].get(),
                     )?;
+                    if method.is_nil() {
+                        return error!();
+                    }
                     let instance = self.instance.upgrade().unwrap();
                     return instance.call(method, &[a, b]);
                 } else if !mt_b.is_nil() {
@@ -589,6 +640,9 @@ impl State {
                         mt_b,
                         self.global_state.constants[ConstantsIndex::MtKeyEq as usize].get(),
                     )?;
+                    if method.is_nil() {
+                        return error!();
+                    }
                     let instance = self.instance.upgrade().unwrap();
                     return instance.call(method, &[a, b]);
                 } else {
@@ -610,14 +664,43 @@ impl State {
             }
             Ok(Value::from_number((a / b).floor()))
         } else {
-            Err(RuntimeError {
-                kind: ErrorKind::ArithmeticError,
-                msg: format!(
-                    "attempt to perform arithmetic operation '//' between {} and {}",
-                    a.type_of(),
-                    b.type_of()
-                ),
-            })
+            macro_rules! error {
+                () => {
+                    Err(RuntimeError {
+                        kind: ErrorKind::ArithmeticError,
+                        msg: format!(
+                            "attempt to perform arithmetic operation '//' between {} and {}",
+                            a.type_of(),
+                            b.type_of()
+                        ),
+                    })
+                };
+            }
+            let mt_a = self.get_metatable(a);
+            let mt_b = self.get_metatable(b);
+            if !mt_a.is_nil() {
+                let method = self.table_get(
+                    mt_a,
+                    self.global_state.constants[ConstantsIndex::MtKeyIDiv as usize].get(),
+                )?;
+                if method.is_nil() {
+                    return error!();
+                }
+                let instance = self.instance.upgrade().unwrap();
+                return instance.call(method, &[a, b]);
+            } else if !mt_b.is_nil() {
+                let method = self.table_get(
+                    mt_b,
+                    self.global_state.constants[ConstantsIndex::MtKeyIDiv as usize].get(),
+                )?;
+                if method.is_nil() {
+                    return error!();
+                }
+                let instance = self.instance.upgrade().unwrap();
+                return instance.call(method, &[a, b]);
+            } else {
+                error!()
+            }
         }
     }
     pub(crate) fn len(&self, a: Value) -> Result<Value, RuntimeError> {
@@ -625,15 +708,36 @@ impl State {
             // Value::Nil => todo!(),
             // Value::Bool(_) => todo!(),
             // Value::Number(_) => todo!(),
-            Value::Table(x) => Ok(Value::from_number((*x).borrow_mut().len() as f64)),
             Value::String(x) => Ok(Value::from_number((*x).data.len() as f64)),
             // Value::Closure(_) => todo!(),
             // Value::Callable(_) => todo!(),
             Value::Tuple(x) => Ok(Value::from_number((*x).values.borrow().len() as f64)),
-            _ => Err(RuntimeError {
-                kind: ErrorKind::ArithmeticError,
-                msg: format!(" attempt to get length of a {} value", a.type_of(),),
-            }),
+            _ => {
+                let mt = self.get_metatable(a);
+                if mt.is_nil() {
+                    match a {
+                        Value::Table(x) => Ok(Value::from_number((*x).borrow_mut().len() as f64)),
+                        _ => Err(RuntimeError {
+                            kind: ErrorKind::ArithmeticError,
+                            msg: format!(" attempt to get length of a {} value", a.type_of(),),
+                        }),
+                    }
+                } else {
+                    let method = self.table_get(
+                        mt,
+                        self.global_state.constants[ConstantsIndex::MtKeyLen as usize].get(),
+                    )?;
+                    if method.is_nil() {
+                        Err(RuntimeError {
+                            kind: ErrorKind::ArithmeticError,
+                            msg: format!(" attempt to get length of a {} value", a.type_of(),),
+                        })
+                    } else {
+                        let instance = self.instance.upgrade().unwrap();
+                        return instance.call(method, &[a]);
+                    }
+                }
+            }
         }
     }
     pub(crate) fn not(&self, a: Value) -> Result<Value, RuntimeError> {
@@ -665,10 +769,33 @@ impl State {
             // Value::Nil => todo!(),
             // Value::Bool(_) => todo!(),
             Value::Number(x) => Ok(Value::from_number(*-x)),
-            _ => Err(RuntimeError {
-                kind: ErrorKind::ArithmeticError,
-                msg: format!(" attempt to get length of a {} value", a.type_of(),),
-            }),
+            _ => {
+                macro_rules! error {
+                    () => {
+                        Err(RuntimeError {
+                            kind: ErrorKind::ArithmeticError,
+                            msg: format!(
+                                " attempt to perform unary '-' on a {} value",
+                                a.type_of(),
+                            ),
+                        })
+                    };
+                }
+                let mt = self.get_metatable(a);
+                if mt.is_nil() {
+                    return error!();
+                }
+                let method = self.table_get(
+                    mt,
+                    self.global_state.constants[ConstantsIndex::MtKeyNeg as usize].get(),
+                )?;
+                if method.is_nil() {
+                    return error!();
+                } else {
+                    let instance = self.instance.upgrade().unwrap();
+                    return instance.call(method, &[a]);
+                }
+            }
         }
     }
     pub(crate) fn get_metatable(&self, a: Value) -> Value {

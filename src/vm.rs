@@ -215,6 +215,15 @@ impl Instance {
                     *eval_stack.last_mut().unwrap() = lhs;
                 }};
             }
+            macro_rules! unary_op_impl {
+                ($func:ident) => {{
+                    let top = *eval_stack.last_mut().unwrap();
+                    std::mem::drop(eval_stack);
+                    let top = state.$func(top)?;
+                    let mut eval_stack = state.eval_stack.borrow_mut();
+                    *eval_stack.last_mut().unwrap() = top;
+                }};
+            }
             let instruction = module.code[ip];
             #[cfg(debug_assertions)]
             {
@@ -247,20 +256,16 @@ impl Instance {
                         eval_stack.push(f);
                     }
                     OpCode::Not => {
-                        let top = eval_stack.last_mut().unwrap();
-                        *top = state.not(*top)?;
+                        unary_op_impl!(not)
                     }
                     OpCode::BitwiseNot => {
-                        let top = eval_stack.last_mut().unwrap();
-                        *top = state.bitwise_not(*top)?;
+                        unary_op_impl!(bitwise_not)
                     }
                     OpCode::Neg => {
-                        let top = eval_stack.last_mut().unwrap();
-                        *top = state.neg(*top)?;
+                        unary_op_impl!(neg)
                     }
                     OpCode::Len => {
-                        let top = eval_stack.last_mut().unwrap();
-                        *top = state.len(*top)?;
+                        unary_op_impl!(len)
                     }
                     OpCode::LoadNumber => {
                         ip_modified = true;

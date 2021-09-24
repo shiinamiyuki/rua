@@ -87,12 +87,15 @@ pub(crate) enum ConstantsIndex {
     MtKeySub,
     MtKeyMul,
     MtKeyDiv,
+    MtKeyIDiv,
     MtKeyMod,
     MtKeyPow,
     MtKeyConcat,
     MtKeyEq,
     MtKeyLt,
     MtKeyLe,
+    MtKeyLen,
+    MtKeyNeg,
     MtKeyCall,
     NumConstants,
 }
@@ -774,6 +777,8 @@ impl RuntimeInner {
             runtime.create_pooled_string(&String::from("__mul"));
         constants[ConstantsIndex::MtKeyDiv as usize] =
             runtime.create_pooled_string(&String::from("__div"));
+            constants[ConstantsIndex::MtKeyIDiv as usize] =
+            runtime.create_pooled_string(&String::from("__idiv"));
         constants[ConstantsIndex::MtKeyMod as usize] =
             runtime.create_pooled_string(&String::from("__mod"));
         constants[ConstantsIndex::MtKeyPow as usize] =
@@ -786,8 +791,12 @@ impl RuntimeInner {
             runtime.create_pooled_string(&String::from("__le"));
         constants[ConstantsIndex::MtKeyCall as usize] =
             runtime.create_pooled_string(&String::from("__call"));
-            constants[ConstantsIndex::MtKeyConcat as usize] =
+        constants[ConstantsIndex::MtKeyConcat as usize] =
             runtime.create_pooled_string(&String::from("__concat"));
+        constants[ConstantsIndex::MtKeyLen as usize] =
+            runtime.create_pooled_string(&String::from("__len"));
+        constants[ConstantsIndex::MtKeyNeg as usize] =
+            runtime.create_pooled_string(&String::from("__unm"));
         for v in &constants {
             assert!(!v.is_nil());
         }
