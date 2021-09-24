@@ -398,71 +398,165 @@ impl State {
         int_binary_op_impl!(|, a, b)
     }
 
-    pub(crate) fn cmp(&self, a: Value, b: Value) -> Result<Ordering, RuntimeError> {
-        let res = match (a, b) {
-            (Value::Nil, Value::Nil) => Ok(Ordering::Equal),
-            (Value::Bool(a), Value::Bool(b)) => Ok(a.cmp(&b)),
-            (Value::Number(a), Value::Number(b)) => Ok(a.cmp(&b)),
+    // pub(crate) fn cmp(&self, a: Value, b: Value) -> Result<Ordering, RuntimeError> {
+    //     let res = match (a, b) {
+    //         (Value::Nil, Value::Nil) => Ok(Ordering::Equal),
+    //         (Value::Bool(a), Value::Bool(b)) => Ok(a.cmp(&b)),
+    //         (Value::Number(a), Value::Number(b)) => Ok(a.cmp(&b)),
+    //         (Value::String(a), Value::String(b)) => {
+    //             let a = &(*a).data;
+    //             let b = &(*b).data;
+    //             Ok(a.cmp(b))
+    //         }
+    //         // (Value::Table(a), Value::Table(b))=>{
+    //         //     if a == b {
+    //         //         Ok(Ordering::Equal)
+    //         //     }
+    //         // }
+    //         _ => Err(RuntimeError {
+    //             kind: ErrorKind::ArithmeticError,
+    //             msg: format!(
+    //                 "attempt to perform compare {} with {}",
+    //                 a.type_of(),
+    //                 b.type_of()
+    //             ),
+    //         }),
+    //     };
+    //     #[cfg(debug_assertions)]
+    //     {
+    //         match res {
+    //             Ok(ordering) => {
+    //                 if ordering == Ordering::Equal {
+    //                     debug_assert!(a == b);
+    //                 } else {
+    //                     debug_assert!(a != b);
+    //                 }
+    //             }
+    //             _ => {}
+    //         }
+    //     }
+    //     res
+    // }
+
+    pub(crate) fn lt(&self, a: Value, b: Value) -> Result<Value, RuntimeError> {
+        match (a, b) {
+            (Value::Number(a), Value::Number(b)) => Ok(Value::from_bool(a < b)),
             (Value::String(a), Value::String(b)) => {
                 let a = &(*a).data;
                 let b = &(*b).data;
-                Ok(a.cmp(b))
+                Ok(Value::from_bool(a < b))
             }
-            // (Value::Table(a), Value::Table(b))=>{
-            //     if a == b {
-            //         Ok(Ordering::Equal)
-            //     }
-            // }
-            _ => Err(RuntimeError {
-                kind: ErrorKind::ArithmeticError,
-                msg: format!(
-                    "attempt to perform compare {} with {}",
-                    a.type_of(),
-                    b.type_of()
-                ),
-            }),
-        };
-        #[cfg(debug_assertions)]
-        {
-            match res {
-                Ok(ordering) => {
-                    if ordering == Ordering::Equal {
-                        debug_assert!(a == b);
-                    } else {
-                        debug_assert!(a != b);
-                    }
+            _ => {
+                let mt_a = self.get_metatable(a);
+                let mt_b = self.get_metatable(b);
+                if !mt_a.is_nil() {
+                    let method = self.table_get(
+                        mt_a,
+                        self.global_state.constants[ConstantsIndex::MtKeyLt as usize].get(),
+                    )?;
+                    let instance = self.instance.upgrade().unwrap();
+                    return instance.call(method, &[a, b]);
+                } else if !mt_b.is_nil() {
+                    let method = self.table_get(
+                        mt_b,
+                        self.global_state.constants[ConstantsIndex::MtKeyLt as usize].get(),
+                    )?;
+                    let instance = self.instance.upgrade().unwrap();
+                    return instance.call(method, &[a, b]);
+                } else {
+                    Err(RuntimeError {
+                        kind: ErrorKind::ArithmeticError,
+                        msg: format!(
+                            "attempt to perform compare {} with {}",
+                            a.type_of(),
+                            b.type_of()
+                        ),
+                    })
                 }
-                _ => {}
             }
         }
-        res
-    }
-
-    pub(crate) fn lt(&self, a: Value, b: Value) -> Result<Value, RuntimeError> {
-        let ordering = self.cmp(a, b)?;
-        Ok(Value::from_bool(ordering == Ordering::Less))
     }
     pub(crate) fn le(&self, a: Value, b: Value) -> Result<Value, RuntimeError> {
-        let ordering = self.cmp(a, b)?;
-        Ok(Value::from_bool(
-            ordering == Ordering::Less || ordering == Ordering::Equal,
-        ))
+        match (a, b) {
+            (Value::Number(a), Value::Number(b)) => Ok(Value::from_bool(a <= b)),
+            (Value::String(a), Value::String(b)) => {
+                let a = &(*a).data;
+                let b = &(*b).data;
+                Ok(Value::from_bool(a <= b))
+            }
+            _ => {
+                let mt_a = self.get_metatable(a);
+                let mt_b = self.get_metatable(b);
+                if !mt_a.is_nil() {
+                    let method = self.table_get(
+                        mt_a,
+                        self.global_state.constants[ConstantsIndex::MtKeyLe as usize].get(),
+                    )?;
+                    let instance = self.instance.upgrade().unwrap();
+                    return instance.call(method, &[a, b]);
+                } else if !mt_b.is_nil() {
+                    let method = self.table_get(
+                        mt_b,
+                        self.global_state.constants[ConstantsIndex::MtKeyLe as usize].get(),
+                    )?;
+                    let instance = self.instance.upgrade().unwrap();
+                    return instance.call(method, &[a, b]);
+                } else {
+                    Err(RuntimeError {
+                        kind: ErrorKind::ArithmeticError,
+                        msg: format!(
+                            "attempt to perform compare {} with {}",
+                            a.type_of(),
+                            b.type_of()
+                        ),
+                    })
+                }
+            }
+        }
     }
     pub(crate) fn gt(&self, a: Value, b: Value) -> Result<Value, RuntimeError> {
-        let ordering = self.cmp(a, b)?;
-        Ok(Value::from_bool(ordering == Ordering::Greater))
+        self.lt(b, a)
     }
     pub(crate) fn ge(&self, a: Value, b: Value) -> Result<Value, RuntimeError> {
-        let ordering = self.cmp(a, b)?;
-        Ok(Value::from_bool(
-            ordering == Ordering::Greater || ordering == Ordering::Equal,
-        ))
+        self.le(b, a)
     }
     pub(crate) fn eq(&self, a: Value, b: Value) -> Result<Value, RuntimeError> {
-        Ok(Value::from_bool(a == b))
+        match (a, b) {
+            (Value::Nil, Value::Nil) => Ok(Value::from_bool(true)),
+            (Value::Bool(a), Value::Bool(b)) => Ok(Value::from_bool(a == b)),
+            (Value::Number(a), Value::Number(b)) => Ok(Value::from_bool(a == b)),
+            (Value::String(a), Value::String(b)) => {
+                let a = &(*a).data;
+                let b = &(*b).data;
+                Ok(Value::from_bool(a == b))
+            }
+            (Value::Closure(a), Value::Closure(b)) => Ok(Value::from_bool(a == b)),
+            (Value::Callable(a), Value::Callable(b)) => Ok(Value::from_bool(a == b)),
+            _ => {
+                let mt_a = self.get_metatable(a);
+                let mt_b = self.get_metatable(b);
+                if !mt_a.is_nil() {
+                    let method = self.table_get(
+                        mt_a,
+                        self.global_state.constants[ConstantsIndex::MtKeyEq as usize].get(),
+                    )?;
+                    let instance = self.instance.upgrade().unwrap();
+                    return instance.call(method, &[a, b]);
+                } else if !mt_b.is_nil() {
+                    let method = self.table_get(
+                        mt_b,
+                        self.global_state.constants[ConstantsIndex::MtKeyEq as usize].get(),
+                    )?;
+                    let instance = self.instance.upgrade().unwrap();
+                    return instance.call(method, &[a, b]);
+                } else {
+                    Ok(Value::from_bool(false))
+                }
+            }
+        }
     }
     pub(crate) fn ne(&self, a: Value, b: Value) -> Result<Value, RuntimeError> {
-        Ok(Value::from_bool(a != b))
+        Ok(Value::from_bool(!self.eq(a, b)?.to_bool()))
     }
     pub(crate) fn idiv(&self, a: Value, b: Value) -> Result<Value, RuntimeError> {
         if let (Some(a), Some(b)) = (a.number(), b.number()) {

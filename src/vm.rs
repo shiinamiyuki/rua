@@ -3,7 +3,7 @@ use crate::{
     bytecode::{get_3xu8, u32_from_3xu8, ByteCode, ByteCodeModule, OpCode},
     closure::{Callable, Closure, UpValue, UpValueInner},
     gc::{Gc, GcState, Traceable},
-    runtime::{ErrorKind, RuntimeError, RuntimeInner, ValueRef},
+    runtime::{ConstantsIndex, ErrorKind, RuntimeError, RuntimeInner, ValueRef},
     state::{CallContext, Frame, State},
     table::Table,
     value::{Managed, ManagedCell, Tuple, TupleFlag, Value},
@@ -141,7 +141,7 @@ impl Instance {
                         state: &self.state,
                         frames: &*frames,
                         ret_values: RefCell::new(smallvec![]),
-                        n_expected_rets:u8::MAX,
+                        n_expected_rets: u8::MAX,
                     };
                     let func = { &(*callable) };
                     func.call(&ctx)?;
@@ -566,53 +566,90 @@ impl Instance {
                     }
                     OpCode::TailCall => {
                         let n_args = operands[0] as usize;
-                        let func = eval_stack.pop().unwrap();
-                        match func {
-                            Value::Closure(closure) => {
-                                let mut frames = state.frames.borrow_mut();
-                                let frame = frames.last_mut().unwrap();
-                                ip_modified = true;
-                                ip = Frame::get_ip(Some(closure));
-                                for i in 0..n_args {
-                                    frame.locals[i] = eval_stack[eval_stack.len() - 1 - i];
+                        let mut func = eval_stack.pop().unwrap();
+                        loop {
+                            match func {
+                                Value::Closure(closure) => {
+                                    let mut frames = state.frames.borrow_mut();
+                                    let frame = frames.last_mut().unwrap();
+                                    ip_modified = true;
+                                    ip = Frame::get_ip(Some(closure));
+                                    for i in 0..n_args {
+                                        frame.locals[i] = eval_stack[eval_stack.len() - 1 - i];
+                                    }
+                                    frame.n_args = n_args;
+                                    let len = eval_stack.len();
+                                    eval_stack.resize(len - n_args, Value::nil());
+                                    n_expected_rets = operands[1];
+                                    break;
                                 }
-                                frame.n_args = n_args;
-                                let len = eval_stack.len();
-                                eval_stack.resize(len - n_args, Value::nil());
-                                n_expected_rets = operands[1];
-                            }
-                            Value::Callable(callable) => {
-                                ip += 1;
-                                let mut frame = Frame::new(n_args, None);
-                                for i in 0..n_args {
-                                    frame.locals[i] = eval_stack[eval_stack.len() - 1 - i];
+                                Value::Callable(callable) => {
+                                    ip += 1;
+                                    let mut frame = Frame::new(n_args, None);
+                                    for i in 0..n_args {
+                                        frame.locals[i] = eval_stack[eval_stack.len() - 1 - i];
+                                    }
+                                    let len = eval_stack.len();
+                                    eval_stack.resize(len - n_args, Value::nil());
+                                    on_return!(Ok(Continue::CallExt(callable, frame, operands[1])));
                                 }
-                                let len = eval_stack.len();
-                                eval_stack.resize(len - n_args, Value::nil());
-                                on_return!(Ok(Continue::CallExt(callable, frame, operands[1])));
+                                _ => {
+                                    let mt = self.state.get_metatable(func);
+                                    if mt.is_nil() {
+                                        on_return!(Err(RuntimeError {
+                                            kind: ErrorKind::TypeError,
+                                            msg: format!(
+                                                "attempt to call a {} value",
+                                                func.type_of()
+                                            )
+                                        }))
+                                    } else {
+                                        func = self.state.table_get(
+                                            mt,
+                                            self.state.global_state.constants
+                                                [ConstantsIndex::MtKeyCall as usize]
+                                                .get(),
+                                        )?;
+                                    }
+                                }
                             }
-                            _ => unreachable!(),
                         }
                     }
                     OpCode::Call => {
                         let n_args = operands[0] as usize;
-                        let func = eval_stack.pop().unwrap();
-                        match func {
-                            Value::Closure(closure) => {
-                                ip += 1;
-                                let frame = new_frame!(self.gc, eval_stack, n_args, Some(closure));
-                                on_return!(Ok(Continue::NewFrame(frame, operands[1])));
-                            }
-                            Value::Callable(callable) => {
-                                ip += 1;
-                                let frame = new_frame!(self.gc, eval_stack, n_args, None);
-                                on_return!(Ok(Continue::CallExt(callable, frame, operands[1])));
-                            }
-                            _ => {
-                                on_return!(Err(RuntimeError {
-                                    kind: ErrorKind::TypeError,
-                                    msg: format!("attempt to call a {} value", func.type_of())
-                                }))
+                        let mut func = eval_stack.pop().unwrap();
+                        loop {
+                            match func {
+                                Value::Closure(closure) => {
+                                    ip += 1;
+                                    let frame =
+                                        new_frame!(self.gc, eval_stack, n_args, Some(closure));
+                                    on_return!(Ok(Continue::NewFrame(frame, operands[1])));
+                                }
+                                Value::Callable(callable) => {
+                                    ip += 1;
+                                    let frame = new_frame!(self.gc, eval_stack, n_args, None);
+                                    on_return!(Ok(Continue::CallExt(callable, frame, operands[1])));
+                                }
+                                _ => {
+                                    let mt = self.state.get_metatable(func);
+                                    if mt.is_nil() {
+                                        on_return!(Err(RuntimeError {
+                                            kind: ErrorKind::TypeError,
+                                            msg: format!(
+                                                "attempt to call a {} value",
+                                                func.type_of()
+                                            )
+                                        }))
+                                    } else {
+                                        func = self.state.table_get(
+                                            mt,
+                                            self.state.global_state.constants
+                                                [ConstantsIndex::MtKeyCall as usize]
+                                                .get(),
+                                        )?;
+                                    }
+                                }
                             }
                         }
                     }

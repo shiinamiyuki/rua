@@ -90,6 +90,9 @@ pub(crate) enum ConstantsIndex {
     MtKeyMod,
     MtKeyPow,
     MtKeyEq,
+    MtKeyLt,
+    MtKeyLe,
+    MtKeyCall,
     NumConstants,
 }
 // pub(crate) const MT_KEY_INDEX:usize=0;
@@ -774,6 +777,17 @@ impl RuntimeInner {
             runtime.create_pooled_string(&String::from("__mod"));
         constants[ConstantsIndex::MtKeyPow as usize] =
             runtime.create_pooled_string(&String::from("__pow"));
+        constants[ConstantsIndex::MtKeyEq as usize] =
+            runtime.create_pooled_string(&String::from("__eq"));
+        constants[ConstantsIndex::MtKeyLt as usize] =
+            runtime.create_pooled_string(&String::from("__lt"));
+        constants[ConstantsIndex::MtKeyLe as usize] =
+            runtime.create_pooled_string(&String::from("__le"));
+        constants[ConstantsIndex::MtKeyCall as usize] =
+            runtime.create_pooled_string(&String::from("__call"));
+        for v in &constants {
+            assert!(!v.is_nil());
+        }
         let global_state = GlobalState {
             constants: constants.into_iter().map(|x| Cell::new(x)).collect(),
         };
