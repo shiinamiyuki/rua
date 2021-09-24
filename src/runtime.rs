@@ -89,6 +89,7 @@ pub(crate) enum ConstantsIndex {
     MtKeyDiv,
     MtKeyMod,
     MtKeyPow,
+    MtKeyConcat,
     MtKeyEq,
     MtKeyLt,
     MtKeyLe,
@@ -785,6 +786,8 @@ impl RuntimeInner {
             runtime.create_pooled_string(&String::from("__le"));
         constants[ConstantsIndex::MtKeyCall as usize] =
             runtime.create_pooled_string(&String::from("__call"));
+            constants[ConstantsIndex::MtKeyConcat as usize] =
+            runtime.create_pooled_string(&String::from("__concat"));
         for v in &constants {
             assert!(!v.is_nil());
         }

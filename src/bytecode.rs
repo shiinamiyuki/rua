@@ -22,6 +22,7 @@ pub enum OpCode {
     IDiv,
     Mod,
     Pow,
+    Concat,
     And,
     Or,
     LessThan,

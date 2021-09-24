@@ -366,6 +366,48 @@ impl State {
         let c = self.gc.allocate(c);
         Value::Closure(c)
     }
+    pub(crate) fn concat(&self, a: Value, b: Value) -> Result<Value, RuntimeError> {
+        match (a,b) {
+            (Value::String(a), Value::String(b))=>{
+                let mut a = a.data.clone();
+                a.push_str(&b.data);
+                Ok(self.create_string(a))
+            }
+            (Value::String(a), Value::Number(b))=>{
+                let mut a = a.data.clone();
+                a.push_str(&b.to_string());
+                Ok(self.create_string(a))
+            }
+            _=>{
+                let mt_a = self.get_metatable(a);
+                let mt_b = self.get_metatable(b);
+                if !mt_a.is_nil() {
+                    let method = self.table_get(
+                        mt_a,
+                        self.global_state.constants[ConstantsIndex::MtKeyConcat as usize].get(),
+                    )?;
+                    let instance = self.instance.upgrade().unwrap();
+                    return instance.call(method, &[a, b]);
+                } else if !mt_b.is_nil() {
+                    let method = self.table_get(
+                        mt_b,
+                        self.global_state.constants[ConstantsIndex::MtKeyConcat as usize].get(),
+                    )?;
+                    let instance = self.instance.upgrade().unwrap();
+                    return instance.call(method, &[a, b]);
+                } else {
+                    Err(RuntimeError {
+                        kind: ErrorKind::ArithmeticError,
+                        msg: format!(
+                            "attempt to perform concat {} and {}",
+                            a.type_of(),
+                            b.type_of()
+                        ),
+                    })
+                }
+            }
+        }
+    }
     pub(crate) fn add(&self, a: Value, b: Value) -> Result<Value, RuntimeError> {
         binary_op_impl!(self, +, a,b, MtKeyAdd)
     }

@@ -445,6 +445,7 @@ impl Compiler {
                         ">" => OpCode::GreaterThan,
                         "==" => OpCode::Equal,
                         "!=" => OpCode::NotEqual,
+                        ".." => OpCode::Concat,
                         _ => unreachable!(),
                     },
                     _ => unreachable!(),

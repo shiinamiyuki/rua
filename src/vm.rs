@@ -328,6 +328,9 @@ impl Instance {
                     OpCode::LoadFalse => {
                         eval_stack.push(Value::from_bool(false));
                     }
+                    OpCode::Concat => {
+                        binary_op_impl!(concat)
+                    }
                     OpCode::And => {
                         binary_op_impl!(bitwise_and)
                     }

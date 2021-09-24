@@ -997,11 +997,14 @@ impl Parser {
     fn parse_add_expr(&mut self) -> Result<Rc<Expr>, ParseError> {
         gen_parse_binary_expr!(self, self.parse_mul_expr(), self.parse_mul_expr(), "+", "-")
     }
+    fn parse_concat_expr(&mut self) -> Result<Rc<Expr>, ParseError> {
+        gen_parse_binary_expr!(self, self.parse_add_expr(), self.parse_add_expr(), "..")
+    }
     fn parse_cmp_expr(&mut self) -> Result<Rc<Expr>, ParseError> {
         gen_parse_binary_expr!(
             self,
-            self.parse_add_expr(),
-            self.parse_add_expr(),
+            self.parse_concat_expr(),
+            self.parse_concat_expr(),
             "<",
             "<=",
             ">",
