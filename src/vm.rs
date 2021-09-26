@@ -9,13 +9,8 @@ use crate::{
     value::{Managed, ManagedCell, Tuple, TupleFlag, Value},
     Stack,
 };
-use smallvec::smallvec;
-use std::{
-    cell::{Cell, RefCell, RefMut},
-    collections::HashMap,
-    iter::FromIterator,
-    rc::Rc,
-};
+use smallvec::{smallvec, SmallVec};
+use std::{borrow::Borrow, cell::{Cell, RefCell, RefMut}, collections::HashMap, iter::FromIterator, rc::Rc};
 
 /*
 The instances represents a thread
@@ -33,33 +28,30 @@ enum Continue {
 }
 macro_rules! new_frame {
     ($gc:expr, $eval_stack:expr, $n_args:expr,$closure:expr) => {{
-        let closure: Option<Gc<Closure>> = $closure;
-        let mut frame = Frame::new($n_args, $closure);
-        let is_ext = closure.is_none();
-        let n_parameters: usize = closure.map_or(u8::MAX as usize, |c| c.n_args);
-        let has_varargs = closure.map_or(false, |c| c.has_varargs);
-        let n_arg_to_local = if is_ext {
-            $n_args
-        } else {
-            ($n_args).min(n_parameters)
-        };
-        for i in 0..n_arg_to_local {
-            frame.locals[i] = $eval_stack[$eval_stack.len() - 1 - i];
+        let mut args: SmallVec<[Value; 8]> = SmallVec::new();
+        for i in 0..$n_args {
+            args.push($eval_stack[$eval_stack.len() - 1 - i]);
         }
-        if !is_ext && has_varargs {
-            let mut tv = smallvec![];
-            for i in n_parameters..$n_args {
-                tv.push($eval_stack[$eval_stack.len() - 1 - i]);
+        if !args.is_empty() {
+            match *args.last().unwrap() {
+                Value::Tuple(tuple) => {
+                    if tuple.flag == TupleFlag::VarArgs {
+                        args.pop().unwrap();
+                        let values = tuple.values.borrow();
+                        for v in values.iter() {
+                            args.push(*v);
+                        }
+                    }
+                }
+                _ => {}
             }
-            frame.locals[n_parameters] = Value::Tuple($gc.allocate(Tuple {
-                values: RefCell::new(tv),
-                flag: TupleFlag::VarArgs,
-                metatable: Cell::new(Value::Nil),
-            }));
         }
+
         let len = $eval_stack.len();
         $eval_stack.resize(len - $n_args, Value::nil());
-        frame
+
+        new_frame_direct!($gc, args, $closure)
+        // frame
     }};
 }
 macro_rules! new_frame_direct {
@@ -161,9 +153,26 @@ impl Instance {
             }),
         }
     }
+    fn close_all_upvalues(closure: &Closure) {
+        unsafe {
+            for v in &closure.upvalues {
+                let v = v.inner.borrow();
+                let inner = v.get();
+                match inner {
+                    UpValueInner::Open(p) => {
+                        v.set(UpValueInner::Closed(*p));
+                    }
+                    UpValueInner::Empty => {
+                        unreachable!()
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
     fn exec_frame(&self, state: &State, mut n_expected_rets: u8) -> Result<Continue, RuntimeError> {
         let mut guard = RetGuard { bomb: false };
-         {
+        {
             let mut frames = state.frames.borrow_mut();
             let frame = frames.last_mut().unwrap();
             let closure = &frame.closure.unwrap();
@@ -171,7 +180,7 @@ impl Instance {
                 assert!(closure.upvalues.len() == 1);
             } else {
                 for (i, v) in closure.upvalues.iter().enumerate() {
-                    let proto = &(*closure.module).protypes[closure.proto_idx];
+                    let proto = &(*closure.module).prototypes[closure.proto_idx];
                     let info = &proto.upvalues[i];
                     if i == 0 && info.is_special {
                         let mut v = v.inner.borrow_mut();
@@ -185,7 +194,7 @@ impl Instance {
                         }
                     }
                 }
-            } 
+            }
         };
         let (mut ip, code_len, module) = {
             let mut frames = state.frames.borrow_mut();
@@ -414,6 +423,7 @@ impl Instance {
                                 _ => {
                                     if n_expected_rets > 1 {
                                         for _ in 1..n_expected_rets {
+                                            println!("push 1 nil");
                                             eval_stack.push(Value::Nil);
                                         }
                                     }
@@ -527,6 +537,27 @@ impl Instance {
                         let frame = frames.last_mut().unwrap();
                         frame.locals[idx as usize] = eval_stack.pop().unwrap();
                     }
+                    OpCode::CloseUpvalue => {
+                        let idx = operands[0];
+                        let mut frames = state.frames.borrow_mut();
+                        let frame = frames.last_mut().unwrap();
+                        let closure = frame.closure.as_ref().unwrap();
+
+                        unsafe {
+                            let mut v = closure.upvalues[idx as usize].inner.borrow_mut();
+                            let inner = v.get();
+                            match inner {
+                                UpValueInner::Open(p) => {
+                                    v.set(UpValueInner::Closed(*p));
+                                    *v = Rc::new(Cell::new(UpValueInner::Open(p)));
+                                }
+                                UpValueInner::Empty => {
+                                    unreachable!()
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
                     OpCode::StoreTableArray => {
                         let cnt = u32_from_3xu8(operands);
                         let table = eval_stack[eval_stack.len() - cnt as usize - 1];
@@ -579,25 +610,16 @@ impl Instance {
                                 Value::Closure(closure) => {
                                     let mut frames = state.frames.borrow_mut();
                                     let frame = frames.last_mut().unwrap();
+                                    Self::close_all_upvalues(&closure);
                                     ip_modified = true;
                                     ip = Frame::get_ip(Some(closure));
-                                    for i in 0..n_args {
-                                        frame.locals[i] = eval_stack[eval_stack.len() - 1 - i];
-                                    }
-                                    frame.n_args = n_args;
-                                    let len = eval_stack.len();
-                                    eval_stack.resize(len - n_args, Value::nil());
+                                    *frame = new_frame!(self.gc, eval_stack, n_args, Some(closure));
                                     n_expected_rets = operands[1];
                                     break;
                                 }
                                 Value::Callable(callable) => {
                                     ip += 1;
-                                    let mut frame = Frame::new(n_args, None);
-                                    for i in 0..n_args {
-                                        frame.locals[i] = eval_stack[eval_stack.len() - 1 - i];
-                                    }
-                                    let len = eval_stack.len();
-                                    eval_stack.resize(len - n_args, Value::nil());
+                                    let frame = new_frame!(self.gc, eval_stack, n_args, None);
                                     on_return!(Ok(Continue::CallExt(callable, frame, operands[1])));
                                 }
                                 _ => {
@@ -649,12 +671,22 @@ impl Instance {
                                             )
                                         }))
                                     } else {
-                                        func = self.state.table_get(
+                                        let new_func = self.state.table_get(
                                             mt,
                                             self.state.global_state.constants
                                                 [ConstantsIndex::MtKeyCall as usize]
                                                 .get(),
                                         )?;
+                                        if new_func.is_nil() {
+                                            on_return!(Err(RuntimeError {
+                                                kind: ErrorKind::TypeError,
+                                                msg: format!(
+                                                    "attempt to call a {} value",
+                                                    func.type_of()
+                                                )
+                                            }))
+                                        }
+                                        func = new_func;
                                     }
                                 }
                             }
@@ -685,7 +717,7 @@ impl Instance {
                     OpCode::NewClosure => {
                         ip_modified = true;
                         let proto_idx = u32_from_3xu8(operands);
-                        let proto = &module.protypes[proto_idx as usize];
+                        let proto = &module.prototypes[proto_idx as usize];
                         let entry = match module.code[ip + 1] {
                             ByteCode::Address(bytes) => u32::from_le_bytes(bytes),
                             _ => unreachable!(),
@@ -753,7 +785,7 @@ impl Instance {
                 return Err(e);
             }
         }
-        assert!(self.state.eval_stack.borrow().is_empty());
+        assert_eq!(self.state.eval_stack.borrow().len(), 0);
         Ok(())
     }
     fn reset(&self) {
@@ -835,22 +867,8 @@ impl Instance {
                 }
                 Continue::Return => {
                     let mut frames = self.state.frames.borrow_mut();
-                    unsafe {
-                        let closure = frames.last().unwrap().closure.as_ref().unwrap();
-                        for v in &closure.upvalues {
-                            let v = v.inner.borrow();
-                            let inner = v.get();
-                            match inner {
-                                UpValueInner::Open(p) => {
-                                    v.set(UpValueInner::Closed(*p));
-                                }
-                                UpValueInner::Empty => {
-                                    unreachable!()
-                                }
-                                _ => {}
-                            }
-                        }
-                    }
+                    let closure = frames.last().unwrap().closure.as_ref().unwrap();
+                    Self::close_all_upvalues(&**closure);
                     frames.pop().unwrap();
                     if frames.len() == level {
                         break;

@@ -58,12 +58,28 @@ macro_rules! binary_op_impl_closue {
         if let (Some(a), Some(b)) = ($a.number(), $b.number()) {
             Ok(Value::from_number($op(a, b)))
         } else {
+            macro_rules! error {
+                () => {
+                    Err(RuntimeError {
+                        kind: ErrorKind::ArithmeticError,
+                        msg: format!(
+                            "attempt to perform arithmetic operation '{}' between {} and {}",
+                            $op_str,
+                            $a.type_of(),
+                            $b.type_of()
+                        ),
+                    })
+                };
+            }
             let mt = $self.get_metatable($a);
             if !mt.is_nil() {
                 let method = $self.table_get(
                     mt,
                     $self.global_state.constants[ConstantsIndex::$metamethod as usize].get(),
                 )?;
+                if method.is_nil() {
+                    return error!();
+                }
                 let instance = $self.instance.upgrade().unwrap();
                 return instance.call(method, &[$a, $b]);
             }
@@ -73,18 +89,14 @@ macro_rules! binary_op_impl_closue {
                     mt,
                     $self.global_state.constants[ConstantsIndex::$metamethod as usize].get(),
                 )?;
+                if method.is_nil() {
+                    return error!();
+                }
                 let instance = $self.instance.upgrade().unwrap();
                 return instance.call(method, &[$a, $b]);
+            } else {
+                return error!();
             }
-            Err(RuntimeError {
-                kind: ErrorKind::ArithmeticError,
-                msg: format!(
-                    "attempt to perform arithmetic operation '{}' between {} and {}",
-                    $op_str,
-                    $a.type_of(),
-                    $b.type_of()
-                ),
-            })
         }
     };
 }
@@ -316,18 +328,21 @@ impl State {
         value: Value,
         depth: u32,
     ) -> Result<(), RuntimeError> {
-        let newindex = self.table_get_impl(
-            table,
-            self.global_state.constants[ConstantsIndex::MtKeyNewIndex as usize].get(),
-            depth + 1,
-        )?;
-        if newindex.as_table().is_some() {
-            return self.table_set_impl(newindex, key, value, depth + 1);
-        }
-        if newindex.as_callable().is_some() || newindex.as_closure().is_some() {
-            let instance = self.instance.upgrade().unwrap();
-            instance.call(newindex, &[key, value])?;
-            return Ok(());
+        let mt = self.get_metatable(table);
+        if !mt.is_nil() {
+            let newindex = self.table_get_impl(
+                mt,
+                self.global_state.constants[ConstantsIndex::MtKeyNewIndex as usize].get(),
+                depth + 1,
+            )?;
+            if newindex.as_table().is_some() {
+                return self.table_set_impl(newindex, key, value, depth + 1);
+            }
+            if newindex.as_callable().is_some() || newindex.as_closure().is_some() {
+                let instance = self.instance.upgrade().unwrap();
+                instance.call(newindex, &[key, value])?;
+                return Ok(());
+            }
         }
         let table = match table.as_table() {
             Some(x) => x,

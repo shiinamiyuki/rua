@@ -1,6 +1,8 @@
 use std::fmt::Debug;
 
+use crate::parse::SourceLocation;
 use crate::{closure::ClosurePrototype, value::Value};
+use std::collections::{BTreeMap, HashMap};
 
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -52,16 +54,17 @@ pub enum OpCode {
     LoadLocal,  // PUSH  local[i]
     StoreLocal, // local[i] = TOS;POP
     Pack,
-    Unpack,     // Unpack TOS to n values,
-    StoreTableArray, 
-    LoadTableStringKey, 
+    Unpack, // Unpack TOS to n values,
+    StoreTableArray,
+    LoadTableStringKey,
     StoreTableStringKey,
 
     LoadTable,    // TOS = key, table
-    StoreTable,   // TOS = value, key, table   
+    StoreTable,   // TOS = value, key, table
     LoadUpvalue,  // TOS=upvalue, push upvalue[i]
     StoreUpvalue, // TOS~1=upvalue, TOS=value upvalue[i] = value
 
+    CloseUpvalue,
     Scatter, // Scatter{n, table_idx} local[scatter_table[table_idx]..] = stack[TOP-n-1..TOP-n]
     Gather,
 
@@ -94,7 +97,25 @@ end
 
 
 */
-
+#[derive(Clone, Debug)]
+pub struct VarDebugInfo {
+    name: String,
+    loc: SourceLocation,
+}
+#[derive(Clone, Debug)]
+pub struct FuncDebugInfo {
+    locals: HashMap<u8, VarDebugInfo>,
+    upvalues: HashMap<u8, VarDebugInfo>,
+}
+#[derive(Clone, Debug)]
+pub struct ModuleDebugInfo {
+    funcs: Vec<FuncDebugInfo>,
+}
+impl ModuleDebugInfo {
+    pub fn new() -> Self {
+        Self { funcs: vec![] }
+    }
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ByteCode {
     Op(OpCode),
@@ -106,15 +127,16 @@ pub enum ByteCode {
 }
 #[derive(Clone)]
 pub struct ByteCodeModule {
-    pub(crate) protypes: Vec<ClosurePrototype>,
+    pub(crate) prototypes: Vec<ClosurePrototype>,
     pub(crate) string_pool: Vec<String>,
     pub(crate) string_pool_cache: Vec<Value>,
     pub(crate) code: Vec<ByteCode>,
+    pub(crate) debug_info: ModuleDebugInfo,
 }
 impl Debug for ByteCodeModule {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ByteCodeModule")
-            .field("protypes", &self.protypes)
+            .field("prototypes", &self.prototypes)
             .field("string_pool", &self.string_pool)
             .field("code", &self.code)
             .finish()

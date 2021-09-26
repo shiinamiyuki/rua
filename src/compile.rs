@@ -1,6 +1,6 @@
 use std::{
     cell::{Ref, RefCell},
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     convert::TryInto,
     fmt::format,
     rc::Rc,
@@ -258,6 +258,7 @@ impl Compiler {
 
                         if tab.func_scope == info.func_scope {
                             // the locals of that function
+                            // println!("local upvalue {}", name);
                             let func = &mut self.funcs[tab.func_scope - 1];
                             if !func.upvalues.contains_key(&info.uid) {
                                 let id = func.upvalues.len() as u32;
@@ -306,7 +307,7 @@ impl Compiler {
                                     name.clone(),
                                     VarInfo {
                                         func_scope: tab.func_scope,
-                                        location:id,
+                                        location: id,
                                         uid: info.uid,
                                         // is_on_stack: false,
                                         is_upvalue: true,
@@ -933,19 +934,17 @@ impl Compiler {
                 let loc = block.loc();
                 for var in vars {
                     match &**var {
-                        Expr::Identifier{token}=>{
-                            match token{
-                                Token::Identifier{value,..}=>{
-                                    self.add_var(value.clone());
-                                }
-                                _=>unreachable!()
+                        Expr::Identifier { token } => match token {
+                            Token::Identifier { value, .. } => {
+                                self.add_var(value.clone());
                             }
-                        }
-                        _=>{
-                            return Err(CompileError{
-                                loc:loc.clone(),
-                                kind:ErrorKind::SemanticError,
-                                msg:"generic for loop expect identifiers".into(),
+                            _ => unreachable!(),
+                        },
+                        _ => {
+                            return Err(CompileError {
+                                loc: loc.clone(),
+                                kind: ErrorKind::SemanticError,
+                                msg: "generic for loop expect identifiers".into(),
                             });
                         }
                     }
@@ -982,8 +981,8 @@ impl Compiler {
 
                 self.enter_scope(false);
                 self.compile_stmt(body)?;
-                self.leave_scope(false);     
-                self.emit(ByteCode::Op(OpCode::Jump));            
+                self.leave_scope(false);
+                self.emit(ByteCode::Op(OpCode::Jump));
                 self.emit(ByteCode::Label(begin.to_le_bytes()));
                 self.emit_label(end);
                 self.leave_scope(false);
@@ -1110,15 +1109,15 @@ impl Compiler {
                 },
             );
         }
-        self.symbols.n_locals = args.len();
+        self.symbols.n_locals = arg_offset as usize + args.len();
         self.compile_stmt(body)?;
         self.emit(ByteCode::Op(OpCode::LoadNil));
         self.emit(ByteCode::Op(OpCode::Return));
         let proto = ClosurePrototype {
             n_args: if has_varargs {
-                args.len() - 1
+                args.len() - 1 + arg_offset as usize
             } else {
-                args.len()
+                args.len() + arg_offset as usize
             },
             has_varargs,
             upvalues: {
@@ -1136,8 +1135,8 @@ impl Compiler {
             entry: entry as usize,
         };
         self.leave_scope(true);
-        let proto_idx = self.module.protypes.len() as u32;
-        self.module.protypes.push(proto);
+        let proto_idx = self.module.prototypes.len() as u32;
+        self.module.prototypes.push(proto);
         self.emit_label(end);
         self.emit(ByteCode::Op3U8(OpCode::NewClosure, get_3xu8(proto_idx)));
         self.emit(ByteCode::Address(entry.to_le_bytes()));
@@ -1343,8 +1342,9 @@ impl Compiler {
         let module = std::mem::replace(
             &mut self.module,
             ByteCodeModule {
+                debug_info: ModuleDebugInfo::new(),
                 string_pool_cache: vec![],
-                protypes: vec![],
+                prototypes: vec![],
                 code: vec![],
                 string_pool: vec![],
             },
@@ -1375,9 +1375,32 @@ impl Compiler {
             });
         }
     }
+    unsafe fn close_upvalues_this_scope(&mut self) {
+        let mut upvalues_to_close = vec![];
+        for (var, info) in &self.symbols.vars {
+            let upvalues = &self.funcs.last().unwrap().upvalues;
+
+            if let Some(upvalue_info) = upvalues.get(&info.uid) {
+                // println!("is_upvalue {}", var);
+                // println!("from_parent {} {}", var, upvalue_info.from_parent);
+                if !upvalue_info.from_parent {
+                    // println!("fuck {}", var);
+                    upvalues_to_close.push(upvalue_info.id);
+                }
+            }
+        }
+        for v in upvalues_to_close {
+            self.emit(ByteCode::Op3U8(OpCode::CloseUpvalue, [v as u8, 0, 0]));
+        }
+    }
+
     fn leave_scope(&mut self, function_scope: bool) {
         unsafe {
             let n_locals = self.symbols.n_locals;
+            if !function_scope {
+                self.close_upvalues_this_scope();
+            }
+
             let parent = self.symbols.parent;
             std::mem::swap(&mut self.symbols, parent.as_mut().unwrap());
             Box::from_raw(parent);
@@ -1404,8 +1427,9 @@ pub fn compile(block: Rc<Stmt>) -> Result<ByteCodeModule, CompileError> {
             n_locals: 0,
         },
         module: ByteCodeModule {
+            debug_info: ModuleDebugInfo::new(),
             string_pool_cache: vec![],
-            protypes: vec![],
+            prototypes: vec![],
             code: vec![],
             string_pool: vec![],
         },

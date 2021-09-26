@@ -9,6 +9,7 @@ use std::{
 
 use ordered_float::OrderedFloat;
 
+use crate::runtime::ErrorKind::ExternalError;
 use crate::{
     api::{BaseApi, CallApi},
     bytecode::ByteCodeModule,
@@ -35,15 +36,18 @@ pub enum ErrorKind {
     CompileError,
     KeyError,
 }
+
 #[derive(Debug, Clone)]
 pub struct RuntimeError {
     pub kind: ErrorKind,
     pub msg: String,
 }
+
 pub(crate) struct GcValueList {
     pub(crate) head: Box<ValueBox>,
     pub(crate) tail: Box<ValueBox>,
 }
+
 impl GcValueList {
     pub(crate) fn new() -> Self {
         let head = Box::new(ValueBox {
@@ -65,9 +69,11 @@ impl GcValueList {
         Self { head, tail }
     }
 }
+
 pub(crate) struct GlobalState {
     pub(crate) constants: Vec<Cell<Value>>,
 }
+
 pub(crate) struct RuntimeInner {
     pub(crate) gc: Rc<GcState>,
     pub(crate) globals: Value,
@@ -76,6 +82,7 @@ pub(crate) struct RuntimeInner {
     pub(crate) string_pool: HashMap<String, Value>,
     pub(crate) gc_value_list: GcValueList,
 }
+
 pub(crate) enum ConstantsIndex {
     MtNumber,
     MtString,
@@ -99,6 +106,7 @@ pub(crate) enum ConstantsIndex {
     MtKeyCall,
     NumConstants,
 }
+
 // pub(crate) const MT_KEY_INDEX:usize=0;
 // const MT_KEY_INDEX:usize=0;
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -121,46 +129,55 @@ impl From<i8> for RustPrimitive {
         RustPrimitive::I8(x)
     }
 }
+
 impl From<u8> for RustPrimitive {
     fn from(x: u8) -> Self {
         RustPrimitive::U8(x)
     }
 }
+
 impl From<i16> for RustPrimitive {
     fn from(x: i16) -> Self {
         RustPrimitive::I16(x)
     }
 }
+
 impl From<u16> for RustPrimitive {
     fn from(x: u16) -> Self {
         RustPrimitive::U16(x)
     }
 }
+
 impl From<i32> for RustPrimitive {
     fn from(x: i32) -> Self {
         RustPrimitive::I32(x)
     }
 }
+
 impl From<u32> for RustPrimitive {
     fn from(x: u32) -> Self {
         RustPrimitive::U32(x)
     }
 }
+
 impl From<f32> for RustPrimitive {
     fn from(x: f32) -> Self {
         RustPrimitive::F32(OrderedFloat(x))
     }
 }
+
 impl From<f64> for RustPrimitive {
     fn from(x: f64) -> Self {
         RustPrimitive::F64(OrderedFloat(x))
     }
 }
+
 pub struct ValueRef<'a> {
     pub(crate) value: Value,
     pub(crate) phantom: PhantomData<&'a u32>,
     pub(crate) prim: UnsafeCell<RustPrimitive>,
 }
+
 impl<'a> ValueRef<'a> {
     pub(crate) fn new(v: Value) -> Self {
         Self {
@@ -393,6 +410,7 @@ a Root is never collected as long as it is not dropped
 pub struct GcValue {
     inner: Box<ValueBox>,
 }
+
 pub struct RootBorrowMut<'a> {
     // inner: &'a ValueBox,
     _ref: RefMut<'a, Value>,
@@ -404,23 +422,27 @@ pub struct RootBorrow<'a> {
     _ref: Ref<'a, Value>,
     value: ValueRef<'a>,
 }
+
 impl<'a> Deref for RootBorrow<'a> {
     type Target = ValueRef<'a>;
     fn deref(&self) -> &Self::Target {
         &self.value
     }
 }
+
 impl<'a> Deref for RootBorrowMut<'a> {
     type Target = ValueRef<'a>;
     fn deref(&self) -> &Self::Target {
         &self.value
     }
 }
+
 impl<'a> DerefMut for RootBorrowMut<'a> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.value
     }
 }
+
 impl GcValue {
     pub fn borrow_mut<'a>(&'a self) -> RootBorrowMut<'a> {
         let b = self.inner.value.borrow_mut();
@@ -439,6 +461,7 @@ impl GcValue {
         }
     }
 }
+
 impl Drop for GcValue {
     fn drop(&mut self) {
         unsafe {
@@ -460,6 +483,7 @@ pub struct Module {
     runtime: Rc<RefCell<RuntimeInner>>,
     module: Value,
 }
+
 impl Module {
     pub fn function<'a, F: Fn(&CallContext<'_>) -> Result<(), RuntimeError> + 'static>(
         &'a mut self,
@@ -488,10 +512,12 @@ impl Module {
         self
     }
 }
+
 #[derive(Clone)]
 pub struct Runtime {
     inner: Rc<RefCell<RuntimeInner>>,
 }
+
 impl Runtime {
     pub fn new() -> Self {
         let r = Self {
@@ -531,7 +557,7 @@ impl Runtime {
                         "error: {}\n  --> {}:{}:{}",
                         err.msg, *err.loc.file, err.loc.line, err.loc.col
                     ),
-                })
+                });
             }
         };
 
@@ -561,6 +587,36 @@ impl Runtime {
     }
 }
 
+pub(crate) fn compile_file(path: &str) -> Result<ByteCodeModule, RuntimeError> {
+    let src = std::fs::read_to_string(path).unwrap();
+    let tokens = tokenize("test.lua", &src);
+    let tokens = tokens.map_err(|err| RuntimeError {
+        kind: ErrorKind::CompileError,
+        msg: format!(
+            "error: {}\n  --> {}:{}:{}",
+            err.msg, *err.loc.file, err.loc.line, err.loc.col
+        ),
+    })?;
+
+    let expr = parse_impl(tokens);
+    let expr = expr.map_err(|err| RuntimeError {
+        kind: ErrorKind::CompileError,
+        msg: format!(
+            "error: {}\n  --> {}:{}:{}",
+            err.msg, *err.loc.file, err.loc.line, err.loc.col
+        ),
+    })?;
+
+    let module = compile(expr).map_err(|err| RuntimeError {
+        kind: ErrorKind::CompileError,
+        msg: format!(
+            "error: {}\n  --> {}:{}:{}",
+            err.msg, *err.loc.file, err.loc.line, err.loc.col
+        ),
+    })?;
+    Ok(module)
+}
+
 impl RuntimeInner {
     pub fn add_module(&mut self, name: String, module: Module) {
         let name = self.create_pooled_string(&name);
@@ -575,8 +631,8 @@ impl RuntimeInner {
 
         globals.set(name, var);
     }
-    fn add_function<'a, F: Fn(&CallContext<'_>) -> Result<(), RuntimeError> + 'static>(
-        &'a mut self,
+    fn add_function<F: Fn(&CallContext<'_>) -> Result<(), RuntimeError> + 'static>(
+        &mut self,
         name: String,
         f: F,
     ) {
@@ -630,10 +686,23 @@ impl RuntimeInner {
             Ok(())
         });
         self.add_function("assert".into(), |ctx| {
-            let v = ctx.arg(0).unwrap();
+            let v = ctx.arg(0)?;
             assert!(v.value.to_bool());
             Ok(())
         });
+        {
+            let pself = pself.clone();
+            self.add_function("require".into(), move |ctx| {
+                let v = ctx.arg(0)?;
+                let path = v.cast::<String>()?;
+                let module = compile_file(path)?;
+                let instance = {
+                    let mut inner = pself.borrow_mut();
+                    inner.create_instance(pself.clone())
+                };
+                instance.exec(module)
+            });
+        }
         self.add_function("rawget".into(), |ctx| {
             let table = ctx.arg_or_nil(0);
             let key = ctx.arg_or_nil(1);
@@ -777,7 +846,7 @@ impl RuntimeInner {
             runtime.create_pooled_string(&String::from("__mul"));
         constants[ConstantsIndex::MtKeyDiv as usize] =
             runtime.create_pooled_string(&String::from("__div"));
-            constants[ConstantsIndex::MtKeyIDiv as usize] =
+        constants[ConstantsIndex::MtKeyIDiv as usize] =
             runtime.create_pooled_string(&String::from("__idiv"));
         constants[ConstantsIndex::MtKeyMod as usize] =
             runtime.create_pooled_string(&String::from("__mod"));
@@ -808,6 +877,7 @@ impl RuntimeInner {
         runtime
     }
 }
+
 impl GlobalState {
     pub(crate) fn get_metatable(&self, v: Value) -> Value {
         match v {
@@ -844,6 +914,7 @@ impl GlobalState {
         }
     }
 }
+
 impl Traceable for RuntimeInner {
     fn trace(&self, gc: &GcState) {
         gc.trace(&self.globals);
@@ -873,6 +944,7 @@ impl Traceable for RuntimeInner {
         }
     }
 }
+
 impl BaseApi for Runtime {
     fn create_number<'a>(&'a self, x: f64) -> ValueRef<'a> {
         self.inner.create_number(x)
@@ -927,6 +999,7 @@ impl BaseApi for Runtime {
         todo!()
     }
 }
+
 impl BaseApi for Rc<RefCell<RuntimeInner>> {
     fn create_number<'a>(&'a self, x: f64) -> ValueRef<'a> {
         ValueRef::new(Value::from_number(x))
@@ -1014,6 +1087,7 @@ impl BaseApi for Rc<RefCell<RuntimeInner>> {
         todo!()
     }
 }
+
 impl Drop for RuntimeInner {
     fn drop(&mut self) {
         for instance in self.instances.iter() {
