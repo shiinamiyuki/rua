@@ -8,6 +8,7 @@ use std::{
 use crate::{
     bytecode::ByteCodeModule,
     compile::UpValueInfo,
+    debug_println,
     gc::{GcState, Traceable},
     runtime::RuntimeError,
     state::CallContext,
@@ -51,6 +52,15 @@ pub(crate) struct UpValue {
     pub(crate) inner: RefCell<Rc<Cell<UpValueInner>>>, // Rc or Gc?
 }
 
+impl std::fmt::Display for UpValue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.inner.borrow().get() {
+            UpValueInner::Empty => unreachable!(),
+            UpValueInner::Open(p) => unsafe { write!(f, "UpValue::Open({})", (*p).print()) },
+            UpValueInner::Closed(v) => write!(f, "UpValue::Closed({})", v.print()),
+        }
+    }
+}
 #[derive(Clone, Debug)]
 pub struct ClosurePrototype {
     pub(crate) entry: usize,
@@ -73,6 +83,12 @@ pub struct Closure {
 impl Closure {
     pub(crate) fn set_upvalue(&self, i: u32, value: Value) {
         unsafe {
+            debug_println!(
+                "store upvalue {} {:?}, {}",
+                i,
+                Rc::as_ptr(&self.upvalues[i as usize].inner.borrow()),
+                self.upvalues[i as usize]
+            );
             let v = self.upvalues[i as usize].inner.borrow();
             match (**v).get() {
                 UpValueInner::Open(p) => {
@@ -97,10 +113,17 @@ impl Closure {
     pub(crate) fn get_upvalue(&self, i: u32) -> Value {
         unsafe {
             // let v = (*self.upvalues[i as usize].inner).borrow();
+            debug_println!(
+                "load upvalue {} {:?}, {}",
+                i,
+                Rc::as_ptr(&self.upvalues[i as usize].inner.borrow()),
+                self.upvalues[i as usize]
+            );
             let v = self.upvalues[i as usize].inner.borrow();
+
             match (**v).get() {
                 UpValueInner::Open(p) => *p.as_ref().unwrap(),
-                UpValueInner::Closed(v) => v,
+                UpValueInner::Closed(c) => c,
                 UpValueInner::Empty => {
                     unreachable!()
                 }

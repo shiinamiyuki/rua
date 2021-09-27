@@ -125,13 +125,14 @@ enum FunctionLocation {
     Global,
     Stack,
 }
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct UpValueInfo {
     pub(crate) from_parent: bool,
     pub(crate) id: u32,
     pub(crate) uid: u32,
     pub(crate) location: u32,
     pub(crate) is_special: bool,
+    pub(crate) name: String,
 }
 struct FuncInfo {
     upvalues: HashMap<u32, UpValueInfo>,
@@ -258,9 +259,10 @@ impl Compiler {
 
                         if tab.func_scope == info.func_scope {
                             // the locals of that function
-                            // println!("local upvalue {}", name);
+
                             let func = &mut self.funcs[tab.func_scope - 1];
                             if !func.upvalues.contains_key(&info.uid) {
+                                println!("local upvalue {}", name);
                                 let id = func.upvalues.len() as u32;
                                 let info = tab.get_cur(name).unwrap_or_else(|| {
                                     panic!("{}", name);
@@ -273,6 +275,7 @@ impl Compiler {
                                         uid: info.uid,
                                         location: info.location,
                                         is_special: false,
+                                        name: name.clone(),
                                     },
                                 );
                             }
@@ -301,6 +304,7 @@ impl Compiler {
                                         uid: info.uid,
                                         location,
                                         is_special: false,
+                                        name: name.clone(),
                                     },
                                 );
                                 tab.set(
@@ -1050,6 +1054,7 @@ impl Compiler {
                     uid: env_uid,
                     location: 0,
                     is_special: false,
+                    name:"_ENV".into()
                 },
             );
         } else {
@@ -1127,7 +1132,7 @@ impl Compiler {
                     .unwrap()
                     .upvalues
                     .iter()
-                    .map(|(_, info)| *info)
+                    .map(|(_, info)| info.clone())
                     .collect();
                 tmp.sort_by(|a, b| a.id.partial_cmp(&b.id).unwrap());
                 tmp
@@ -1342,7 +1347,7 @@ impl Compiler {
         let module = std::mem::replace(
             &mut self.module,
             ByteCodeModule {
-                debug_info: ModuleDebugInfo::new(),
+                // debug_info: ModuleDebugInfo::new(),
                 string_pool_cache: vec![],
                 prototypes: vec![],
                 code: vec![],
@@ -1427,7 +1432,7 @@ pub fn compile(block: Rc<Stmt>) -> Result<ByteCodeModule, CompileError> {
             n_locals: 0,
         },
         module: ByteCodeModule {
-            debug_info: ModuleDebugInfo::new(),
+            // debug_info: ModuleDebugInfo::new(),
             string_pool_cache: vec![],
             prototypes: vec![],
             code: vec![],

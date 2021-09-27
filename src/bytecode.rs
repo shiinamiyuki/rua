@@ -97,25 +97,25 @@ end
 
 
 */
-#[derive(Clone, Debug)]
-pub struct VarDebugInfo {
-    name: String,
-    loc: SourceLocation,
-}
-#[derive(Clone, Debug)]
-pub struct FuncDebugInfo {
-    locals: HashMap<u8, VarDebugInfo>,
-    upvalues: HashMap<u8, VarDebugInfo>,
-}
-#[derive(Clone, Debug)]
-pub struct ModuleDebugInfo {
-    funcs: Vec<FuncDebugInfo>,
-}
-impl ModuleDebugInfo {
-    pub fn new() -> Self {
-        Self { funcs: vec![] }
-    }
-}
+// #[derive(Clone, Debug)]
+// pub struct VarDebugInfo {
+//     name: String,
+//     loc: SourceLocation,
+// }
+// #[derive(Clone, Debug)]
+// pub struct FuncDebugInfo {
+//     locals: HashMap<u8, VarDebugInfo>,
+//     upvalues: HashMap<u8, VarDebugInfo>,
+// }
+// #[derive(Clone, Debug)]
+// pub struct ModuleDebugInfo {
+//     funcs: Vec<FuncDebugInfo>,
+// }
+// impl ModuleDebugInfo {
+//     pub fn new() -> Self {
+//         Self { funcs: vec![] }
+//     }
+// }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ByteCode {
     Op(OpCode),
@@ -131,7 +131,59 @@ pub struct ByteCodeModule {
     pub(crate) string_pool: Vec<String>,
     pub(crate) string_pool_cache: Vec<Value>,
     pub(crate) code: Vec<ByteCode>,
-    pub(crate) debug_info: ModuleDebugInfo,
+    // pub(crate) debug_info: ModuleDebugInfo,
+}
+impl ByteCodeModule {
+    pub(crate) fn pretty_print_instruction(&self, i: usize) -> String {
+        let inst = self.code[i];
+        match inst {
+            ByteCode::Op(op) => match op {
+                OpCode::Add => "add".into(),
+                OpCode::Sub => "sub".into(),
+                OpCode::Mul => "mul".into(),
+                OpCode::Div => "div".into(),
+                OpCode::Mod => "mof".into(),
+                OpCode::Pow => "pow".into(),
+                OpCode::Pop => "pop".into(),
+                OpCode::NotEqual => "ne".into(),
+                OpCode::Equal => "eq".into(),
+                OpCode::Return => "ret".into(),
+                OpCode::RotBCA => "rot-bca".into(),
+                OpCode::Dup => "dup".into(),
+                OpCode::Jump => "jump".into(),
+                OpCode::StoreTable => "store table".into(),
+                OpCode::LoadTable => "load table".into(),
+                _ => format!("{:?}", inst),
+            },
+            ByteCode::Op3U8(op, operands) => match op {
+                OpCode::LoadStr => format!(
+                    "load \"{}\"",
+                    self.string_pool[u32_from_3xu8(operands) as usize].escape_debug()
+                ),
+                OpCode::LoadTableStringKey => format!(
+                    "load table[\"{}\"]",
+                    self.string_pool[u32_from_3xu8(operands) as usize].escape_debug()
+                ),
+                OpCode::StoreTableStringKey => format!(
+                    "store table[\"{}\"]",
+                    self.string_pool[u32_from_3xu8(operands) as usize].escape_debug()
+                ),
+
+                OpCode::Call => format!("call n_args={}, n_rets={}", operands[0], operands[1]),
+                OpCode::NewClosure => format!("new closure, proto={}", u32_from_3xu8(operands)),
+                OpCode::StoreLocal => format!("store local[{}]", u32_from_3xu8(operands)),
+                OpCode::LoadLocal => format!("load local[{}]", u32_from_3xu8(operands)),
+                OpCode::StoreUpvalue => format!("store upval[{}]", u32_from_3xu8(operands)),
+                OpCode::LoadUpvalue => format!("load upval[{}]", u32_from_3xu8(operands)),
+                OpCode::CloseUpvalue => format!("close upval[{}]", u32_from_3xu8(operands)),
+                OpCode::TestJump => {
+                    format!("test jump {} {} {}", operands[0], operands[1], operands[2])
+                }
+                _ => format!("{:?}", inst),
+            },
+            _ => panic!(),
+        }
+    }
 }
 impl Debug for ByteCodeModule {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {

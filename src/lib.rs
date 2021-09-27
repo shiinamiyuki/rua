@@ -138,3 +138,17 @@ pub(crate) fn dummy_convert<T: 'static + Sized, U: 'static + Sized>(x: T) -> U {
         unreachable!()
     }
 }
+
+#[macro_export]
+macro_rules! debug_println {
+    ($($arg:expr),+) => {
+        #[cfg(debug_assertions)]
+        {
+            if let Ok(s) = std::env::var("DPRINT") {
+                if s=="1"{
+                    println!($($arg),+);
+                }
+            }
+        }
+    };
+}

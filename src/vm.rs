@@ -2,6 +2,7 @@ use crate::{
     api::{BaseApi, StateApi},
     bytecode::{get_3xu8, u32_from_3xu8, ByteCode, ByteCodeModule, OpCode},
     closure::{Callable, Closure, UpValue, UpValueInner},
+    debug_println,
     gc::{Gc, GcState, Traceable},
     runtime::{ConstantsIndex, ErrorKind, RuntimeError, RuntimeInner, ValueRef},
     state::{CallContext, Frame, State},
@@ -10,7 +11,13 @@ use crate::{
     Stack,
 };
 use smallvec::{smallvec, SmallVec};
-use std::{borrow::Borrow, cell::{Cell, RefCell, RefMut}, collections::HashMap, iter::FromIterator, rc::Rc};
+use std::{
+    borrow::Borrow,
+    cell::{Cell, RefCell, RefMut},
+    collections::HashMap,
+    iter::FromIterator,
+    rc::Rc,
+};
 
 /*
 The instances represents a thread
@@ -153,25 +160,35 @@ impl Instance {
             }),
         }
     }
-    fn close_all_upvalues(closure: &Closure) {
+    pub(crate) fn close_all_upvalues(closure: &Closure) {
         unsafe {
-            for v in &closure.upvalues {
-                let v = v.inner.borrow();
-                let inner = v.get();
-                match inner {
-                    UpValueInner::Open(p) => {
-                        v.set(UpValueInner::Closed(*p));
+            debug_println!("closing upvalues");
+            if closure.proto_idx == usize::MAX {
+                return;
+            }
+            let proto = &(*closure.module).prototypes[closure.proto_idx];
+            for (i, uv) in closure.upvalues.iter().enumerate() {
+                if !proto.upvalues[i].from_parent {
+                    let v = uv.inner.borrow();
+                    let inner = v.get();
+                    match inner {
+                        UpValueInner::Open(p) => {
+                            debug_println!("closing upvalue {} {:?} {}", i, Rc::as_ptr(&v), uv);
+                            v.set(UpValueInner::Closed(*p));
+                        }
+                        _ => {
+                            unreachable!()
+                        }
                     }
-                    UpValueInner::Empty => {
-                        unreachable!()
-                    }
-                    _ => {}
+                    std::mem::drop(v);
+                    let mut v = uv.inner.borrow_mut();
+                    *v = Rc::new(Cell::new(UpValueInner::Empty));
                 }
             }
         }
     }
     fn exec_frame(&self, state: &State, mut n_expected_rets: u8) -> Result<Continue, RuntimeError> {
-        let mut guard = RetGuard { bomb: false };
+        let mut guard = RetGuard { bomb: true };
         {
             let mut frames = state.frames.borrow_mut();
             let frame = frames.last_mut().unwrap();
@@ -188,11 +205,21 @@ impl Instance {
                     } else {
                         if !info.from_parent {
                             let mut v = v.inner.borrow_mut();
+                            // match v.get() {
+                            //     UpValueInner::Empty => {}
+                            //     _ => unreachable!(),
+                            // }
                             *v = Rc::new(Cell::new(UpValueInner::Open(
                                 &mut frame.locals[info.location as usize] as *mut Value,
                             )));
                         }
                     }
+                    debug_println!(
+                        "create upvalue {} {:?} {}",
+                        i,
+                        Rc::as_ptr(&v.inner.borrow()),
+                        v
+                    );
                 }
             }
         };
@@ -237,7 +264,7 @@ impl Instance {
             {
                 if let Ok(s) = std::env::var("PRINT_INST") {
                     if s == "1" {
-                        println!("{} {:?}", ip, instruction);
+                        println!("{} {}", ip, module.pretty_print_instruction(ip));
                     }
                 }
             }
@@ -423,7 +450,6 @@ impl Instance {
                                 _ => {
                                     if n_expected_rets > 1 {
                                         for _ in 1..n_expected_rets {
-                                            println!("push 1 nil");
                                             eval_stack.push(Value::Nil);
                                         }
                                     }
@@ -523,6 +549,7 @@ impl Instance {
                             let frame = frames.last_mut().unwrap();
                             let c = frame.closure.as_ref().unwrap();
                             eval_stack.push(c.get_upvalue(idx));
+                            // println!("{}",eval_stack.last().unwrap().print());
                         }
                     }
                     OpCode::LoadLocal => {
@@ -530,6 +557,7 @@ impl Instance {
                         let mut frames = state.frames.borrow_mut();
                         let frame = frames.last_mut().unwrap();
                         eval_stack.push(frame.locals[idx as usize]);
+                        // println!("{}",eval_stack.last().unwrap().print());
                     }
                     OpCode::StoreLocal => {
                         let idx = operands[0];
@@ -544,6 +572,12 @@ impl Instance {
                         let closure = frame.closure.as_ref().unwrap();
 
                         unsafe {
+                            debug_assert!(
+                                !closure.module.prototypes[closure.proto_idx].upvalues
+                                    [idx as usize]
+                                    .from_parent
+                            );
+                            debug_println!("close upvalue single {}", closure.upvalues[idx as usize]);
                             let mut v = closure.upvalues[idx as usize].inner.borrow_mut();
                             let inner = v.get();
                             match inner {
@@ -551,10 +585,7 @@ impl Instance {
                                     v.set(UpValueInner::Closed(*p));
                                     *v = Rc::new(Cell::new(UpValueInner::Open(p)));
                                 }
-                                UpValueInner::Empty => {
-                                    unreachable!()
-                                }
-                                _ => {}
+                                _ => unreachable!(),
                             }
                         }
                     }
@@ -610,7 +641,7 @@ impl Instance {
                                 Value::Closure(closure) => {
                                     let mut frames = state.frames.borrow_mut();
                                     let frame = frames.last_mut().unwrap();
-                                    Self::close_all_upvalues(&closure);
+                                    // Self::close_all_upvalues(&frame.closure.as_ref().unwrap());
                                     ip_modified = true;
                                     ip = Frame::get_ip(Some(closure));
                                     *frame = new_frame!(self.gc, eval_stack, n_args, Some(closure));
@@ -618,6 +649,12 @@ impl Instance {
                                     break;
                                 }
                                 Value::Callable(callable) => {
+                                    {
+                                        let mut frames = state.frames.borrow_mut();
+                                        // let frame = frames.last_mut().unwrap();
+                                        // Self::close_all_upvalues(&frame.closure.as_ref().unwrap());
+                                        frames.pop();
+                                    }
                                     ip += 1;
                                     let frame = new_frame!(self.gc, eval_stack, n_args, None);
                                     on_return!(Ok(Continue::CallExt(callable, frame, operands[1])));
@@ -732,6 +769,12 @@ impl Instance {
                             .map(|(i, info)| {
                                 debug_assert!(i == info.id as usize);
                                 if info.from_parent {
+                                    debug_println!(
+                                        "upvalue {}, {} from parent {}",
+                                        i,
+                                        parent.upvalues[info.location as usize],
+                                        info.location
+                                    );
                                     parent.upvalues[info.location as usize].clone()
                                 } else {
                                     UpValue {
@@ -833,12 +876,11 @@ impl Instance {
     }
 
     fn exec_frames_loop(&self, level: usize) -> Result<(), RuntimeError> {
-        let mut n_expected_rets = 1;
+        let mut n_expected_rets = vec![1];
         loop {
-            let cont = self.exec_frame(&self.state, n_expected_rets)?;
+            let cont = self.exec_frame(&self.state, *n_expected_rets.last().unwrap())?;
             match cont {
                 Continue::CallExt(callable, frame, n_expected_rets2) => {
-                    n_expected_rets = n_expected_rets2;
                     {
                         let mut frames = self.state.frames.borrow_mut();
                         frames.push(frame);
@@ -850,7 +892,7 @@ impl Instance {
                             instance: self,
                             state: &self.state,
                             frames: &*frames,
-                            n_expected_rets,
+                            n_expected_rets: n_expected_rets2,
                             ret_values: RefCell::new(smallvec![]),
                         };
                         func.call(&ctx)?;
@@ -861,14 +903,16 @@ impl Instance {
                     }
                 }
                 Continue::NewFrame(frame, n_expected_rets2) => {
-                    n_expected_rets = n_expected_rets2;
+                    // n_expected_rets = n_expected_rets2;
+                    n_expected_rets.push(n_expected_rets2);
                     let mut frames = self.state.frames.borrow_mut();
                     frames.push(frame);
                 }
                 Continue::Return => {
+                    n_expected_rets.pop();
                     let mut frames = self.state.frames.borrow_mut();
                     let closure = frames.last().unwrap().closure.as_ref().unwrap();
-                    Self::close_all_upvalues(&**closure);
+                    // Self::close_all_upvalues(&**closure);
                     frames.pop().unwrap();
                     if frames.len() == level {
                         break;
