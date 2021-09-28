@@ -7,7 +7,13 @@ use std::{
     vec,
 };
 
-use crate::{bytecode::*, closure::ClosurePrototype, debug_println, log_2, parse::{Expr, FunctionName, SourceLocation, Stmt, TableField, Token}, state::MAX_LOCALS};
+use crate::{
+    bytecode::*,
+    closure::ClosurePrototype,
+    debug_println, log_2,
+    parse::{Expr, FunctionName, SourceLocation, Stmt, TableField, Token},
+    state::MAX_LOCALS,
+};
 
 #[derive(Clone, Copy, Debug)]
 pub enum ErrorKind {
@@ -813,31 +819,35 @@ impl Compiler {
             } => {
                 self.compile_expr(cond, Default::default())?;
                 self.emit(ByteCode::Op3U8(OpCode::TestJump, [0, 1, 1]));
-                let mut jmp_end = vec![];
-                let l = self.new_label();
-                self.emit(ByteCode::Label(l.to_le_bytes()));
+                // let mut jmp_end = vec![];
+                let else_label = self.new_label();
+                let end = self.new_label();
+                self.emit(ByteCode::Label(else_label.to_le_bytes()));
                 self.compile_stmt(then)?;
+                self.emit(ByteCode::Op(OpCode::Jump));
+                self.emit(ByteCode::Label(end.to_le_bytes()));
+                self.emit_label(else_label);
                 for (cond, then) in else_ifs {
                     self.compile_expr(cond, Default::default())?;
                     self.emit(ByteCode::Op3U8(OpCode::TestJump, [0, 1, 1]));
-                    let l = self.new_label();
-                    self.emit(ByteCode::Label(l.to_le_bytes()));
+                    let else_label= self.new_label();
+                    self.emit(ByteCode::Label(else_label.to_le_bytes()));
                     self.compile_stmt(then)?;
                     self.emit(ByteCode::Op(OpCode::Jump));
-                    let end = self.new_label();
                     self.emit(ByteCode::Label(end.to_le_bytes()));
-                    jmp_end.push(end);
-                    self.emit_label(l);
+                    // jmp_end.push(end);
+                    self.emit_label(else_label);
                 }
-                self.emit_label(l);
+                
                 if let Some(else_) = else_ {
                     self.compile_stmt(else_)?;
                 }
-                {
-                    for jmp in jmp_end {
-                        self.emit_label(jmp);
-                    }
-                }
+                self.emit_label(end);
+                // {
+                //     for jmp in jmp_end {
+                //         self.emit_label(jmp);
+                //     }
+                // }
                 Ok(())
             }
             Stmt::While { loc, cond, body } => {
@@ -930,11 +940,15 @@ impl Compiler {
                 let ctrl_var = format!("##_var{}", self.module.code.len());
                 self.enter_scope(false);
                 let loc = block.loc();
+                let mut varnames = vec![];
+                let mut varnames_original = vec![];
                 for var in vars {
                     match &**var {
                         Expr::Identifier { token } => match token {
                             Token::Identifier { value, .. } => {
-                                self.add_var(value.clone());
+                                varnames_original.push(value);
+                                varnames.push(format!("##_{}_{}", value, self.module.code.len()));
+                                self.add_var(varnames.last().unwrap().clone());
                             }
                             _ => unreachable!(),
                         },
@@ -968,7 +982,11 @@ impl Compiler {
                 self.load_identifier(&s_var)?;
                 self.load_identifier(&f_var)?;
                 self.emit(ByteCode::Op3U8(OpCode::Call, [2, vars.len() as u8, 0])); // local var_1, ... , var_n = _f(_s, _var)
-                for var in vars.iter().rev() {
+                self.enter_scope(false);
+                for (i, var) in vars.iter().enumerate().rev() {
+                    self.add_var(varnames_original[i].clone());
+                    self.emit(ByteCode::Op(OpCode::Dup));
+                    self.store_variable(&varnames[i])?;
                     self.emit_store(var)?;
                 }
                 self.compile_expr(&vars[0], Default::default())?;
@@ -979,6 +997,7 @@ impl Compiler {
 
                 self.enter_scope(false);
                 self.compile_stmt(body)?;
+                self.leave_scope(false);
                 self.leave_scope(false);
                 self.emit(ByteCode::Op(OpCode::Jump));
                 self.emit(ByteCode::Label(begin.to_le_bytes()));
@@ -1048,7 +1067,7 @@ impl Compiler {
                     uid: env_uid,
                     location: 0,
                     is_special: false,
-                    name:"_ENV".into()
+                    name: "_ENV".into(),
                 },
             );
         } else {

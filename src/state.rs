@@ -11,7 +11,12 @@ use crate::{
     vm::Instance,
     Stack,
 };
-use std::{cell::{Cell, RefCell}, cmp::Ordering, process::abort, rc::{Rc, Weak}};
+use std::{
+    cell::{Cell, RefCell},
+    cmp::Ordering,
+    process::abort,
+    rc::{Rc, Weak},
+};
 
 pub const MAX_LOCALS: usize = 256;
 pub(crate) struct Frame {
@@ -41,10 +46,10 @@ impl Frame {
 }
 impl Drop for Frame {
     fn drop(&mut self) {
-        debug_println!("has_closed={}", self.has_closed);
-        if !self.has_closed {
-            abort();
-        }
+        // debug_println!("has_closed={}", self.has_closed);
+        // if !self.has_closed {
+        //     abort();
+        // }
         // unsafe {
         //     debug_println!("drop frame");
         //     if let Some(c) = self.closure {
@@ -285,6 +290,7 @@ impl State {
                     msg: format!("__index chain too long,possible loop",),
                 });
             }
+            let origin_table = table;
             let (value, mt) = {
                 let mt = self.get_metatable(table);
                 match table.as_table() {
@@ -319,7 +325,7 @@ impl State {
             )?;
             if table.as_callable().is_some() || table.as_closure().is_some() {
                 let instance = self.instance.upgrade().unwrap();
-                return instance.call(table, &[key]);
+                return instance.call(table, &[origin_table, key]);
             }
             if table.as_table().is_none() {
                 return Ok(Value::Nil);
@@ -354,7 +360,7 @@ impl State {
             }
             if newindex.as_callable().is_some() || newindex.as_closure().is_some() {
                 let instance = self.instance.upgrade().unwrap();
-                instance.call(newindex, &[key, value])?;
+                instance.call(newindex, &[table, key, value])?;
                 return Ok(());
             }
         }
@@ -639,19 +645,13 @@ impl State {
             }
             (Value::Closure(a), Value::Closure(b)) => Ok(Value::from_bool(a == b)),
             (Value::Callable(a), Value::Callable(b)) => Ok(Value::from_bool(a == b)),
+            (Value::Table(a), Value::Table(b)) if a == b => Ok(Value::from_bool(true)),
             _ => {
                 let mt_a = self.get_metatable(a);
                 let mt_b = self.get_metatable(b);
                 macro_rules! error {
                     () => {
-                        Err(RuntimeError {
-                            kind: ErrorKind::ArithmeticError,
-                            msg: format!(
-                                "attempt to perform compare {} with {}",
-                                a.type_of(),
-                                b.type_of()
-                            ),
-                        })
+                        Ok(Value::from_bool(false))
                     };
                 }
                 if !mt_a.is_nil() {

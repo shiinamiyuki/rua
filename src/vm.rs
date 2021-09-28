@@ -188,7 +188,7 @@ impl Instance {
         }
     }
     fn exec_frame(&self, state: &State, mut n_expected_rets: u8) -> Result<Continue, RuntimeError> {
-        let mut guard = RetGuard { bomb: true };
+        let mut guard = RetGuard { bomb: false };
         {
             let mut frames = state.frames.borrow_mut();
             let frame = frames.last_mut().unwrap();
@@ -286,8 +286,10 @@ impl Instance {
                     }
                     OpCode::Self_ => {
                         let method = eval_stack.pop().unwrap();
-                        let table = eval_stack.last().unwrap();
-                        let f = state.table_get(*table, method)?;
+                        let table = *eval_stack.last().unwrap();
+                        std::mem::drop(eval_stack);
+                        let f = state.table_get(table, method)?;
+                        let mut eval_stack = self.state.eval_stack.borrow_mut();
                         eval_stack.push(f);
                     }
                     OpCode::Not => {

@@ -15,24 +15,24 @@
 -- end)
 -- ut:run()
 
-function mystery(f)
-    local ctor = function ()
-        local object = {}
+-- function mystery(f)
+--     local ctor = function ()
+--         local object = {}
         
-        object.f = function()
-            f(object)
-        end
-        -- object.f()
-        -- print('inside end')
-        return object
-    end
-    return ctor
-end
+--         object.f = function()
+--             f(object)
+--         end
+--         -- object.f()
+--         -- print('inside end')
+--         return object
+--     end
+--     return ctor
+-- end
 
 
-local o = mystery(print)({})
-print(o)
-o.f()
+-- local o = mystery(print)({})
+-- print(o)
+-- o.f()
 function dummy()
 end
 
@@ -43,7 +43,8 @@ function foo(f)
             return f(o)
         end
         -- print('g')
-        dummy()
+        -- dummy()
+        print(o)
         return o
     end
 end
