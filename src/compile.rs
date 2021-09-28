@@ -7,13 +7,7 @@ use std::{
     vec,
 };
 
-use crate::{
-    bytecode::*,
-    closure::ClosurePrototype,
-    log_2,
-    parse::{Expr, FunctionName, SourceLocation, Stmt, TableField, Token},
-    state::MAX_LOCALS,
-};
+use crate::{bytecode::*, closure::ClosurePrototype, debug_println, log_2, parse::{Expr, FunctionName, SourceLocation, Stmt, TableField, Token}, state::MAX_LOCALS};
 
 #[derive(Clone, Copy, Debug)]
 pub enum ErrorKind {
@@ -262,7 +256,7 @@ impl Compiler {
 
                             let func = &mut self.funcs[tab.func_scope - 1];
                             if !func.upvalues.contains_key(&info.uid) {
-                                println!("local upvalue {}", name);
+                                debug_println!("local upvalue {}", name);
                                 let id = func.upvalues.len() as u32;
                                 let info = tab.get_cur(name).unwrap_or_else(|| {
                                     panic!("{}", name);

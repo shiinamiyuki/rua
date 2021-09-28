@@ -1,11 +1,17 @@
 use smallvec::{smallvec, SmallVec};
 
-use crate::{Stack, api::{BaseApi, CallApi, StateApi}, closure::Closure, debug_println, gc::{Gc, GcState, Traceable}, runtime::{ConstantsIndex, ErrorKind, GlobalState, RuntimeError, ValueRef}, table::Table, value::{Managed, Tuple, UserData, Value}, vm::Instance};
-use std::{
-    cell::{Cell, RefCell},
-    cmp::Ordering,
-    rc::{Rc, Weak},
+use crate::{
+    api::{BaseApi, CallApi, StateApi},
+    closure::Closure,
+    debug_println,
+    gc::{Gc, GcState, Traceable},
+    runtime::{ConstantsIndex, ErrorKind, GlobalState, RuntimeError, ValueRef},
+    table::Table,
+    value::{Managed, Tuple, UserData, Value},
+    vm::Instance,
+    Stack,
 };
+use std::{cell::{Cell, RefCell}, cmp::Ordering, process::abort, rc::{Rc, Weak}};
 
 pub const MAX_LOCALS: usize = 256;
 pub(crate) struct Frame {
@@ -14,6 +20,7 @@ pub(crate) struct Frame {
     pub(crate) closure: Option<Gc<Closure>>,
     pub(crate) ip: usize,
     pub(crate) n_args: usize,
+    pub(crate) has_closed: bool,
 }
 
 impl Frame {
@@ -28,17 +35,22 @@ impl Frame {
             closure,
             ip: Self::get_ip(closure),
             n_args,
+            has_closed: false,
         }
     }
 }
 impl Drop for Frame {
     fn drop(&mut self) {
-        unsafe {
-            debug_println!("drop frame");
-            if let Some(c) = self.closure {
-                Instance::close_all_upvalues(&c);
-            }
+        debug_println!("has_closed={}", self.has_closed);
+        if !self.has_closed {
+            abort();
         }
+        // unsafe {
+        //     debug_println!("drop frame");
+        //     if let Some(c) = self.closure {
+        //         Instance::close_all_upvalues(&c);
+        //     }
+        // }
     }
 }
 /*

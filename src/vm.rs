@@ -171,9 +171,9 @@ impl Instance {
                 if !proto.upvalues[i].from_parent {
                     let v = uv.inner.borrow();
                     let inner = v.get();
+                    debug_println!("closing upvalue {} {:?} {}", i, Rc::as_ptr(&v), uv);
                     match inner {
                         UpValueInner::Open(p) => {
-                            debug_println!("closing upvalue {} {:?} {}", i, Rc::as_ptr(&v), uv);
                             v.set(UpValueInner::Closed(*p));
                         }
                         _ => {
@@ -195,7 +195,7 @@ impl Instance {
             let closure = &frame.closure.unwrap();
             if closure.proto_idx == usize::MAX {
                 assert!(closure.upvalues.len() == 1);
-            } else {
+            } else if frame.ip == closure.entry {
                 for (i, v) in closure.upvalues.iter().enumerate() {
                     let proto = &(*closure.module).prototypes[closure.proto_idx];
                     let info = &proto.upvalues[i];
@@ -577,7 +577,10 @@ impl Instance {
                                     [idx as usize]
                                     .from_parent
                             );
-                            debug_println!("close upvalue single {}", closure.upvalues[idx as usize]);
+                            debug_println!(
+                                "close upvalue single {}",
+                                closure.upvalues[idx as usize]
+                            );
                             let mut v = closure.upvalues[idx as usize].inner.borrow_mut();
                             let inner = v.get();
                             match inner {
@@ -641,7 +644,8 @@ impl Instance {
                                 Value::Closure(closure) => {
                                     let mut frames = state.frames.borrow_mut();
                                     let frame = frames.last_mut().unwrap();
-                                    // Self::close_all_upvalues(&frame.closure.as_ref().unwrap());
+                                    frame.has_closed = true;
+                                    Self::close_all_upvalues(&frame.closure.as_ref().unwrap());
                                     ip_modified = true;
                                     ip = Frame::get_ip(Some(closure));
                                     *frame = new_frame!(self.gc, eval_stack, n_args, Some(closure));
@@ -651,9 +655,10 @@ impl Instance {
                                 Value::Callable(callable) => {
                                     {
                                         let mut frames = state.frames.borrow_mut();
-                                        // let frame = frames.last_mut().unwrap();
-                                        // Self::close_all_upvalues(&frame.closure.as_ref().unwrap());
-                                        frames.pop();
+                                        let frame = frames.last_mut().unwrap();
+                                        Self::close_all_upvalues(&frame.closure.as_ref().unwrap());
+                                        frame.has_closed = true;
+                                    //     // frames.pop();
                                     }
                                     ip += 1;
                                     let frame = new_frame!(self.gc, eval_stack, n_args, None);
@@ -769,13 +774,15 @@ impl Instance {
                             .map(|(i, info)| {
                                 debug_assert!(i == info.id as usize);
                                 if info.from_parent {
+                                    let p = parent.upvalues[info.location as usize].clone();
                                     debug_println!(
-                                        "upvalue {}, {} from parent {}",
+                                        "upvalue {} {:?}, {} from parent {}",
                                         i,
+                                        Rc::as_ptr(&p.inner.borrow()),
                                         parent.upvalues[info.location as usize],
                                         info.location
                                     );
-                                    parent.upvalues[info.location as usize].clone()
+                                    p
                                 } else {
                                     UpValue {
                                         inner: RefCell::new(Rc::new(Cell::new(
@@ -881,6 +888,7 @@ impl Instance {
             let cont = self.exec_frame(&self.state, *n_expected_rets.last().unwrap())?;
             match cont {
                 Continue::CallExt(callable, frame, n_expected_rets2) => {
+                    debug_assert!(frame.closure.is_none());
                     {
                         let mut frames = self.state.frames.borrow_mut();
                         frames.push(frame);
@@ -899,6 +907,7 @@ impl Instance {
                     }
                     {
                         let mut frames = self.state.frames.borrow_mut();
+                        frames.last_mut().unwrap().has_closed = true;
                         frames.pop().unwrap();
                     }
                 }
@@ -911,8 +920,9 @@ impl Instance {
                 Continue::Return => {
                     n_expected_rets.pop();
                     let mut frames = self.state.frames.borrow_mut();
+                    frames.last_mut().unwrap().has_closed = true;
                     let closure = frames.last().unwrap().closure.as_ref().unwrap();
-                    // Self::close_all_upvalues(&**closure);
+                    Self::close_all_upvalues(&**closure);
                     frames.pop().unwrap();
                     if frames.len() == level {
                         break;
