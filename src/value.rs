@@ -18,19 +18,22 @@ use crate::{
     table::Table,
 };
 
-pub struct Managed<T: 'static> {
+pub struct Managed<T: 'static + Any> {
     pub data: T,
-    // metatable:Cell<Value>,
+    metatable: Cell<Value>,
 }
 pub type LightUserData<T> = Managed<T>;
 impl<T> Managed<T> {
     pub fn new(data: T) -> Self {
-        Self { data }
+        Self {
+            data,
+            metatable: Cell::new(Value::Nil),
+        }
     }
 }
 impl<T> Traceable for Managed<T> {
-    fn trace(&self, _gc: &GcState) {
-        // gc.trace(&self.metatable.get());
+    fn trace(&self, gc: &GcState) {
+        gc.trace(&self.metatable.get());
     }
 }
 
@@ -43,24 +46,27 @@ pub trait UserData: Traceable + Any {
     fn set_metatable(&self, v: ValueRef<'_>);
     fn get_metatable<'a>(&'a self) -> ValueRef<'a>;
 }
-impl<T> UserData for Managed<T> {
+impl<T> UserData for Managed<T>
+where
+    T: Any,
+{
     fn as_traceable(&self) -> &dyn Traceable {
         self
     }
     fn as_any(&self) -> &dyn Any {
-        self
+        &self.data
     }
     fn type_name(&self) -> &'static str {
         std::any::type_name::<T>()
     }
 
-    fn set_metatable(&self, _v: ValueRef<'_>) {
-        // self.metatable.set(v.value);
+    fn set_metatable(&self, v: ValueRef<'_>) {
+        self.metatable.set(v.value);
     }
 
     fn get_metatable<'a>(&'a self) -> ValueRef<'a> {
-        // ValueRef::new(self.metatable.get())
-        ValueRef::new(Value::Nil)
+        ValueRef::new(self.metatable.get())
+        // ValueRef::new(Value::Nil)
     }
 }
 impl Traceable for Box<dyn UserData> {

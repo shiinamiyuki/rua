@@ -165,7 +165,7 @@ pub struct CallContext<'a> {
     pub(crate) state: &'a State,
     pub(crate) instance: &'a Instance,
     pub(crate) ret_values: RefCell<SmallVec<[Value; 8]>>,
-    pub(crate) frames: &'a Stack<Frame>,
+    pub(crate) frame: Frame,
     pub(crate) n_expected_rets: u8,
 }
 
@@ -274,7 +274,7 @@ impl State {
         table.set(key, value);
         Ok(())
     }
-    pub(crate) fn table_get(&self, mut table: Value, key: Value) -> Result<Value, RuntimeError> {
+    pub(crate) fn table_get(&self, table: Value, key: Value) -> Result<Value, RuntimeError> {
         self.table_get_impl(table, key, 0)
     }
     pub(crate) fn table_get_impl(
@@ -348,6 +348,13 @@ impl State {
         value: Value,
         depth: u32,
     ) -> Result<(), RuntimeError> {
+        if let Some(table) = table.as_table() {
+            let mut table = table.borrow_mut();
+            if !table.get(key).is_nil() {
+                table.set(key, value);
+                return Ok(());
+            }
+        }
         let mt = self.get_metatable(table);
         if !mt.is_nil() {
             let newindex = self.table_get_impl(
@@ -876,7 +883,7 @@ impl<'b> BaseApi for CallContext<'b> {
         key: ValueRef<'a>,
         value: ValueRef<'a>,
     ) -> Result<(), RuntimeError> {
-        todo!()
+        self.instance.table_rawset(table, key, value)
     }
 
     fn table_rawget<'a>(
@@ -884,7 +891,11 @@ impl<'b> BaseApi for CallContext<'b> {
         table: ValueRef<'a>,
         key: ValueRef<'a>,
     ) -> Result<ValueRef<'a>, RuntimeError> {
-        todo!()
+        self.instance.table_rawget(table, key)
+    }
+
+    fn get_global_env<'a>(&self) -> ValueRef<'a> {
+        self.instance.get_global_env()
     }
 }
 
@@ -908,14 +919,12 @@ impl<'b> StateApi for CallContext<'b> {
 }
 impl<'b> CallApi for CallContext<'b> {
     fn arg_count(&self) -> usize {
-        let frame = self.frames.last().unwrap();
-        frame.n_args
+        self.frame.n_args
     }
 
     fn arg_or_nil<'a>(&'a self, i: usize) -> ValueRef<'a> {
-        let frame = self.frames.last().unwrap();
-        if i < frame.n_args {
-            ValueRef::new(frame.locals[i])
+        if i < self.frame.n_args {
+            ValueRef::new(self.frame.locals[i])
             // Some(self.eval_stack.borrow()[frame.frame_bottom + i])
         } else {
             ValueRef::new(Value::nil())
@@ -923,9 +932,8 @@ impl<'b> CallApi for CallContext<'b> {
     }
 
     fn arg<'a>(&'a self, i: usize) -> Result<ValueRef<'a>, RuntimeError> {
-        let frame = self.frames.last().unwrap();
-        if i < frame.n_args {
-            Ok(ValueRef::new(frame.locals[i]))
+        if i < self.frame.n_args {
+            Ok(ValueRef::new(self.frame.locals[i]))
             // Some(self.eval_stack.borrow()[frame.frame_bottom + i])
         } else {
             Err(RuntimeError {

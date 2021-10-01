@@ -3,10 +3,9 @@ use std::fs::{File, OpenOptions};
 use std::io::{BufReader, BufWriter};
 use std::rc::Rc;
 
-use crate::runtime::{ErrorKind, Runtime, RuntimeError};
 use crate::api::*;
-
-
+use crate::runtime::{ErrorKind, Runtime, RuntimeError, ValueRef};
+use crate::value::Value;
 
 // macro_rules! bind_function {
 //     ($func:ident, fn($arg0:ty)->$ret:ty) => {
@@ -73,6 +72,54 @@ pub(crate) fn add_math_lib(runtime: &Runtime) {
         Ok(())
     });
     runtime.add_module("math".into(), math);
+}
+pub(crate) fn add_string_lib(runtime: &Runtime) {
+    let mut m = runtime.create_module();
+    m.function("lower".into(), |ctx| {
+        let s = ctx.arg(0)?.cast::<String>()?;
+        ctx.ret(0, ctx.create_string(s.to_ascii_lowercase()));
+        Ok(())
+    });
+    m.function("upper".into(), |ctx| {
+        let s = ctx.arg(0)?.cast::<String>()?;
+        ctx.ret(0, ctx.create_string(s.to_ascii_uppercase()));
+        Ok(())
+    });
+    m.function("sub".into(), |ctx| {
+        let s = ctx.arg(0)?.cast::<String>()?;
+        let i = *ctx.arg(1)?.cast::<f64>()? as usize;
+        let j = *ctx.arg(2)?.cast::<f64>()? as usize;
+        ctx.ret(0, ctx.create_string(String::from(&s[i..=j])));
+        Ok(())
+    });
+    m.function("char".into(), |ctx| {
+        let mut s = String::new();
+        for i in 0..ctx.arg_count() {
+            let ch = *ctx.arg(i)?.cast::<f64>()? as u8;
+            s.push(ch as char);
+        }
+        ctx.ret(0, ctx.create_string(s));
+        Ok(())
+    });
+    m.function("byte".into(), |ctx| {
+        let s = ctx.arg(0)?.cast::<String>()?;
+        if ctx.arg_count() >= 2 {
+            let i = *ctx.arg(1)?.cast::<f64>()? as usize;
+            if !(i >= 1 && i <= s.len()) {
+                ctx.ret(0, ValueRef::new(Value::Nil));
+            } else {
+                ctx.ret(
+                    0,
+                    ctx.create_number(s.chars().nth(i - 1).unwrap() as u8 as f64),
+                );
+            }
+        } else {
+            ctx.ret(0, ctx.create_number(s.chars().nth(0).unwrap() as u8 as f64));
+        }
+
+        Ok(())
+    });
+    runtime.add_module("string".into(), m);
 }
 // type FileHandle = Rc<RefCell<FileRecord>>;
 // struct IOContext {
@@ -197,7 +244,7 @@ pub(crate) fn add_math_lib(runtime: &Runtime) {
 //         io.function("output".into(), move |ctx| {
 //             let arg0 = ctx.arg(0)?;
 //             if arg0.is_nil(){
-//                 let 
+//                 let
 //             }
 //             let handle = arg0.cast_ref::<FileHandle>()?;
 //             {
@@ -219,7 +266,7 @@ pub(crate) fn add_math_lib(runtime: &Runtime) {
 //         io.function("read".into(), move |ctx| {
 //             let mut io_ctx = io_ctx.borrow_mut();
 //             if io_ctx.input.is_none() {
-//                 let s = 
+//                 let s =
 //             }
 //             let mut input = io_ctx.input.
 //             Ok(())

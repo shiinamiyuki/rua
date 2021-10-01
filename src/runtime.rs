@@ -9,7 +9,7 @@ use std::{
 
 use ordered_float::OrderedFloat;
 
-use crate::runtime::ErrorKind::ExternalError;
+use crate::{api::StateApi, runtime::ErrorKind::ExternalError};
 use crate::{
     api::{BaseApi, CallApi},
     bytecode::ByteCodeModule,
@@ -104,6 +104,7 @@ pub(crate) enum ConstantsIndex {
     MtKeyLen,
     MtKeyNeg,
     MtKeyCall,
+    MtKeyToString,
     NumConstants,
 }
 
@@ -172,10 +173,11 @@ impl From<f64> for RustPrimitive {
     }
 }
 
+#[derive(Clone, Copy)]
 pub struct ValueRef<'a> {
     pub(crate) value: Value,
     pub(crate) phantom: PhantomData<&'a u32>,
-    pub(crate) prim: UnsafeCell<RustPrimitive>,
+    // pub(crate) prim: UnsafeCell<RustPrimitive>,
 }
 
 impl<'a> ValueRef<'a> {
@@ -183,7 +185,7 @@ impl<'a> ValueRef<'a> {
         Self {
             value: v,
             phantom: PhantomData {},
-            prim: UnsafeCell::new(RustPrimitive::Unit),
+            // prim: UnsafeCell::new(RustPrimitive::Unit),
         }
     }
 }
@@ -229,7 +231,11 @@ macro_rules! arg_user {
                 } else {
                     return Err(RuntimeError {
                         kind: ErrorKind::TypeError,
-                        msg: format!("expected type 'userdata' but is {}", userdata.type_name()),
+                        msg: format!(
+                            "expected type 'userdata' {} but is {}",
+                            userdata.type_name(),
+                            std::any::type_name::<$t>()
+                        ),
                     });
                 }
             }
@@ -349,7 +355,7 @@ impl<'a> ValueRef<'a> {
     //         panic!("attempt to cast a userdata, use cast_ref instead!");
     //     }
     // }
-    pub fn cast<T: 'static>(&self) -> Result<&T, RuntimeError> {
+    pub fn cast<T: 'static>(&self) -> Result<&'a T, RuntimeError> {
         if TypeId::of::<f64>() == TypeId::of::<T>() {
             let x = arg_f64!(self)?;
             Ok(dummy_convert_ref::<f64, T>(x))
@@ -478,10 +484,29 @@ impl<'a> Drop for RootBorrowMut<'a> {
         *self._ref = self.value.value;
     }
 }
-
+// pub struct LuaClass {
+//     runtime: Rc<RefCell<RuntimeInner>>,
+// }
+// impl LuaClass {
+//     pub fn function<'a, F: Fn(&CallContext<'_>) -> Result<(), RuntimeError> + 'static>(
+//         &'a mut self,
+//         name: String,
+//         f: F,
+//     ) -> &mut Module {
+//         {
+//             let gc = self.runtime.borrow().gc.clone();
+//             let mut table = self.module.as_table().unwrap().borrow_mut();
+//             table.set(
+//                 Value::String(gc.allocate(Managed::new(name))),
+//                 Value::Callable(gc.allocate(Box::new(NativeFunction::new(f)))),
+//             );
+//         }
+//         self
+//     }
+// }
 pub struct Module {
     runtime: Rc<RefCell<RuntimeInner>>,
-    module: Value,
+    pub(crate) module: Value,
 }
 
 impl Module {
@@ -528,6 +553,16 @@ impl Runtime {
             inner.add_std_lib(r.inner.clone());
         }
         stdlib::add_math_lib(&r);
+        stdlib::add_string_lib(&r);
+
+        #[cfg(feature = "complete")]
+        crate::na_bind::add_na_lib(&r);
+        {
+            let std_src = include_str!("stdlib.lua");
+            let instance = r.create_instance();
+            let module = compile_src("stdlib.lua", std_src).unwrap();
+            instance.exec(module).unwrap();
+        }
         r
     }
     pub fn create_instance(&self) -> Rc<Instance> {
@@ -587,9 +622,8 @@ impl Runtime {
     }
 }
 
-pub(crate) fn compile_file(path: &str) -> Result<ByteCodeModule, RuntimeError> {
-    let src = std::fs::read_to_string(path).unwrap();
-    let tokens = tokenize("test.lua", &src);
+pub(crate) fn compile_src(filename: &str, src: &str) -> Result<ByteCodeModule, RuntimeError> {
+    let tokens = tokenize(filename, src);
     let tokens = tokens.map_err(|err| RuntimeError {
         kind: ErrorKind::CompileError,
         msg: format!(
@@ -615,6 +649,10 @@ pub(crate) fn compile_file(path: &str) -> Result<ByteCodeModule, RuntimeError> {
         ),
     })?;
     Ok(module)
+}
+pub(crate) fn compile_file(path: &str) -> Result<ByteCodeModule, RuntimeError> {
+    let src = std::fs::read_to_string(path).unwrap();
+    compile_src(path, &src)
 }
 
 impl RuntimeInner {
@@ -674,13 +712,44 @@ impl RuntimeInner {
         instance
     }
     fn add_std_lib(&mut self, pself: Rc<RefCell<RuntimeInner>>) {
+        {
+            let pself = pself.clone();
+            self.add_function("tostring".into(), move |ctx| {
+                let v = ctx.arg(0)?;
+                let s = {
+                    let mt = ctx.get_metatable(v);
+                    if !mt.value.is_nil() {
+                        let tostring = ctx.table_get(
+                            mt,
+                            ValueRef::new(
+                                pself.borrow().global_state.as_ref().unwrap().constants
+                                    [ConstantsIndex::MtKeyToString as usize]
+                                    .get(),
+                            ),
+                        )?;
+                        if tostring.value.is_nil() {
+                            ctx.create_string(v.value.print())
+                        } else {
+                            ctx.call(tostring, &[v])?
+                        }
+                    } else {
+                        ctx.create_string(v.value.print())
+                    }
+                };
+                ctx.ret(0, s);
+                Ok(())
+            });
+        }
         self.add_function("print".into(), |ctx| {
             for i in 0..ctx.arg_count() {
                 let arg = ctx.arg(i).unwrap();
                 if i > 0 {
                     print!(" ");
                 }
-                print!("{}", arg.value.print());
+                let env = ctx.get_global_env();
+                let tostring = ctx.table_get(env, ctx.create_string("tostring".into()))?;
+                let s = ctx.call(tostring, &[arg])?;
+                print!("{}", s.value.print());
             }
             print!("\n");
             Ok(())
@@ -700,7 +769,9 @@ impl RuntimeInner {
                     let mut inner = pself.borrow_mut();
                     inner.create_instance(pself.clone())
                 };
-                instance.exec(module)
+                let ret = instance.exec(module)?;
+                ctx.ret(0, ret);
+                Ok(())
             });
         }
         self.add_function("rawget".into(), |ctx| {
@@ -866,6 +937,8 @@ impl RuntimeInner {
             runtime.create_pooled_string(&String::from("__len"));
         constants[ConstantsIndex::MtKeyNeg as usize] =
             runtime.create_pooled_string(&String::from("__unm"));
+        constants[ConstantsIndex::MtKeyToString as usize] =
+            runtime.create_pooled_string(&String::from("__tostring"));
         for v in &constants {
             assert!(!v.is_nil());
         }
@@ -892,7 +965,7 @@ impl GlobalState {
             Value::Closure(_) => Value::Nil,
             Value::Callable(_) => Value::Nil,
             Value::Tuple(t) => t.metatable.get(),
-            Value::UserData(_) => todo!(),
+            Value::UserData(p) => p.get_metatable().value,
         }
     }
     pub(crate) fn set_metatable(&self, v: Value, mt: Value) {
@@ -910,7 +983,7 @@ impl GlobalState {
             Value::Tuple(t) => {
                 t.metatable.set(mt);
             }
-            Value::UserData(_) => todo!(),
+            Value::UserData(p) => p.set_metatable(ValueRef::new(mt)),
         }
     }
 }
@@ -967,19 +1040,19 @@ impl BaseApi for Runtime {
     }
 
     fn create_closure<'a>(&self, closure: Box<dyn Callable>) -> ValueRef<'a> {
-        todo!()
+        self.inner.create_closure(closure)
     }
 
     fn create_table<'a>(&self) -> ValueRef<'a> {
-        todo!()
+        self.inner.create_table()
     }
 
     fn set_metatable<'a>(&self, v: ValueRef<'a>, mt: ValueRef<'a>) {
-        todo!()
+        self.inner.set_metatable(v, mt)
     }
 
     fn get_metatable<'a>(&self, v: ValueRef<'a>) -> ValueRef<'a> {
-        todo!()
+        self.inner.get_metatable(v)
     }
 
     fn table_rawset<'a>(
@@ -988,7 +1061,7 @@ impl BaseApi for Runtime {
         key: ValueRef<'a>,
         value: ValueRef<'a>,
     ) -> Result<(), RuntimeError> {
-        todo!()
+        self.inner.table_rawset(table, key, value)
     }
 
     fn table_rawget<'a>(
@@ -996,11 +1069,18 @@ impl BaseApi for Runtime {
         table: ValueRef<'a>,
         key: ValueRef<'a>,
     ) -> Result<ValueRef<'a>, RuntimeError> {
-        todo!()
+        self.inner.table_rawget(table, key)
+    }
+
+    fn get_global_env<'a>(&self) -> ValueRef<'a> {
+        self.inner.get_global_env()
     }
 }
 
 impl BaseApi for Rc<RefCell<RuntimeInner>> {
+    fn get_global_env<'a>(&self) -> ValueRef<'a> {
+        ValueRef::new(self.borrow().globals)
+    }
     fn create_number<'a>(&'a self, x: f64) -> ValueRef<'a> {
         ValueRef::new(Value::from_number(x))
     }
@@ -1076,7 +1156,15 @@ impl BaseApi for Rc<RefCell<RuntimeInner>> {
         key: ValueRef<'a>,
         value: ValueRef<'a>,
     ) -> Result<(), RuntimeError> {
-        todo!()
+        if let Some(table) = table.value.as_table() {
+            table.borrow_mut().set(key.value, value.value);
+            Ok(())
+        } else {
+            Err(RuntimeError {
+                kind: ErrorKind::TypeError,
+                msg: format!("attempt to call rawset on a {} value", table.type_of()),
+            })
+        }
     }
 
     fn table_rawget<'a>(
@@ -1084,7 +1172,14 @@ impl BaseApi for Rc<RefCell<RuntimeInner>> {
         table: ValueRef<'a>,
         key: ValueRef<'a>,
     ) -> Result<ValueRef<'a>, RuntimeError> {
-        todo!()
+        if let Some(table) = table.value.as_table() {
+            Ok(ValueRef::new(table.borrow().get(key.value)))
+        } else {
+            Err(RuntimeError {
+                kind: ErrorKind::TypeError,
+                msg: format!("attempt to call rawget on a {} value", table.type_of()),
+            })
+        }
     }
 }
 

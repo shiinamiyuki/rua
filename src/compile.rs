@@ -124,6 +124,7 @@ enum FunctionLocation {
     Local,
     Global,
     Stack,
+    Repl,
 }
 #[derive(Clone, Debug)]
 pub(crate) struct UpValueInfo {
@@ -145,6 +146,7 @@ struct Compiler {
     var_uid_gen: u32,
     label_gen: u32,
     labels: HashMap<u32, usize>,
+    break_labels: Vec<u32>,
 }
 macro_rules! compile_assign_impl {
     ($self:expr, $loc:expr, $lhs:expr, $rhs:expr, $is_local_var_def:expr,$handle_var_def:expr, $compile_lhs:expr) => {{
@@ -677,6 +679,22 @@ impl Compiler {
     }
     fn compile_stmt(&mut self, block: &Stmt) -> Result<(), CompileError> {
         match &*block {
+            Stmt::Break { .. } => {
+                if self.break_labels.is_empty() {
+                    return Err(CompileError {
+                        kind: ErrorKind::SemanticError,
+                        loc: block.loc().clone(),
+                        msg: "break but be contained in loop!".into(),
+                    });
+                } else {
+                    unsafe { self.close_upvalues_this_scope() };
+                    self.emit(ByteCode::Op(OpCode::Jump));
+                    self.emit(ByteCode::Label(
+                        self.break_labels.last().unwrap().to_le_bytes(),
+                    ));
+                    Ok(())
+                }
+            }
             Stmt::Return { loc: _, expr } => {
                 if expr.len() == 1 {
                     self.compile_expr(&expr[0], Default::default())?;
@@ -830,7 +848,7 @@ impl Compiler {
                 for (cond, then) in else_ifs {
                     self.compile_expr(cond, Default::default())?;
                     self.emit(ByteCode::Op3U8(OpCode::TestJump, [0, 1, 1]));
-                    let else_label= self.new_label();
+                    let else_label = self.new_label();
                     self.emit(ByteCode::Label(else_label.to_le_bytes()));
                     self.compile_stmt(then)?;
                     self.emit(ByteCode::Op(OpCode::Jump));
@@ -838,7 +856,7 @@ impl Compiler {
                     // jmp_end.push(end);
                     self.emit_label(else_label);
                 }
-                
+
                 if let Some(else_) = else_ {
                     self.compile_stmt(else_)?;
                 }
@@ -857,12 +875,14 @@ impl Compiler {
                 self.compile_expr(cond, Default::default())?;
                 self.emit(ByteCode::Op3U8(OpCode::TestJump, [0, 1, 1]));
                 let l = self.new_label();
+                self.break_labels.push(l);
                 self.emit(ByteCode::Label(l.to_le_bytes()));
                 self.compile_stmt(body)?;
                 self.emit(ByteCode::Op(OpCode::Jump));
                 self.emit(ByteCode::Label(begin.to_le_bytes()));
                 // self.emit(ByteCode::Address((start as u32).to_le_bytes()));
                 self.emit_label(l);
+                self.break_labels.pop();
                 Ok(())
             }
             Stmt::Repeat { loc, cond, body } => todo!(),
@@ -922,16 +942,18 @@ impl Compiler {
                 self.push_number(0.0);
                 self.emit(ByteCode::Op(OpCode::GreaterThan));
                 self.emit(ByteCode::Op3U8(OpCode::TestJump, [0, 1, 1]));
+                let end = self.new_label();
+                self.break_labels.push(end);
                 let l = self.new_label();
                 self.emit(ByteCode::Label(l.to_le_bytes()));
                 gen_for_loop!(LessThanEqual);
-                let end = self.new_label();
                 self.emit(ByteCode::Op(OpCode::Jump));
                 self.emit(ByteCode::Label(end.to_le_bytes()));
                 self.emit_label(l);
                 gen_for_loop!(GreaterThanEqual);
                 self.emit_label(end);
                 self.leave_scope(false);
+                self.break_labels.pop();
                 Ok(())
             }
             Stmt::ForIn { vars, range, body } => {
@@ -977,6 +999,7 @@ impl Compiler {
 
                 let end = self.new_label();
                 let begin = self.new_label();
+                self.break_labels.push(end);
                 self.emit_label(begin);
                 self.load_identifier(&ctrl_var)?;
                 self.load_identifier(&s_var)?;
@@ -1003,6 +1026,7 @@ impl Compiler {
                 self.emit(ByteCode::Label(begin.to_le_bytes()));
                 self.emit_label(end);
                 self.leave_scope(false);
+                self.break_labels.pop();
                 Ok(())
             }
             Stmt::Assign { loc, lhs, rhs } => {
@@ -1046,7 +1070,7 @@ impl Compiler {
         self.emit(ByteCode::Label(end.to_le_bytes()));
         let entry = self.module.code.len() as u32;
         self.enter_scope(true);
-
+        let tmp = std::mem::replace(&mut self.break_labels, vec![]);
         if let None = self.symbols.get(&"_ENV".into()) {
             let env_uid = self.new_var_uid();
             self.symbols.set(
@@ -1129,7 +1153,20 @@ impl Compiler {
         }
         self.symbols.n_locals = arg_offset as usize + args.len();
         self.compile_stmt(body)?;
-        self.emit(ByteCode::Op(OpCode::LoadNil));
+        match location {
+            FunctionLocation::Repl => match *self.module.code.last().unwrap() {
+                ByteCode::Op(OpCode::Pop) => {
+                    self.module.code.pop().unwrap();
+                }
+                _ => {
+                    self.emit(ByteCode::Op(OpCode::LoadNil));
+                }
+            },
+            _ => {
+                self.emit(ByteCode::Op(OpCode::LoadNil));
+            }
+        }
+
         self.emit(ByteCode::Op(OpCode::Return));
         let proto = ClosurePrototype {
             n_args: if has_varargs {
@@ -1181,26 +1218,29 @@ impl Compiler {
                     // for (_i, acc) in access_chain.iter().enumerate().rev() {
                     //     self.push_string(acc);
                     // }
-                    {
-                        let info = *self.symbols.get(&"_ENV".into()).unwrap();
-                        if info.is_upvalue {
-                            self.emit(ByteCode::Op3U8(
-                                OpCode::LoadUpvalue,
-                                get_3xu8(info.location),
-                            ));
-                        } else {
-                            self.emit(ByteCode::Op3U8(OpCode::LoadLocal, get_3xu8(info.location)));
-                        }
-                    }
+                    // {
+                    //     let info = *self.symbols.get(&"_ENV".into()).unwrap();
+                    //     if info.is_upvalue {
+                    //         self.emit(ByteCode::Op3U8(
+                    //             OpCode::LoadUpvalue,
+                    //             get_3xu8(info.location),
+                    //         ));
+                    //     } else {
+                    //         self.emit(ByteCode::Op3U8(OpCode::LoadLocal, get_3xu8(info.location)));
+                    //     }
+                    // }
+                    self.load_identifier(&access_chain[0])?;
                     if let Some(method) = method {
-                        for (_i, acc) in access_chain.iter().enumerate() {
+                        assert!(access_chain.len() > 0);
+                        for (_i, acc) in access_chain.iter().enumerate().skip(1) {
                             let idx = self.string_pool_index(*acc);
                             self.emit(ByteCode::Op3U8(OpCode::LoadTableStringKey, get_3xu8(idx)));
                         }
                         let idx = self.string_pool_index(method);
                         self.emit(ByteCode::Op3U8(OpCode::StoreTableStringKey, get_3xu8(idx)));
                     } else {
-                        for (i, acc) in access_chain.iter().enumerate() {
+                        assert!(access_chain.len() > 1);
+                        for (i, acc) in access_chain.iter().enumerate().skip(1) {
                             let idx = self.string_pool_index(*acc);
                             if i != access_chain.len() - 1 {
                                 self.emit(ByteCode::Op3U8(
@@ -1251,7 +1291,9 @@ impl Compiler {
                 _ => unreachable!(),
             },
             FunctionLocation::Stack => {}
+            FunctionLocation::Repl => {}
         };
+        self.break_labels = tmp;
         Ok(())
     }
     fn store_variable(&mut self, name: &String) -> Result<(), CompileError> {
@@ -1328,7 +1370,7 @@ impl Compiler {
         }
     }
     fn resolve_labels(&mut self) {
-        for (i, inst) in self.module.code.iter_mut().enumerate() {
+        for (_i, inst) in self.module.code.iter_mut().enumerate() {
             match *inst {
                 ByteCode::Label(label) => {
                     let level = u32::from_le_bytes(label);
@@ -1339,23 +1381,34 @@ impl Compiler {
             }
         }
     }
-    fn run(&mut self, block: Rc<Stmt>) -> Result<ByteCodeModule, CompileError> {
-        self.enter_scope(true);
-        {
-            let env_uid = self.new_var_uid();
-            self.symbols.set(
-                "_ENV".into(),
-                VarInfo {
-                    func_scope: self.funcs.len(),
-                    location: 0,
-                    uid: env_uid,
-                    is_upvalue: true,
-                },
-            );
-        }
+    fn run(&mut self, block: Rc<Stmt>, is_eval: bool) -> Result<ByteCodeModule, CompileError> {
+        // self.enter_scope(true);
+        // {
+        //     let env_uid = self.new_var_uid();
+        //     self.symbols.set(
+        //         "_ENV".into(),
+        //         VarInfo {
+        //             func_scope: self.funcs.len(),
+        //             location: 0,
+        //             uid: env_uid,
+        //             is_upvalue: true,
+        //         },
+        //     );
+        // }
 
-        self.compile_stmt(&*block)?;
-        self.leave_scope(true);
+        // self.compile_stmt(&*block)?;
+        // self.leave_scope(true);
+        self.compile_function(
+            None,
+            &vec![],
+            &*block,
+            if is_eval {
+                FunctionLocation::Repl
+            } else {
+                FunctionLocation::Stack
+            },
+        )?;
+        self.emit(ByteCode::Op3U8(OpCode::Call, [0, 1, 0]));
         self.resolve_labels();
         let module = std::mem::replace(
             &mut self.module,
@@ -1395,7 +1448,7 @@ impl Compiler {
     }
     unsafe fn close_upvalues_this_scope(&mut self) {
         let mut upvalues_to_close = vec![];
-        for (var, info) in &self.symbols.vars {
+        for (_var, info) in &self.symbols.vars {
             let upvalues = &self.funcs.last().unwrap().upvalues;
 
             if let Some(upvalue_info) = upvalues.get(&info.uid) {
@@ -1444,6 +1497,7 @@ pub fn compile(block: Rc<Stmt>) -> Result<ByteCodeModule, CompileError> {
             func_scope: 0,
             n_locals: 0,
         },
+        break_labels: vec![],
         module: ByteCodeModule {
             // debug_info: ModuleDebugInfo::new(),
             string_pool_cache: vec![],
@@ -1453,16 +1507,30 @@ pub fn compile(block: Rc<Stmt>) -> Result<ByteCodeModule, CompileError> {
         },
         str_map: HashMap::new(),
     };
-    compiler.run(block)
+    compiler.run(block, false)
 }
 
 pub fn compile_repl(block: Rc<Stmt>) -> Result<ByteCodeModule, CompileError> {
-    let mut module = compile(block)?;
-    match *module.code.last().unwrap() {
-        ByteCode::Op(OpCode::Pop) => {
-            module.code.pop().unwrap();
-        }
-        _ => {}
-    }
-    Ok(module)
+    let mut compiler = Compiler {
+        funcs: vec![],
+        var_uid_gen: 0,
+        label_gen: 0,
+        labels: HashMap::new(),
+        symbols: SymbolTable {
+            vars: HashMap::new(),
+            parent: std::ptr::null_mut(),
+            func_scope: 0,
+            n_locals: 0,
+        },
+        break_labels: vec![],
+        module: ByteCodeModule {
+            // debug_info: ModuleDebugInfo::new(),
+            string_pool_cache: vec![],
+            prototypes: vec![],
+            code: vec![],
+            string_pool: vec![],
+        },
+        str_map: HashMap::new(),
+    };
+    compiler.run(block, true)
 }

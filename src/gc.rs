@@ -149,5 +149,7 @@ impl GcState {
     }
 }
 impl Drop for GcState {
-    fn drop(&mut self) {}
+    fn drop(&mut self) {
+        self.collect();
+    }
 }

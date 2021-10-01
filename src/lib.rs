@@ -1,7 +1,6 @@
 use std::{any::TypeId, marker::PhantomData, mem::size_of};
 
 pub mod api;
-pub mod bind;
 pub mod bytecode;
 pub mod closure;
 pub mod compile;
@@ -13,6 +12,9 @@ pub mod stdlib;
 pub mod table;
 pub mod value;
 pub mod vm;
+pub mod bind;
+#[cfg(feature="complete")]
+pub mod na_bind;
 
 pub(crate) const fn num_bits<T>() -> usize {
     std::mem::size_of::<T>() * 8
@@ -119,7 +121,7 @@ impl<T> Drop for Stack<T> {
     }
 }
 
-pub(crate) fn dummy_convert_ref<T: 'static, U: 'static>(x: &T) -> &U {
+pub(crate) fn dummy_convert_ref<'a,'b,T: 'static, U: 'static>(x: &'a T) -> &'b U {
     if TypeId::of::<T>() == TypeId::of::<U>() {
         unsafe { std::mem::transmute(x) }
     } else {
@@ -152,3 +154,11 @@ macro_rules! debug_println {
         }
     };
 }
+
+
+// #[cfg(feature="threading")]
+// pub(crate) mod sync_cell{
+//     pub(crate) struct SyncCell<T>(parking_lot::RwLock<T>);
+
+//     pub(crate) struct SynCellRef<'a, T>(par)
+// }

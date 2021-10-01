@@ -151,6 +151,9 @@ pub enum Stmt {
         loc: SourceLocation,
         expr: Vec<Rc<Expr>>,
     },
+    Break {
+        loc: SourceLocation,
+    },
     LocalVar {
         loc: SourceLocation,
         vars: Rc<Stmt>,
@@ -213,6 +216,7 @@ impl Stmt {
     #[allow(dead_code)]
     pub fn loc(&self) -> &SourceLocation {
         match self {
+            Stmt::Break { loc } => loc,
             Stmt::Return { loc, expr: _ } => loc,
             Stmt::If {
                 loc,
@@ -1140,6 +1144,12 @@ impl Parser {
         let cond = self.parse_expr()?;
         Ok(Rc::new(Stmt::Repeat { loc, cond, body }))
     }
+    fn parse_break_stmt(&mut self) -> Result<Rc<Stmt>, ParseError> {
+        assert!(self.has("return"));
+        let loc = self.peek().loc().clone();
+        self.advance(1);
+        Ok(Rc::new(Stmt::Break { loc }))
+    }
     fn parse_return_stmt(&mut self) -> Result<Rc<Stmt>, ParseError> {
         assert!(self.has("return"));
         let loc = self.peek().loc().clone();
@@ -1496,7 +1506,9 @@ impl Parser {
             self.parse_for_stmt()
         } else if self.has("return") {
             self.parse_return_stmt()
-        } else if self.has("repeat") {
+        } else if self.has("break") {
+            self.parse_break_stmt()
+        }else if self.has("repeat") {
             self.parse_repeat_stmt()
         } else if self.has("function") {
             self.parse_function()

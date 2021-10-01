@@ -129,26 +129,26 @@ impl Instance {
             }
             Value::Callable(callable) => {
                 let frame = { new_frame_direct!(self.gc, args, None) };
+                // {
+                //     let mut frames = self.state.frames.borrow_mut();
+                //     frames.push(frame);
+                // }
                 {
-                    let mut frames = self.state.frames.borrow_mut();
-                    frames.push(frame);
-                }
-                {
-                    let frames = self.state.frames.borrow();
+                    // let frames = self.state.frames.borrow();
                     let ctx = CallContext {
                         instance: self,
                         state: &self.state,
-                        frames: &*frames,
+                        frame,//s: &*frames,
                         ret_values: RefCell::new(smallvec![]),
                         n_expected_rets: u8::MAX,
                     };
                     let func = { &(*callable) };
                     func.call(&ctx)?;
                 }
-                {
-                    let mut frames = self.state.frames.borrow_mut();
-                    frames.pop().unwrap();
-                }
+                // {
+                //     let mut frames = self.state.frames.borrow_mut();
+                //     frames.pop().unwrap();
+                // }
                 {
                     let mut eval_stack = self.state.eval_stack.borrow_mut();
                     Ok(eval_stack.pop().unwrap())
@@ -176,8 +176,9 @@ impl Instance {
                         UpValueInner::Open(p) => {
                             v.set(UpValueInner::Closed(*p));
                         }
+                        UpValueInner::Empty=>{unreachable!()}
                         _ => {
-                            unreachable!()
+                            // unreachable!()
                         }
                     }
                     std::mem::drop(v);
@@ -187,12 +188,8 @@ impl Instance {
             }
         }
     }
-    fn exec_frame(&self, state: &State, mut n_expected_rets: u8) -> Result<Continue, RuntimeError> {
-        let mut guard = RetGuard { bomb: false };
-        {
-            let mut frames = state.frames.borrow_mut();
-            let frame = frames.last_mut().unwrap();
-            let closure = &frame.closure.unwrap();
+    fn setup_upvalue(&self, frame:&mut Frame){
+        let closure = &frame.closure.unwrap();
             if closure.proto_idx == usize::MAX {
                 assert!(closure.upvalues.len() == 1);
             } else if frame.ip == closure.entry {
@@ -222,6 +219,13 @@ impl Instance {
                     );
                 }
             }
+    }
+    fn exec_frame(&self, state: &State, mut n_expected_rets: u8) -> Result<Continue, RuntimeError> {
+        let mut guard = RetGuard { bomb: false };
+        {
+            let mut frames = state.frames.borrow_mut();
+            let frame = frames.last_mut().unwrap();
+            self.setup_upvalue(frame);
         };
         let (mut ip, code_len, module) = {
             let mut frames = state.frames.borrow_mut();
@@ -651,6 +655,7 @@ impl Instance {
                                     ip_modified = true;
                                     ip = Frame::get_ip(Some(closure));
                                     *frame = new_frame!(self.gc, eval_stack, n_args, Some(closure));
+                                    self.setup_upvalue(frame);
                                     n_expected_rets = operands[1];
                                     break;
                                 }
@@ -660,7 +665,7 @@ impl Instance {
                                         let frame = frames.last_mut().unwrap();
                                         Self::close_all_upvalues(&frame.closure.as_ref().unwrap());
                                         frame.has_closed = true;
-                                    //     // frames.pop();
+                                        //     // frames.pop();
                                     }
                                     ip += 1;
                                     let frame = new_frame!(self.gc, eval_stack, n_args, None);
@@ -828,7 +833,7 @@ impl Instance {
         }
         module
     }
-    pub fn exec(&self, module: ByteCodeModule) -> Result<(), RuntimeError> {
+    pub fn exec<'a>(&'a self, module: ByteCodeModule) -> Result<ValueRef<'a>, RuntimeError> {
         let module = self.load_module_string(module);
         match self.exec_impl(module) {
             Ok(_) => {}
@@ -837,8 +842,13 @@ impl Instance {
                 return Err(e);
             }
         }
-        assert_eq!(self.state.eval_stack.borrow().len(), 0);
-        Ok(())
+        assert!(self.state.eval_stack.borrow().len() <= 1);
+        if self.state.eval_stack.borrow().len() == 1 {
+            let mut st = self.state.eval_stack.borrow_mut();
+            let v = st.pop().unwrap();
+            return Ok(ValueRef::new(v));
+        }
+        Ok(ValueRef::new(Value::Nil))
     }
     fn reset(&self) {
         let mut st = self.state.eval_stack.borrow_mut();
@@ -891,27 +901,27 @@ impl Instance {
             match cont {
                 Continue::CallExt(callable, frame, n_expected_rets2) => {
                     debug_assert!(frame.closure.is_none());
+                    // {
+                    //     let mut frames = self.state.frames.borrow_mut();
+                    //     frames.push(frame);
+                    // }
                     {
-                        let mut frames = self.state.frames.borrow_mut();
-                        frames.push(frame);
-                    }
-                    {
-                        let frames = self.state.frames.borrow();
+                        // let frames = self.state.frames.borrow();
                         let func = &(*callable);
                         let ctx = CallContext {
                             instance: self,
                             state: &self.state,
-                            frames: &*frames,
+                            frame,
                             n_expected_rets: n_expected_rets2,
                             ret_values: RefCell::new(smallvec![]),
                         };
                         func.call(&ctx)?;
                     }
-                    {
-                        let mut frames = self.state.frames.borrow_mut();
-                        frames.last_mut().unwrap().has_closed = true;
-                        frames.pop().unwrap();
-                    }
+                    // {
+                    //     let mut frames = self.state.frames.borrow_mut();
+                    //     frames.last_mut().unwrap().has_closed = true;
+                    //     frames.pop().unwrap();
+                    // }
                 }
                 Continue::NewFrame(frame, n_expected_rets2) => {
                     // n_expected_rets = n_expected_rets2;
@@ -991,6 +1001,10 @@ impl BaseApi for Instance {
         key: ValueRef<'a>,
     ) -> Result<ValueRef<'a>, RuntimeError> {
         self.runtime.table_rawget(table, key)
+    }
+
+    fn get_global_env<'a>(&self) -> ValueRef<'a> {
+        self.runtime.get_global_env()
     }
 }
 impl StateApi for Instance {

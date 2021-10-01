@@ -14,6 +14,7 @@ pub trait BaseApi {
     fn create_table<'a>(&self) -> ValueRef<'a>;
     fn set_metatable<'a>(&self, v: ValueRef<'a>, mt: ValueRef<'a>);
     fn get_metatable<'a>(&self, v: ValueRef<'a>) -> ValueRef<'a>;
+    fn get_global_env<'a>(&self) -> ValueRef<'a>;
     fn table_rawset<'a>(
         &'a self,
         table: ValueRef<'a>,

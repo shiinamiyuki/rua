@@ -1,27 +1,14 @@
-use crate::{runtime::{Module, RuntimeError}, state::CallContext};
+// struct RefWrapper<'a, T>(&'a T);
 
-pub trait Bind {
-    fn bind(module:&mut Module);
-}
-
-
-// pub struct StructBinder<'a> {
-//     module:&'a mut Module,
-//     name:String,
+// pub trait IsReference {
+//     const VALUE:bool;
 // }
-
-// impl<'a> StructBinder<'a> {
-//     fn init<F: Fn(&CallContext<'_>) -> Result<(), RuntimeError> + 'static>(&mut self, f:F ) {
-//         self.module.function(self.name.clone(), ||)
-//     }
-//     fn method<F: Fn(&CallContext<'_>) -> Result<(), RuntimeError> + 'static>(&mut self,name:& str, f:F ) {
-
-
-//     }
-//     fn field<T>(&mut self, name:& str){
-
-//     }
-//     fn finish(self){
-        
-//     }
+// impl IsReference for i32{
+//     const VALUE:bool = false;
+// }
+// impl IsReference for f32{
+//     const VALUE:bool = false;
+// }
+// impl <'a, T> IsReference for RefWrapper<'a, T> {
+//     const VALUE:bool = true;
 // }
