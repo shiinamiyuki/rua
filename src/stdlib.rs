@@ -73,6 +73,35 @@ pub(crate) fn add_math_lib(runtime: &Runtime) {
     });
     runtime.add_module("math".into(), math);
 }
+pub(crate) fn add_table_lib(runtime: &Runtime) {
+    let mut m = runtime.create_module();
+    m.function("insert".into(), |ctx| {
+        let table = ctx.arg(0)?;
+
+        if let Some(table) = table.value.as_table() {
+            let mut table = table.borrow_mut();
+            let (i, v) = if ctx.arg_count() > 2 {
+                (ctx.arg(1)?, ctx.arg(2)?)
+            } else {
+                let len = table.len();
+                let i = Value::from_number(len as f64 + 1.0);
+                let v = ctx.arg(1)?;
+                (ValueRef::new(i), v)
+            };
+            let _ = i.cast::<f64>()?;
+            table.set(i.value, v.value);
+        } else {
+            return Err(RuntimeError {
+                kind: ErrorKind::TypeError,
+                msg: "table expected in table.insert".into(),
+            });
+        }
+
+        Ok(())
+    });
+
+    runtime.add_module("table".into(), m);
+}
 pub(crate) fn add_string_lib(runtime: &Runtime) {
     let mut m = runtime.create_module();
     m.function("lower".into(), |ctx| {

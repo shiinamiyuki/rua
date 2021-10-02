@@ -446,6 +446,7 @@ impl Compiler {
                         "^" => OpCode::Pow,
                         "&" => OpCode::And,
                         "|" => OpCode::Or,
+                        "//" => OpCode::IDiv,
                         "<" => OpCode::LessThan,
                         "<=" => OpCode::LessThanEqual,
                         ">=" => OpCode::GreaterThanEqual,

@@ -1,10 +1,13 @@
 use std::{any::TypeId, marker::PhantomData, mem::size_of};
 
 pub mod api;
+pub mod bind;
 pub mod bytecode;
 pub mod closure;
 pub mod compile;
 pub mod gc;
+#[cfg(feature = "complete")]
+pub mod na_bind;
 pub mod parse;
 pub mod runtime;
 pub mod state;
@@ -12,9 +15,6 @@ pub mod stdlib;
 pub mod table;
 pub mod value;
 pub mod vm;
-pub mod bind;
-#[cfg(feature="complete")]
-pub mod na_bind;
 
 pub(crate) const fn num_bits<T>() -> usize {
     std::mem::size_of::<T>() * 8
@@ -121,7 +121,7 @@ impl<T> Drop for Stack<T> {
     }
 }
 
-pub(crate) fn dummy_convert_ref<'a,'b,T: 'static, U: 'static>(x: &'a T) -> &'b U {
+pub(crate) fn dummy_convert_ref<'a, 'b, T: 'static, U: 'static>(x: &'a T) -> &'b U {
     if TypeId::of::<T>() == TypeId::of::<U>() {
         unsafe { std::mem::transmute(x) }
     } else {
@@ -155,10 +155,17 @@ macro_rules! debug_println {
     };
 }
 
+#[cfg(feature="threading")]
+pub(crate) mod sync_cell{
+    pub(crate) struct SyncCell<T>(parking_lot::RwLock<T>);
 
-// #[cfg(feature="threading")]
-// pub(crate) mod sync_cell{
-//     pub(crate) struct SyncCell<T>(parking_lot::RwLock<T>);
+    pub(crate) struct SynCellRef<'a, T>(par)
+}
 
-//     pub(crate) struct SynCellRef<'a, T>(par)
-// }
+#[cfg(feature = "fast-alloc")]
+mod dummy {
+    use mimalloc::MiMalloc;
+
+    #[global_allocator]
+    static GLOBAL: MiMalloc = MiMalloc;
+}

@@ -1145,7 +1145,7 @@ impl Parser {
         Ok(Rc::new(Stmt::Repeat { loc, cond, body }))
     }
     fn parse_break_stmt(&mut self) -> Result<Rc<Stmt>, ParseError> {
-        assert!(self.has("return"));
+        assert!(self.has("break"));
         let loc = self.peek().loc().clone();
         self.advance(1);
         Ok(Rc::new(Stmt::Break { loc }))

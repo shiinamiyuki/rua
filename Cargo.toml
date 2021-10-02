@@ -12,7 +12,8 @@ ordered-float = "2.0"
 smallvec = "1.6.1"
 nalgebra = {version ="0.26.2", features = ["serde-serialize"], optional=true }
 # rua-derive ={path="rua-derive", optional=true }
-parking_lot = {version="*",optional = true}
+parking_lot = {version="*"}
+
 [[bin]]
 name="rua"
 path="src/bin/rua.rs"
@@ -20,7 +21,7 @@ path="src/bin/rua.rs"
 [features]
 default=[]
 core = []
-threading = ["parking_lot"]
+# threading = ["parking_lot"]
 # default=["rua-derive"]
 complete = ["nalgebra"]
 # derive = ["rua-derive"]

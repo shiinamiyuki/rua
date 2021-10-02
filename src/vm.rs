@@ -750,7 +750,7 @@ impl Instance {
                         };
                         let b = operands[0];
                         let pop_t = operands[1];
-                        let pop_f = operands[1];
+                        let pop_f = operands[2];
                         if top.to_bool() == (b != 0) {
                             ip = addr as usize;
                             if pop_t != 0 {

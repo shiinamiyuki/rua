@@ -177,15 +177,23 @@ impl From<f64> for RustPrimitive {
 pub struct ValueRef<'a> {
     pub(crate) value: Value,
     pub(crate) phantom: PhantomData<&'a u32>,
+    pub(crate) arg_idx: Option<usize>,
     // pub(crate) prim: UnsafeCell<RustPrimitive>,
 }
 
 impl<'a> ValueRef<'a> {
+    pub(crate) fn new_arg(v: Value, idx: usize) -> Self {
+        Self {
+            value: v,
+            phantom: PhantomData {},
+            arg_idx: Some(idx), // prim: UnsafeCell::new(RustPrimitive::Unit),
+        }
+    }
     pub(crate) fn new(v: Value) -> Self {
         Self {
             value: v,
             phantom: PhantomData {},
-            // prim: UnsafeCell::new(RustPrimitive::Unit),
+            arg_idx: None, // prim: UnsafeCell::new(RustPrimitive::Unit),
         }
     }
 }
@@ -213,10 +221,21 @@ macro_rules! arg_f64 {
         match $self.as_f64() {
             Some(x) => Ok(x),
             None => {
-                return Err(RuntimeError {
-                    kind: ErrorKind::TypeError,
-                    msg: format!("expected  type 'number' but is {}", $self.type_of()),
-                })
+                if $self.arg_idx.is_some() {
+                    return Err(RuntimeError {
+                        kind: ErrorKind::TypeError,
+                        msg: format!(
+                            "bad argument #{}, expected  type 'number' but is {}",
+                            $self.arg_idx.unwrap() + 1,
+                            $self.type_of()
+                        ),
+                    });
+                } else {
+                    return Err(RuntimeError {
+                        kind: ErrorKind::TypeError,
+                        msg: format!("expected  type 'number' but is {}", $self.type_of()),
+                    });
+                }
             }
         }
     }};
@@ -229,14 +248,25 @@ macro_rules! arg_user {
                 if let Some(x) = any.downcast_ref::<$t>() {
                     Ok(x)
                 } else {
-                    return Err(RuntimeError {
-                        kind: ErrorKind::TypeError,
-                        msg: format!(
-                            "expected type 'userdata' {} but is {}",
-                            userdata.type_name(),
-                            std::any::type_name::<$t>()
-                        ),
-                    });
+                    if $self.arg_idx.is_some() {
+                        return Err(RuntimeError {
+                            kind: ErrorKind::TypeError,
+                            msg: format!(
+                                "bad argument #{}, expected type 'userdata' but is {}",
+                                $self.arg_idx.unwrap() + 1,
+                                $self.type_of()
+                            ),
+                        });
+                    } else {
+                        return Err(RuntimeError {
+                            kind: ErrorKind::TypeError,
+                            msg: format!(
+                                "expected type 'userdata' {} but is {}",
+                                userdata.type_name(),
+                                std::any::type_name::<$t>()
+                            ),
+                        });
+                    }
                 }
             }
             None => {
@@ -257,10 +287,21 @@ macro_rules! arg_string {
         match $self.as_string() {
             Some(x) => Ok(x),
             None => {
-                return Err(RuntimeError {
-                    kind: ErrorKind::TypeError,
-                    msg: format!("expected 'string' but is {}", $self.type_of()),
-                })
+                if $self.arg_idx.is_some() {
+                    return Err(RuntimeError {
+                        kind: ErrorKind::TypeError,
+                        msg: format!(
+                            "bad argument #{}, expected type 'string' but is {}",
+                            $self.arg_idx.unwrap() + 1,
+                            $self.type_of()
+                        ),
+                    });
+                } else {
+                    return Err(RuntimeError {
+                        kind: ErrorKind::TypeError,
+                        msg: format!("expected 'string' but is {}", $self.type_of()),
+                    });
+                }
             }
         }
     }};
@@ -554,7 +595,7 @@ impl Runtime {
         }
         stdlib::add_math_lib(&r);
         stdlib::add_string_lib(&r);
-
+        stdlib::add_table_lib(&r);
         #[cfg(feature = "complete")]
         crate::na_bind::add_na_lib(&r);
         {

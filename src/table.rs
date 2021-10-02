@@ -211,7 +211,7 @@ impl LinkedHashMap {
             self.reset(16);
             // debug_assert!(!self.check_cycle());
         }
-        if self.len * 2 > self.table.len() {
+        if self.len * 3 > self.table.len() {
             self.grow();
             // debug_assert!(!self.check_cycle());
         }
@@ -318,7 +318,7 @@ impl Table {
             largest_uint: array_part_len as u64,
             len: array_part_len,
             need_recompute_len: false,
-            metatable:Value::Nil,
+            metatable: Value::Nil,
         }
     }
     pub(crate) fn len(&mut self) -> usize {
@@ -328,14 +328,14 @@ impl Table {
             self.need_recompute_len = false;
             for (i, v) in self.array.iter().enumerate() {
                 if v.is_nil() {
-                    self.len = i + 1;
+                    self.len = i;
                     return self.len;
                 }
             }
             for i in (self.array.len() + 1) as u64..=self.largest_uint {
                 let v = Value::from_number(i as f64);
                 if self.get(v).is_nil() {
-                    self.len = i as usize;
+                    self.len = i as usize - 1;
                     return self.len;
                 }
             }
