@@ -1,8 +1,10 @@
-# Rua (WIP)
-Lua implementation in Rust
+# Rua 
+Lua 5.4 implementation in Rust
 
-## Extensions
- - continue statements
-
+## Compliance with Lua
+- No binary compatibility
+- Standard library is incomplete
+- Simple mark sweep GC
+- Performance is bad
 
 
