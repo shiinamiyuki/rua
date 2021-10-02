@@ -140,9 +140,7 @@ impl Traceable for Closure {
                 UpValueInner::Closed(v) => {
                     gc.trace(&v);
                 }
-                UpValueInner::Empty => {
-                    unreachable!()
-                }
+                UpValueInner::Empty => {}
             }
         }
     }

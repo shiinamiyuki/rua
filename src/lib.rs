@@ -154,18 +154,3 @@ macro_rules! debug_println {
         }
     };
 }
-
-#[cfg(feature="threading")]
-pub(crate) mod sync_cell{
-    pub(crate) struct SyncCell<T>(parking_lot::RwLock<T>);
-
-    pub(crate) struct SynCellRef<'a, T>(par)
-}
-
-#[cfg(feature = "fast-alloc")]
-mod dummy {
-    use mimalloc::MiMalloc;
-
-    #[global_allocator]
-    static GLOBAL: MiMalloc = MiMalloc;
-}

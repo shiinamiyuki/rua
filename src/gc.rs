@@ -1,6 +1,7 @@
 use std::cell::{Cell, RefCell};
 use std::ops::Deref;
 use std::ptr::NonNull;
+use std::rc::Rc;
 pub struct GcState {
     inner: RefCell<GcInner>,
 }
@@ -75,6 +76,15 @@ where
 }
 struct GcInner {
     head: PtrTraceable,
+    lock: usize,
+}
+pub struct GcLockGuard {
+    gc: Rc<GcState>,
+}
+impl Drop for GcLockGuard {
+    fn drop(&mut self) {
+        self.gc.inner.borrow_mut().lock -= 1;
+    }
 }
 impl GcState {
     // move an object onto heap
@@ -116,13 +126,22 @@ impl GcState {
     }
     pub fn new() -> Self {
         Self {
-            inner: RefCell::new(GcInner { head: None }),
+            inner: RefCell::new(GcInner {
+                head: None,
+                lock: 0,
+            }),
         }
     }
+    pub fn lock(self: &Rc<GcState>) -> GcLockGuard {
+        self.inner.borrow_mut().lock += 1;
+        GcLockGuard { gc: self.clone() }
+    }
+
     pub(crate) fn start_trace(&self) {}
     pub(crate) fn end_trace(&self) {}
-    pub(crate) fn collect(&self) {
+    pub(crate) fn collect(&self, force: bool) {
         let mut gc = self.inner.borrow_mut();
+        assert!(!force || gc.lock == 0);
         let mut cur = gc.head;
         let mut prev: Option<NonNull<GcBox<dyn Traceable>>> = None;
         // println!("collecting");
@@ -150,6 +169,6 @@ impl GcState {
 }
 impl Drop for GcState {
     fn drop(&mut self) {
-        self.collect();
+        self.collect(true);
     }
 }

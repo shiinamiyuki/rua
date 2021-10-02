@@ -138,11 +138,12 @@ impl Instance {
                     let ctx = CallContext {
                         instance: self,
                         state: &self.state,
-                        frame,//s: &*frames,
+                        frame, //s: &*frames,
                         ret_values: RefCell::new(smallvec![]),
                         n_expected_rets: u8::MAX,
                     };
                     let func = { &(*callable) };
+                    self.gc.lock();
                     func.call(&ctx)?;
                 }
                 // {
@@ -176,7 +177,9 @@ impl Instance {
                         UpValueInner::Open(p) => {
                             v.set(UpValueInner::Closed(*p));
                         }
-                        UpValueInner::Empty=>{unreachable!()}
+                        UpValueInner::Empty => {
+                            unreachable!()
+                        }
                         _ => {
                             // unreachable!()
                         }
@@ -188,37 +191,37 @@ impl Instance {
             }
         }
     }
-    fn setup_upvalue(&self, frame:&mut Frame){
+    fn setup_upvalue(&self, frame: &mut Frame) {
         let closure = &frame.closure.unwrap();
-            if closure.proto_idx == usize::MAX {
-                assert!(closure.upvalues.len() == 1);
-            } else if frame.ip == closure.entry {
-                for (i, v) in closure.upvalues.iter().enumerate() {
-                    let proto = &(*closure.module).prototypes[closure.proto_idx];
-                    let info = &proto.upvalues[i];
-                    if i == 0 && info.is_special {
+        if closure.proto_idx == usize::MAX {
+            assert!(closure.upvalues.len() == 1);
+        } else if frame.ip == closure.entry {
+            for (i, v) in closure.upvalues.iter().enumerate() {
+                let proto = &(*closure.module).prototypes[closure.proto_idx];
+                let info = &proto.upvalues[i];
+                if i == 0 && info.is_special {
+                    let mut v = v.inner.borrow_mut();
+                    *v = Rc::new(Cell::new(UpValueInner::Closed(self.state.globals)));
+                } else {
+                    if !info.from_parent {
                         let mut v = v.inner.borrow_mut();
-                        *v = Rc::new(Cell::new(UpValueInner::Closed(self.state.globals)));
-                    } else {
-                        if !info.from_parent {
-                            let mut v = v.inner.borrow_mut();
-                            // match v.get() {
-                            //     UpValueInner::Empty => {}
-                            //     _ => unreachable!(),
-                            // }
-                            *v = Rc::new(Cell::new(UpValueInner::Open(
-                                &mut frame.locals[info.location as usize] as *mut Value,
-                            )));
-                        }
+                        // match v.get() {
+                        //     UpValueInner::Empty => {}
+                        //     _ => unreachable!(),
+                        // }
+                        *v = Rc::new(Cell::new(UpValueInner::Open(
+                            &mut frame.locals[info.location as usize] as *mut Value,
+                        )));
                     }
-                    debug_println!(
-                        "create upvalue {} {:?} {}",
-                        i,
-                        Rc::as_ptr(&v.inner.borrow()),
-                        v
-                    );
                 }
+                debug_println!(
+                    "create upvalue {} {:?} {}",
+                    i,
+                    Rc::as_ptr(&v.inner.borrow()),
+                    v
+                );
             }
+        }
     }
     fn exec_frame(&self, state: &State, mut n_expected_rets: u8) -> Result<Continue, RuntimeError> {
         let mut guard = RetGuard { bomb: false };
@@ -243,6 +246,15 @@ impl Instance {
             }};
         }
         while ip < code_len {
+            #[cfg(debug_assertions)]
+            {
+                if let Ok(s) = std::env::var("FORCE_GC_CYCLE") {
+                    if s == "1" {
+                        eprintln!("RUNNING GC");
+                        (*self.runtime).borrow().collectgarbage();
+                    }
+                }
+            }
             let mut eval_stack = state.eval_stack.borrow_mut();
             macro_rules! binary_op_impl {
                 ($func:ident) => {{
@@ -915,6 +927,7 @@ impl Instance {
                             n_expected_rets: n_expected_rets2,
                             ret_values: RefCell::new(smallvec![]),
                         };
+                        self.gc.lock();
                         func.call(&ctx)?;
                     }
                     // {

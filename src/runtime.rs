@@ -752,6 +752,11 @@ impl RuntimeInner {
         self.instances.push(Rc::downgrade(&instance));
         instance
     }
+    pub(crate) fn collectgarbage(&self) {
+        self.gc.start_trace();
+        self.gc.trace(self);
+        self.gc.end_trace();
+    }
     fn add_std_lib(&mut self, pself: Rc<RefCell<RuntimeInner>>) {
         {
             let pself = pself.clone();
@@ -913,7 +918,7 @@ impl RuntimeInner {
             gc.start_trace();
             gc.trace(&*self_);
             gc.end_trace();
-            gc.collect();
+            gc.collect(true);
             Ok(())
         });
     }
