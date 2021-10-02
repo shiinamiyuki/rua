@@ -2,6 +2,8 @@
 Lua 5.4 implementation in Rust
 
 ## Compliance with Lua
+- Goto not supported
+- <const> and <close> not supported
 - No binary compatibility
 - Standard library is incomplete
 - Simple mark sweep GC
