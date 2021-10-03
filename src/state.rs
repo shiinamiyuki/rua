@@ -36,7 +36,7 @@ impl Frame {
     pub(crate) fn new(n_args: usize, closure: Option<Gc<Closure>>) -> Self {
         Self {
             locals: smallvec![RawValue::default();16.max(n_args)], //[RawValue::default(); MAX_LOCALS],
-            closure:closure.clone(),
+            closure: closure.clone(),
             ip: Self::get_ip(closure),
             n_args,
             has_closed: false,
@@ -85,7 +85,7 @@ macro_rules! binary_op_impl_closue {
                     return error!();
                 }
                 let instance = $self.instance.upgrade().unwrap();
-                return instance.call(method, &[$a.clone(), $b.clone()]);
+                return instance.call(&method, &[&$a, &$b]);
             }
             let mt = $self.get_metatable(&$b);
             if !mt.is_nil() {
@@ -97,7 +97,7 @@ macro_rules! binary_op_impl_closue {
                     return error!();
                 }
                 let instance = $self.instance.upgrade().unwrap();
-                return instance.call(method, &[$a.clone(), $b.clone()]);
+                return instance.call(&method, &[&$a, &$b]);
             } else {
                 return error!();
             }
@@ -161,7 +161,7 @@ impl<'a> CallContext<'a> {
             msg,
         })
     }
-    fn call_raw(&self, closure: RawValue, args: &[RawValue]) -> Result<RawValue, RuntimeError> {
+    fn call_raw(&self, closure: &RawValue, args: &[&RawValue]) -> Result<RawValue, RuntimeError> {
         Ok(self.instance.call(closure, args)?)
     }
 }
@@ -318,7 +318,7 @@ impl State {
             )?;
             if table.as_callable().is_some() || table.as_closure().is_some() {
                 let instance = self.instance.upgrade().unwrap();
-                return instance.call(table, &[origin_table, key.clone()]);
+                return instance.call(&table, &[&origin_table, &key]);
             }
             if table.as_table().is_none() {
                 return Ok(RawValue::Nil);
@@ -360,7 +360,7 @@ impl State {
             }
             if newindex.as_callable().is_some() || newindex.as_closure().is_some() {
                 let instance = self.instance.upgrade().unwrap();
-                instance.call(newindex, &[table.clone(), key.clone(), value.clone()])?;
+                instance.call(&newindex, &[&table, &key, &value])?;
                 return Ok(());
             }
         }
@@ -422,14 +422,14 @@ impl State {
                         &self.global_state.constants[ConstantsIndex::MtKeyConcat as usize].get(),
                     )?;
                     let instance = self.instance.upgrade().unwrap();
-                    return instance.call(method, &[a.clone(), b.clone()]);
+                    return instance.call(&method, &[a, &b]);
                 } else if !mt_b.is_nil() {
                     let method = self.table_get(
                         &mt_b,
                         &self.global_state.constants[ConstantsIndex::MtKeyConcat as usize].get(),
                     )?;
                     let instance = self.instance.upgrade().unwrap();
-                    return instance.call(method, &[a.clone(), b.clone()]);
+                    return instance.call(&method, &[a, &b]);
                 } else {
                     Err(RuntimeError {
                         kind: ErrorKind::ArithmeticError,
@@ -547,7 +547,7 @@ impl State {
                         return error!();
                     }
                     let instance = self.instance.upgrade().unwrap();
-                    return instance.call(method, &[a.clone(), b.clone()]);
+                    return instance.call(&method, &[a, &b]);
                 } else if !mt_b.is_nil() {
                     let method = self.table_get(
                         &mt_b,
@@ -557,7 +557,7 @@ impl State {
                         return error!();
                     }
                     let instance = self.instance.upgrade().unwrap();
-                    return instance.call(method, &[a.clone(), b.clone()]);
+                    return instance.call(&method, &[a, &b]);
                 } else {
                     Err(RuntimeError {
                         kind: ErrorKind::ArithmeticError,
@@ -603,7 +603,7 @@ impl State {
                         return error!();
                     }
                     let instance = self.instance.upgrade().unwrap();
-                    return instance.call(method, &[a.clone(), b.clone()]);
+                    return instance.call(&method, &[a, &b]);
                 } else if !mt_b.is_nil() {
                     let method = self.table_get(
                         &mt_b,
@@ -613,7 +613,7 @@ impl State {
                         return error!();
                     }
                     let instance = self.instance.upgrade().unwrap();
-                    return instance.call(method, &[a.clone(), b.clone()]);
+                    return instance.call(&method, &[a, &b]);
                 } else {
                     Err(RuntimeError {
                         kind: ErrorKind::ArithmeticError,
@@ -663,7 +663,7 @@ impl State {
                         return error!();
                     }
                     let instance = self.instance.upgrade().unwrap();
-                    return instance.call(method, &[a.clone(), b.clone()]);
+                    return instance.call(&method, &[a, &b]);
                 } else if !mt_b.is_nil() {
                     let method = self.table_get(
                         &mt_b,
@@ -673,7 +673,7 @@ impl State {
                         return error!();
                     }
                     let instance = self.instance.upgrade().unwrap();
-                    return instance.call(method, &[a.clone(), b.clone()]);
+                    return instance.call(&method, &[a, &b]);
                 } else {
                     Ok(RawValue::from_bool(false))
                 }
@@ -716,7 +716,7 @@ impl State {
                     return error!();
                 }
                 let instance = self.instance.upgrade().unwrap();
-                return instance.call(method, &[a.clone(), b.clone()]);
+                return instance.call(&method, &[a, &b]);
             } else if !mt_b.is_nil() {
                 let method = self.table_get(
                     &mt_b,
@@ -726,13 +726,13 @@ impl State {
                     return error!();
                 }
                 let instance = self.instance.upgrade().unwrap();
-                return instance.call(method, &[a.clone(), b.clone()]);
+                return instance.call(&method, &[a, &b]);
             } else {
                 error!()
             }
         }
     }
-    pub(crate) fn len(&self, a: RawValue) -> Result<RawValue, RuntimeError> {
+    pub(crate) fn len(&self, a: &RawValue) -> Result<RawValue, RuntimeError> {
         match a {
             // Value::Nil => todo!(),
             // Value::Bool(_) => todo!(),
@@ -765,16 +765,16 @@ impl State {
                         })
                     } else {
                         let instance = self.instance.upgrade().unwrap();
-                        return instance.call(method, &[a]);
+                        return instance.call(&method, &[a]);
                     }
                 }
             }
         }
     }
-    pub(crate) fn not(&self, a: RawValue) -> Result<RawValue, RuntimeError> {
+    pub(crate) fn not(&self, a: &RawValue) -> Result<RawValue, RuntimeError> {
         Ok(RawValue::from_bool(!a.to_bool()))
     }
-    pub(crate) fn bitwise_not(&self, a: RawValue) -> Result<RawValue, RuntimeError> {
+    pub(crate) fn bitwise_not(&self, a: &RawValue) -> Result<RawValue, RuntimeError> {
         match a {
             // Value::Nil => todo!(),
             // Value::Bool(_) => todo!(),
@@ -795,7 +795,7 @@ impl State {
             }),
         }
     }
-    pub(crate) fn neg(&self, a: RawValue) -> Result<RawValue, RuntimeError> {
+    pub(crate) fn neg(&self, a: &RawValue) -> Result<RawValue, RuntimeError> {
         match a {
             // Value::Nil => todo!(),
             // Value::Bool(_) => todo!(),
@@ -824,7 +824,7 @@ impl State {
                     return error!();
                 } else {
                     let instance = self.instance.upgrade().unwrap();
-                    return instance.call(method, &[a]);
+                    return instance.call(&method, &[a]);
                 }
             }
         }
@@ -947,7 +947,7 @@ impl<'b> CallApi for CallContext<'b> {
     }
 
     fn call<'a>(&self, closure: Value<'a>, args: &[Value<'a>]) -> Result<Value<'a>, RuntimeError> {
-        let args: Vec<_> = args.iter().map(|x| x.value.clone()).collect();
-        Ok(Value::new(self.instance.call(closure.value, &args)?))
+        let args: Vec<_> = args.iter().map(|x| &x.value).collect();
+        Ok(Value::new(self.instance.call(&closure.value, &args)?))
     }
 }

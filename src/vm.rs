@@ -113,8 +113,8 @@ impl Instance {
     // }
     pub(crate) fn call(
         &self,
-        closure: RawValue,
-        args: &[RawValue],
+        closure: &RawValue,
+        args: &[&RawValue],
     ) -> Result<RawValue, RuntimeError> {
         match closure {
             RawValue::Closure(closure) => {
@@ -276,7 +276,7 @@ impl Instance {
                 ($func:ident) => {{
                     let top = eval_stack.last_mut().unwrap().clone();
                     std::mem::drop(eval_stack);
-                    let top = state.$func(top)?;
+                    let top = state.$func(&top)?;
                     let mut eval_stack = state.eval_stack.borrow_mut();
                     *eval_stack.last_mut().unwrap() = top;
                 }};
