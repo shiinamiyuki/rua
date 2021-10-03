@@ -3,7 +3,7 @@ use std::ops::Deref;
 use std::ptr::NonNull;
 use std::rc::Rc;
 pub struct GcState {
-    inner: RefCell<GcInner>,
+    pub(crate) inner: RefCell<GcInner>,
 }
 // #[derive(Clone, Copy, PartialEq, Eq)]
 // enum Color {
@@ -74,9 +74,10 @@ where
         *self
     }
 }
-struct GcInner {
+pub(crate) struct GcInner {
     head: PtrTraceable,
     lock: usize,
+    pub(crate) alloc_count:usize,
 }
 pub struct GcLockGuard {
     gc: Rc<GcState>,
@@ -99,6 +100,7 @@ impl GcState {
         unsafe {
             let gc_box_dyn: *mut GcBox<dyn Traceable> = gc_box;
             let mut gc = self.inner.borrow_mut();
+            gc.alloc_count += 1;
             if let Some(head) = &mut gc.head {
                 (*gc_box_dyn)
                     .next
@@ -129,6 +131,7 @@ impl GcState {
             inner: RefCell::new(GcInner {
                 head: None,
                 lock: 0,
+                alloc_count:0,
             }),
         }
     }

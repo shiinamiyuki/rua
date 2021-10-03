@@ -21,7 +21,7 @@ use crate::{
     state::{CallContext, State},
     stdlib,
     table::Table,
-    value::{Managed, UserData, RawValue},
+    value::{Managed, RawValue, UserData},
     vm::Instance,
     Stack,
 };
@@ -591,7 +591,7 @@ impl Runtime {
         };
         {
             let mut inner = r.inner.borrow_mut();
-            inner.add_std_lib(r.inner.clone());
+            inner.add_std_lib(Rc::downgrade(&r.inner));
         }
         stdlib::add_math_lib(&r);
         stdlib::add_string_lib(&r);
@@ -757,7 +757,7 @@ impl RuntimeInner {
         self.gc.trace(self);
         self.gc.end_trace();
     }
-    fn add_std_lib(&mut self, pself: Rc<RefCell<RuntimeInner>>) {
+    fn add_std_lib(&mut self, pself: Weak<RefCell<RuntimeInner>>) {
         {
             let pself = pself.clone();
             self.add_function("tostring".into(), move |ctx| {
@@ -768,7 +768,14 @@ impl RuntimeInner {
                         let tostring = ctx.table_get(
                             mt,
                             Value::new(
-                                pself.borrow().global_state.as_ref().unwrap().constants
+                                pself
+                                    .upgrade()
+                                    .unwrap()
+                                    .borrow()
+                                    .global_state
+                                    .as_ref()
+                                    .unwrap()
+                                    .constants
                                     [ConstantsIndex::MtKeyToString as usize]
                                     .get(),
                             ),
@@ -811,6 +818,7 @@ impl RuntimeInner {
                 let v = ctx.arg(0)?;
                 let path = v.cast::<String>()?;
                 let module = compile_file(path)?;
+                let pself = pself.upgrade().unwrap();
                 let instance = {
                     let mut inner = pself.borrow_mut();
                     inner.create_instance(pself.clone())
@@ -920,6 +928,7 @@ impl RuntimeInner {
         // let pself = self as *mut RuntimeInner;
         let gc = self.gc.clone();
         self.add_function("collectgarbage".into(), move |_ctx| {
+            let pself = pself.upgrade().unwrap();
             let self_ = pself.borrow();
             gc.start_trace();
             gc.trace(&*self_);
@@ -1235,13 +1244,14 @@ impl BaseApi for Rc<RefCell<RuntimeInner>> {
     }
 }
 
-impl Drop for RuntimeInner {
+impl Drop for Runtime {
     fn drop(&mut self) {
-        for instance in self.instances.iter() {
+        for instance in self.inner.borrow().instances.iter() {
             assert!(
                 instance.upgrade().is_none(),
                 "Runtime dropped before instances"
             );
         }
+        println!("total alloc {}",self.inner.borrow().gc.inner.borrow().alloc_count);
     }
 }

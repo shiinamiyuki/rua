@@ -25,3 +25,7 @@ core = []
 # default=["rua-derive"]
 complete = ["nalgebra"]
 # derive = ["rua-derive"]
+
+[profile.dev]
+opt-level = 2
+

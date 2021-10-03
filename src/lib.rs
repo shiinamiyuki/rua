@@ -1,4 +1,4 @@
-use std::{any::TypeId, marker::PhantomData, mem::size_of};
+use std::{alloc::Layout, any::TypeId, marker::PhantomData, mem::size_of};
 
 pub mod api;
 pub mod bind;
@@ -28,11 +28,86 @@ pub(crate) fn log_2(x: usize) -> Option<u32> {
     }
 }
 
+pub(crate) struct StackPool<T, const N: usize> {
+    pool: Vec<*mut T>,
+    last_pos: usize,
+}
+impl<T, const N: usize> StackPool<T, N> {
+    pub(crate) fn new() -> Self {
+        Self {
+            pool: vec![],
+            last_pos: 0,
+        }
+    }
+    pub(crate) fn allocate(&mut self, x: T) -> *mut T {
+        unsafe {
+            if self.last_pos == N || self.pool.is_empty() {
+                self.last_pos = 0;
+                let layout = Layout::new::<[T; N]>();
+                self.pool
+                    .push(std::mem::transmute(std::alloc::alloc(layout)));
+                self.allocate(x)
+            } else {
+                let p = self.pool.last().unwrap().add(self.last_pos);
+                std::ptr::write(p, x);
+                self.last_pos += 1;
+                p
+            }
+        }
+    }
+    pub(crate) fn free(&mut self, p: *mut T) {
+        unsafe {
+            if self.last_pos == 0 {
+                assert!(self.pool[self.pool.len() - 2].add(N - 1) == p);
+            } else {
+                assert!(self.pool.last().unwrap().add(self.last_pos - 1) == p);
+            }
+            std::ptr::drop_in_place(p);
+            if self.last_pos == 0 {
+                let last = self.pool.pop().unwrap();
+                let layout = Layout::new::<[T; N]>();
+                std::alloc::dealloc(std::mem::transmute(last), layout);
+                if self.pool.is_empty() {
+                    self.last_pos = 0;
+                } else {
+                    self.last_pos = N - 1;
+                }
+            } else {
+                self.last_pos -= 1;
+            }
+        }
+    }
+}
+impl<T, const N: usize> Drop for StackPool<T, N> {
+    fn drop(&mut self) {
+        unsafe {
+            let layout = Layout::new::<[T; N]>();
+
+            if self.pool.len() > 1 {
+                for i in (0..self.last_pos).rev() {
+                    std::ptr::drop_in_place(self.pool.last().unwrap().add(i));
+                }
+                std::alloc::dealloc(std::mem::transmute(self.pool.last().unwrap()), layout);
+            }
+            if !self.pool.is_empty() {
+                for i in 0..self.pool.len() - 1 {
+                    let p = self.pool[i];
+                    for i in (0..N).rev() {
+                        std::ptr::drop_in_place(p.add(i));
+                    }
+                    std::alloc::dealloc(std::mem::transmute(p), layout);
+                }
+            }
+        }
+    }
+}
+
 struct StackNode<T> {
     data: Option<T>,
     prev: *mut StackNode<T>,
 }
 pub(crate) struct Stack<T> {
+    pool: StackPool<StackNode<T>, 256>,
     last: *mut StackNode<T>,
     len: usize,
 }
@@ -51,6 +126,7 @@ impl<'a, T> Iterator for StackIterator<'a, T> {
 impl<T> Stack<T> {
     pub(crate) fn new() -> Self {
         Self {
+            pool: StackPool::new(),
             last: std::ptr::null_mut(),
             len: 0,
         }
@@ -59,10 +135,10 @@ impl<T> Stack<T> {
         self.last.is_null()
     }
     pub(crate) fn push(&mut self, value: T) {
-        let node = Box::into_raw(Box::new(StackNode {
+        let node = self.pool.allocate(StackNode {
             data: Some(value),
             prev: self.last,
-        }));
+        });
         self.last = node;
         self.len += 1;
     }
@@ -99,7 +175,7 @@ impl<T> Stack<T> {
                 let p = self.last;
                 let ret = std::mem::replace(&mut (*p).data, None).unwrap();
                 self.last = (*self.last).prev;
-                Box::from_raw(p);
+                self.pool.free(p);
                 Some(ret)
             }
         }
@@ -114,7 +190,7 @@ impl<T> Drop for Stack<T> {
             let mut p = self.last;
             while !p.is_null() {
                 let prev = (*p).prev;
-                Box::from_raw(p);
+                self.pool.free(p);
                 p = prev;
             }
         }

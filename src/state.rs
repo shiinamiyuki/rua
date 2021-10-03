@@ -44,20 +44,6 @@ impl Frame {
         }
     }
 }
-impl Drop for Frame {
-    fn drop(&mut self) {
-        // debug_println!("has_closed={}", self.has_closed);
-        // if !self.has_closed {
-        //     abort();
-        // }
-        // unsafe {
-        //     debug_println!("drop frame");
-        //     if let Some(c) = self.closure {
-        //         Instance::close_all_upvalues(&c);
-        //     }
-        // }
-    }
-}
 /*
 A state is the execution state of the vm
 An instance have only one state
