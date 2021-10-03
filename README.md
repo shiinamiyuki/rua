@@ -11,6 +11,6 @@ Lua 5.4 implementation in Rust
 - No binary compatibility
 - Standard library is incomplete
 - Simple mark sweep GC
-- Performance is bad
+- Performance is roughly equal to python
 
 
