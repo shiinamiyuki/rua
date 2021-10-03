@@ -707,7 +707,7 @@ impl Compiler {
                                 ByteCode::Op3U8(OpCode::Call, operands) => {
                                     *self.module.code.last_mut().unwrap() =
                                         ByteCode::Op3U8(OpCode::TailCall, operands);
-                                    self.emit(ByteCode::Op3U8(OpCode::Return, [1, 0, 0]));
+                                        self.emit(ByteCode::Op3U8(OpCode::Return, [1, 0, 0]));
                                     return Ok(());
                                 }
                                 _ => panic!("expected call instruction"),
@@ -723,10 +723,9 @@ impl Compiler {
                     for e in expr {
                         self.compile_expr(e, Default::default())?;
                     }
-                    self.emit(ByteCode::Op3U8(OpCode::Return, [expr.len() as u8, 0, 0]));
                     // self.emit(ByteCode::Op3U8(OpCode::Pack, get_3xu8(expr.len() as u32)));
+                    self.emit(ByteCode::Op3U8(OpCode::Return, [expr.len() as u8, 0, 0]));
                 }
-
                 Ok(())
             }
             Stmt::LocalVar { loc, vars } => match &**vars {

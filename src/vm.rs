@@ -628,6 +628,10 @@ impl Instance {
                         let idx = operands[0];
                         let mut frames = state.frames.borrow_mut();
                         let frame = frames.last_mut().unwrap();
+                        let idx = idx as usize;
+                        if idx >= frame.locals.len() {
+                            frame.locals.resize(idx, RawValue::Nil);
+                        }
                         frame.locals[idx as usize] = eval_stack.pop().unwrap();
                     }
                     OpCode::CloseUpvalue => {

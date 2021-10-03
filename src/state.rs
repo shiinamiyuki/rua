@@ -13,14 +13,13 @@ use crate::{
 };
 use std::{
     cell::{Cell, RefCell},
-    cmp::Ordering,
-    process::abort,
     rc::{Rc, Weak},
 };
 
 pub const MAX_LOCALS: usize = 256;
 pub(crate) struct Frame {
-    pub(crate) locals: SmallVec<[RawValue; MAX_LOCALS]>,
+    // pub(crate) locals: [RawValue; MAX_LOCALS],
+    pub(crate) locals: SmallVec<[RawValue; 32]>,
     // pub(crate) frame_bottom: usize, //stack[frame_buttom..frame_buttom_n_args]
     pub(crate) closure: Option<Gc<Closure>>,
     pub(crate) ip: usize,
@@ -36,9 +35,9 @@ impl Frame {
     }
     pub(crate) fn new(n_args: usize, closure: Option<Gc<Closure>>) -> Self {
         Self {
-            locals: smallvec![RawValue::default(); MAX_LOCALS],
+            locals: smallvec![RawValue::default();16.max(n_args)], //[RawValue::default(); MAX_LOCALS],
             closure:closure.clone(),
-            ip: Self::get_ip(closure.clone()),
+            ip: Self::get_ip(closure),
             n_args,
             has_closed: false,
         }
@@ -402,7 +401,7 @@ impl State {
         let c = self.gc.allocate(c);
         RawValue::Closure(c)
     }
-    pub(crate) fn concat(&self, a:& RawValue, b: &RawValue) -> Result<RawValue, RuntimeError> {
+    pub(crate) fn concat(&self, a: &RawValue, b: &RawValue) -> Result<RawValue, RuntimeError> {
         match (a, b) {
             (RawValue::String(a), RawValue::String(b)) => {
                 let mut a = a.data.clone();
@@ -684,7 +683,7 @@ impl State {
     pub(crate) fn ne(&self, a: &RawValue, b: &RawValue) -> Result<RawValue, RuntimeError> {
         Ok(RawValue::from_bool(!self.eq(a, b)?.to_bool()))
     }
-    pub(crate) fn idiv(&self, a: &RawValue, b:& RawValue) -> Result<RawValue, RuntimeError> {
+    pub(crate) fn idiv(&self, a: &RawValue, b: &RawValue) -> Result<RawValue, RuntimeError> {
         if let (Some(a), Some(b)) = (a.number(), b.number()) {
             if b == 0.0 {
                 return Err(RuntimeError {
