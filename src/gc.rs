@@ -125,6 +125,10 @@ impl Drop for GcLockGuard {
         self.gc.inner.borrow_mut().lock -= 1;
     }
 }
+struct GcHead {}
+impl Traceable for GcHead {
+    fn trace(&self, _: &GcState) {}
+}
 impl GcState {
     // move an object onto heap
     pub(crate) fn allocate<T: Traceable + 'static>(&self, object: T) -> Gc<T> {
@@ -172,13 +176,16 @@ impl GcState {
         obj.trace(self);
     }
     pub fn new() -> Self {
-        Self {
+        let gc = Self {
             inner: RefCell::new(GcInner {
                 head: None,
                 lock: 0,
                 alloc_count: 0,
             }),
-        }
+        };
+        let head = gc.allocate(GcHead {});
+        unsafe { head.ptr.as_ref().strong_ref_count.set(u32::MAX as usize) };
+        gc
     }
     pub fn lock(self: &Rc<GcState>) -> GcLockGuard {
         self.inner.borrow_mut().lock += 1;
@@ -188,7 +195,7 @@ impl GcState {
     pub(crate) fn start_trace(&self) {}
     pub(crate) fn end_trace(&self) {}
     pub(crate) fn collect(&self, force: bool) {
-        let mut gc = self.inner.borrow_mut();
+        let gc = self.inner.borrow_mut();
         assert!(!force || gc.lock == 0);
         let mut cur = gc.head;
         // println!("collecting");
@@ -196,10 +203,7 @@ impl GcState {
             while let Some(p) = cur {
                 let object = p.as_ref();
                 let next = object.next.get();
-                if !object.marked.get() {
-                    if cur == gc.head {
-                        gc.head = next;
-                    }
+                if !object.marked.get() && cur != gc.head {
                     object.remove();
                     // println!("collected object {:0x}", p.as_ptr().cast::<()>() as u64);
                     Box::from_raw(p.as_ptr());

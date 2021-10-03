@@ -37,16 +37,17 @@ macro_rules! new_frame {
     ($gc:expr, $eval_stack:expr, $n_args:expr,$closure:expr) => {{
         let mut args: SmallVec<[RawValue; 8]> = SmallVec::new();
         for i in 0..$n_args {
-            args.push($eval_stack[$eval_stack.len() - 1 - i].clone());
+            let j = $eval_stack.len() - 1 - i;
+            args.push(std::mem::replace(&mut $eval_stack[j],RawValue::Nil));
         }
         if !args.is_empty() {
             match args.last().unwrap().clone() {
                 RawValue::Tuple(tuple) => {
                     if tuple.flag == TupleFlag::VarArgs {
                         args.pop().unwrap();
-                        let values = tuple.values.borrow();
-                        for v in values.iter() {
-                            args.push(v.clone());
+                        let values = std::mem::replace(&mut *tuple.values.borrow_mut(),smallvec![]);
+                        for v in values.into_iter() {
+                            args.push(v);
                         }
                     }
                 }
