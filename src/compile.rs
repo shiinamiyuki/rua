@@ -707,7 +707,7 @@ impl Compiler {
                                 ByteCode::Op3U8(OpCode::Call, operands) => {
                                     *self.module.code.last_mut().unwrap() =
                                         ByteCode::Op3U8(OpCode::TailCall, operands);
-                                    self.emit(ByteCode::Op(OpCode::Return));
+                                    self.emit(ByteCode::Op3U8(OpCode::Return, [1, 0, 0]));
                                     return Ok(());
                                 }
                                 _ => panic!("expected call instruction"),
@@ -715,15 +715,18 @@ impl Compiler {
                         }
                         _ => {}
                     }
+                    self.emit(ByteCode::Op3U8(OpCode::Return, [1, 0, 0]));
                 } else if expr.is_empty() {
                     self.emit(ByteCode::Op(OpCode::LoadNil));
+                    self.emit(ByteCode::Op3U8(OpCode::Return, [1, 0, 0]));
                 } else {
                     for e in expr {
                         self.compile_expr(e, Default::default())?;
                     }
-                    self.emit(ByteCode::Op3U8(OpCode::Pack, get_3xu8(expr.len() as u32)));
+                    self.emit(ByteCode::Op3U8(OpCode::Return, [expr.len() as u8, 0, 0]));
+                    // self.emit(ByteCode::Op3U8(OpCode::Pack, get_3xu8(expr.len() as u32)));
                 }
-                self.emit(ByteCode::Op(OpCode::Return));
+
                 Ok(())
             }
             Stmt::LocalVar { loc, vars } => match &**vars {
@@ -1169,7 +1172,7 @@ impl Compiler {
             }
         }
 
-        self.emit(ByteCode::Op(OpCode::Return));
+        self.emit(ByteCode::Op3U8(OpCode::Return, [1, 0, 0]));
         let proto = ClosurePrototype {
             n_args: if has_varargs {
                 args.len() - 1 + arg_offset as usize

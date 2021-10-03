@@ -205,7 +205,9 @@ impl Instance {
                 let info = &proto.upvalues[i];
                 if i == 0 && info.is_special {
                     let mut v = v.inner.borrow_mut();
-                    *v = Rc::new(CloneCell::new(UpValueInner::Closed(self.state.globals.clone())));
+                    *v = Rc::new(CloneCell::new(UpValueInner::Closed(
+                        self.state.globals.clone(),
+                    )));
                 } else {
                     if !info.from_parent {
                         let mut v = v.inner.borrow_mut();
@@ -299,7 +301,11 @@ impl Instance {
                     }
                     OpCode::RotBCA => {
                         let i = eval_stack.len() - 1;
-                        let (a, b, c) = (eval_stack[i - 2].clone(), eval_stack[i - 1].clone(), eval_stack[i].clone());
+                        let (a, b, c) = (
+                            eval_stack[i - 2].clone(),
+                            eval_stack[i - 1].clone(),
+                            eval_stack[i].clone(),
+                        );
                         eval_stack[i - 2] = b;
                         eval_stack[i - 1] = c;
                         eval_stack[i] = a;
@@ -452,35 +458,7 @@ impl Instance {
                         };
                         ip = addr as usize;
                     }
-                    OpCode::Return => {
-                        assert!(n_expected_rets > 0);
-                        if n_expected_rets != u8::MAX {
-                            let ret = eval_stack.last().unwrap().clone();
-                            match ret {
-                                RawValue::Tuple(tuple) => {
-                                    if tuple.flag == TupleFlag::VarArgs {
-                                        eval_stack.pop();
-                                        let values = tuple.values.borrow();
-                                        for i in 0..(n_expected_rets as usize).min(values.len()) {
-                                            eval_stack.push(values[i].clone());
-                                        }
-                                        for _ in values.len()..(n_expected_rets as usize) {
-                                            eval_stack.push(RawValue::Nil);
-                                        }
-                                    }
-                                }
-                                _ => {
-                                    if n_expected_rets > 1 {
-                                        for _ in 1..n_expected_rets {
-                                            eval_stack.push(RawValue::Nil);
-                                        }
-                                    }
-                                }
-                            };
-                            // *eval_stack.last_mut().unwrap() = ret;
-                        }
-                        break;
-                    }
+
                     _ => panic!("unreachable, instruction is {:#?}", instruction),
                 },
                 ByteCode::Op3U8(op, operands) => match op {
@@ -506,19 +484,84 @@ impl Instance {
                     //         }
                     //     }
                     // }
-                    OpCode::Pack => {
-                        let cnt = u32_from_3xu8(operands) as usize;
-                        let mut tv = smallvec![];
-                        for i in 0..cnt {
-                            tv.push(eval_stack[eval_stack.len() + i - cnt].clone());
+                    // OpCode::Pack => {
+                    //     let cnt = u32_from_3xu8(operands) as usize;
+                    //     let mut tv = smallvec![];
+                    //     for i in 0..cnt {
+                    //         tv.push(eval_stack[eval_stack.len() + i - cnt].clone());
+                    //     }
+                    //     let st_len = eval_stack.len() - cnt;
+                    //     eval_stack.resize(st_len, RawValue::Nil);
+                    //     eval_stack.push(RawValue::Tuple(self.gc.allocate(Tuple {
+                    //         values: RefCell::new(tv),
+                    //         flag: TupleFlag::VarArgs,
+                    //         metatable: CloneCell::new(RawValue::nil()),
+                    //     })));
+                    // }
+                    OpCode::Return => {
+                        assert!(n_expected_rets > 0);
+                        let n_ret = operands[0];
+                        debug_println!("on return, {}", eval_stack.last().unwrap().print());
+                        if n_expected_rets != u8::MAX {
+                            let st_len =
+                                eval_stack.len() - n_ret as usize + n_expected_rets as usize;
+                            eval_stack.resize(st_len, RawValue::Nil);
+                            match eval_stack.last_mut().unwrap().clone() {
+                                RawValue::Tuple(tuple) if tuple.flag == TupleFlag::VarArgs => {
+                                    let first = tuple.values.borrow()[0].clone();
+                                    *eval_stack.last_mut().unwrap() = first;
+                                }
+                                _ => {}
+                            }
+                            // let ret = eval_stack.last().unwrap().clone();
+                            // match ret {
+                            //     RawValue::Tuple(tuple) => {
+                            //         if tuple.flag == TupleFlag::VarArgs {
+                            //             eval_stack.pop();
+                            //             let values = tuple.values.borrow();
+                            //             for i in 0..(n_expected_rets as usize).min(values.len()) {
+                            //                 eval_stack.push(values[i].clone());
+                            //             }
+                            //             for _ in values.len()..(n_expected_rets as usize) {
+                            //                 eval_stack.push(RawValue::Nil);
+                            //             }
+                            //         }
+                            //     }
+                            //     _ => {
+                            //         if n_expected_rets > 1 {
+                            //             for _ in 1..n_expected_rets {
+                            //                 eval_stack.push(RawValue::Nil);
+                            //             }
+                            //         }
+                            //     }
+                            // };
+                            // *eval_stack.last_mut().unwrap() = ret;
+                        } else {
+                            let mut tv = smallvec![];
+                            let cnt = n_ret as usize;
+                            for i in 0..cnt {
+                                let v = eval_stack[eval_stack.len() + i - cnt].clone();
+                                match v {
+                                    RawValue::Tuple(t) if t.flag == TupleFlag::VarArgs => {
+                                        assert!(i + 1 == cnt);
+                                        for x in t.values.borrow().iter() {
+                                            tv.push(x.clone());
+                                        }
+                                    }
+                                    _ => {
+                                        tv.push(v);
+                                    }
+                                }
+                            }
+                            let st_len = eval_stack.len() - cnt;
+                            eval_stack.resize(st_len, RawValue::Nil);
+                            eval_stack.push(RawValue::Tuple(self.gc.allocate(Tuple {
+                                values: RefCell::new(tv),
+                                flag: TupleFlag::VarArgs,
+                                metatable: CloneCell::new(RawValue::nil()),
+                            })));
                         }
-                        let st_len = eval_stack.len() - cnt;
-                        eval_stack.resize(st_len, RawValue::Nil);
-                        eval_stack.push(RawValue::Tuple(self.gc.allocate(Tuple {
-                            values: RefCell::new(tv),
-                            flag: TupleFlag::VarArgs,
-                            metatable: CloneCell::new(RawValue::nil()),
-                        })));
+                        break;
                     }
                     OpCode::NewTable => {
                         let n_array = u16::from_le_bytes([operands[0], operands[1]]) as usize;
@@ -648,7 +691,7 @@ impl Instance {
                                 },
                                 _ => {
                                     self.state.table_rawset(
-                                       & table,
+                                        &table,
                                         &RawValue::from_number(cnt as f64),
                                         last,
                                     )?;

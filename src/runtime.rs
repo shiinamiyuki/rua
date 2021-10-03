@@ -1256,9 +1256,9 @@ impl Drop for Runtime {
                 "Runtime dropped before instances"
             );
         }
-        println!(
-            "total alloc {}",
-            self.inner.borrow().gc.inner.borrow().alloc_count
-        );
+        // println!(
+        //     "total alloc {}",
+        //     self.inner.borrow().gc.inner.borrow().alloc_count
+        // );
     }
 }
