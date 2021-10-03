@@ -4,10 +4,10 @@ use crate::{
     closure::{Callable, Closure, UpValue, UpValueInner},
     debug_println,
     gc::{Gc, GcState, Traceable},
-    runtime::{ConstantsIndex, ErrorKind, RuntimeError, RuntimeInner, ValueRef},
+    runtime::{ConstantsIndex, ErrorKind, RuntimeError, RuntimeInner, Value},
     state::{CallContext, Frame, State},
     table::Table,
-    value::{Managed, ManagedCell, Tuple, TupleFlag, Value},
+    value::{Managed, ManagedCell, Tuple, TupleFlag, RawValue},
     Stack,
 };
 use smallvec::{smallvec, SmallVec};
@@ -35,13 +35,13 @@ enum Continue {
 }
 macro_rules! new_frame {
     ($gc:expr, $eval_stack:expr, $n_args:expr,$closure:expr) => {{
-        let mut args: SmallVec<[Value; 8]> = SmallVec::new();
+        let mut args: SmallVec<[RawValue; 8]> = SmallVec::new();
         for i in 0..$n_args {
             args.push($eval_stack[$eval_stack.len() - 1 - i]);
         }
         if !args.is_empty() {
             match *args.last().unwrap() {
-                Value::Tuple(tuple) => {
+                RawValue::Tuple(tuple) => {
                     if tuple.flag == TupleFlag::VarArgs {
                         args.pop().unwrap();
                         let values = tuple.values.borrow();
@@ -55,7 +55,7 @@ macro_rules! new_frame {
         }
 
         let len = $eval_stack.len();
-        $eval_stack.resize(len - $n_args, Value::nil());
+        $eval_stack.resize(len - $n_args, RawValue::nil());
 
         new_frame_direct!($gc, args, $closure)
         // frame
@@ -82,10 +82,10 @@ macro_rules! new_frame_direct {
             for i in n_parameters..n_args {
                 tv.push($args[i]);
             }
-            frame.locals[n_parameters] = Value::Tuple($gc.allocate(Tuple {
+            frame.locals[n_parameters] = RawValue::Tuple($gc.allocate(Tuple {
                 values: RefCell::new(tv),
                 flag: TupleFlag::VarArgs,
-                metatable: Cell::new(Value::Nil),
+                metatable: Cell::new(RawValue::Nil),
             }));
         }
         frame
@@ -111,9 +111,9 @@ impl Instance {
     // pub fn lock<'a>(&self) -> RefMut<State> {
     //     self.state.borrow_mut()
     // }
-    pub(crate) fn call(&self, closure: Value, args: &[Value]) -> Result<Value, RuntimeError> {
+    pub(crate) fn call(&self, closure: RawValue, args: &[RawValue]) -> Result<RawValue, RuntimeError> {
         match closure {
-            Value::Closure(closure) => {
+            RawValue::Closure(closure) => {
                 let frame = { new_frame_direct!(self.gc, args, Some(closure)) };
                 let level = {
                     let mut frames = self.state.frames.borrow_mut();
@@ -127,7 +127,7 @@ impl Instance {
                     Ok(eval_stack.pop().unwrap())
                 }
             }
-            Value::Callable(callable) => {
+            RawValue::Callable(callable) => {
                 let frame = { new_frame_direct!(self.gc, args, None) };
                 // {
                 //     let mut frames = self.state.frames.borrow_mut();
@@ -210,7 +210,7 @@ impl Instance {
                         //     _ => unreachable!(),
                         // }
                         *v = Rc::new(Cell::new(UpValueInner::Open(
-                            &mut frame.locals[info.location as usize] as *mut Value,
+                            &mut frame.locals[info.location as usize] as *mut RawValue,
                         )));
                     }
                 }
@@ -331,7 +331,7 @@ impl Instance {
                             _ => unreachable!(),
                         };
                         let bytes = [lo[0], lo[1], lo[2], lo[3], hi[0], hi[1], hi[2], hi[3]];
-                        eval_stack.push(Value::from_number(f64::from_le_bytes(bytes)));
+                        eval_stack.push(RawValue::from_number(f64::from_le_bytes(bytes)));
                         ip += 3;
                     }
                     // OpCode::LoadGlobal => {
@@ -378,13 +378,13 @@ impl Instance {
                     //     // self.state.set_global(name, v);
                     // }
                     OpCode::LoadNil => {
-                        eval_stack.push(Value::nil());
+                        eval_stack.push(RawValue::nil());
                     }
                     OpCode::LoadTrue => {
-                        eval_stack.push(Value::from_bool(true));
+                        eval_stack.push(RawValue::from_bool(true));
                     }
                     OpCode::LoadFalse => {
-                        eval_stack.push(Value::from_bool(false));
+                        eval_stack.push(RawValue::from_bool(false));
                     }
                     OpCode::Concat => {
                         binary_op_impl!(concat)
@@ -453,7 +453,7 @@ impl Instance {
                         if n_expected_rets != u8::MAX {
                             let ret = *eval_stack.last().unwrap();
                             match ret {
-                                Value::Tuple(tuple) => {
+                                RawValue::Tuple(tuple) => {
                                     if tuple.flag == TupleFlag::VarArgs {
                                         eval_stack.pop();
                                         let values = tuple.values.borrow();
@@ -461,14 +461,14 @@ impl Instance {
                                             eval_stack.push(values[i]);
                                         }
                                         for _ in values.len()..(n_expected_rets as usize) {
-                                            eval_stack.push(Value::Nil);
+                                            eval_stack.push(RawValue::Nil);
                                         }
                                     }
                                 }
                                 _ => {
                                     if n_expected_rets > 1 {
                                         for _ in 1..n_expected_rets {
-                                            eval_stack.push(Value::Nil);
+                                            eval_stack.push(RawValue::Nil);
                                         }
                                     }
                                 }
@@ -509,11 +509,11 @@ impl Instance {
                             tv.push(eval_stack[eval_stack.len() + i - cnt]);
                         }
                         let st_len = eval_stack.len() - cnt;
-                        eval_stack.resize(st_len, Value::Nil);
-                        eval_stack.push(Value::Tuple(self.gc.allocate(Tuple {
+                        eval_stack.resize(st_len, RawValue::Nil);
+                        eval_stack.push(RawValue::Tuple(self.gc.allocate(Tuple {
                             values: RefCell::new(tv),
                             flag: TupleFlag::VarArgs,
-                            metatable: Cell::new(Value::nil()),
+                            metatable: Cell::new(RawValue::nil()),
                         })));
                     }
                     OpCode::NewTable => {
@@ -617,17 +617,17 @@ impl Instance {
                             for i in 0..(cnt - 1) {
                                 self.state.table_rawset(
                                     table,
-                                    Value::from_number((i + 1) as f64),
+                                    RawValue::from_number((i + 1) as f64),
                                     eval_stack[eval_stack.len() + i as usize - cnt as usize],
                                 )?;
                             }
                             let last = eval_stack[eval_stack.len() - 1];
                             match last {
-                                Value::Tuple(tuple) => match tuple.flag {
+                                RawValue::Tuple(tuple) => match tuple.flag {
                                     crate::value::TupleFlag::Empty => {
                                         self.state.table_rawset(
                                             table,
-                                            Value::from_number(cnt as f64),
+                                            RawValue::from_number(cnt as f64),
                                             last,
                                         )?;
                                     }
@@ -636,7 +636,7 @@ impl Instance {
                                         for (i, v) in values.iter().enumerate() {
                                             self.state.table_rawset(
                                                 table,
-                                                Value::from_number((cnt + i as u32) as f64),
+                                                RawValue::from_number((cnt + i as u32) as f64),
                                                 *v,
                                             )?;
                                         }
@@ -645,21 +645,21 @@ impl Instance {
                                 _ => {
                                     self.state.table_rawset(
                                         table,
-                                        Value::from_number(cnt as f64),
+                                        RawValue::from_number(cnt as f64),
                                         last,
                                     )?;
                                 }
                             }
                         }
                         let len = eval_stack.len();
-                        eval_stack.resize(len - cnt as usize - 1, Value::Nil);
+                        eval_stack.resize(len - cnt as usize - 1, RawValue::Nil);
                     }
                     OpCode::TailCall => {
                         let n_args = operands[0] as usize;
                         let mut func = eval_stack.pop().unwrap();
                         loop {
                             match func {
-                                Value::Closure(closure) => {
+                                RawValue::Closure(closure) => {
                                     let mut frames = state.frames.borrow_mut();
                                     let frame = frames.last_mut().unwrap();
                                     frame.has_closed = true;
@@ -671,7 +671,7 @@ impl Instance {
                                     n_expected_rets = operands[1];
                                     break;
                                 }
-                                Value::Callable(callable) => {
+                                RawValue::Callable(callable) => {
                                     {
                                         let mut frames = state.frames.borrow_mut();
                                         let frame = frames.last_mut().unwrap();
@@ -710,13 +710,13 @@ impl Instance {
                         let mut func = eval_stack.pop().unwrap();
                         loop {
                             match func {
-                                Value::Closure(closure) => {
+                                RawValue::Closure(closure) => {
                                     ip += 1;
                                     let frame =
                                         new_frame!(self.gc, eval_stack, n_args, Some(closure));
                                     on_return!(Ok(Continue::NewFrame(frame, operands[1])));
                                 }
-                                Value::Callable(callable) => {
+                                RawValue::Callable(callable) => {
                                     ip += 1;
                                     let frame = new_frame!(self.gc, eval_stack, n_args, None);
                                     on_return!(Ok(Continue::CallExt(callable, frame, operands[1])));
@@ -845,7 +845,7 @@ impl Instance {
         }
         module
     }
-    pub fn exec<'a>(&'a self, module: ByteCodeModule) -> Result<ValueRef<'a>, RuntimeError> {
+    pub fn exec<'a>(&'a self, module: ByteCodeModule) -> Result<Value<'a>, RuntimeError> {
         let module = self.load_module_string(module);
         match self.exec_impl(module) {
             Ok(_) => {}
@@ -858,9 +858,9 @@ impl Instance {
         if self.state.eval_stack.borrow().len() == 1 {
             let mut st = self.state.eval_stack.borrow_mut();
             let v = st.pop().unwrap();
-            return Ok(ValueRef::new(v));
+            return Ok(Value::new(v));
         }
-        Ok(ValueRef::new(Value::Nil))
+        Ok(Value::new(RawValue::Nil))
     }
     fn reset(&self) {
         let mut st = self.state.eval_stack.borrow_mut();
@@ -960,82 +960,82 @@ impl Instance {
     }
 }
 impl BaseApi for Instance {
-    fn create_number<'a>(&'a self, x: f64) -> crate::runtime::ValueRef<'a> {
+    fn create_number<'a>(&'a self, x: f64) -> crate::runtime::Value<'a> {
         self.runtime.create_number(x)
     }
 
-    fn create_bool<'a>(&self, x: bool) -> crate::runtime::ValueRef<'a> {
+    fn create_bool<'a>(&self, x: bool) -> crate::runtime::Value<'a> {
         self.runtime.create_bool(x)
     }
 
     fn create_userdata<'a, T: crate::value::UserData + Traceable>(
         &self,
         userdata: T,
-    ) -> crate::runtime::ValueRef<'a> {
+    ) -> crate::runtime::Value<'a> {
         self.runtime.create_userdata(userdata)
     }
 
-    fn create_string<'a>(&self, s: String) -> crate::runtime::ValueRef<'a> {
+    fn create_string<'a>(&self, s: String) -> crate::runtime::Value<'a> {
         self.runtime.create_string(s)
     }
 
-    fn upgrade<'a>(&'a self, v: crate::runtime::ValueRef<'_>) -> crate::runtime::GcValue {
+    fn upgrade<'a>(&'a self, v: crate::runtime::Value<'_>) -> crate::runtime::GcValue {
         self.runtime.upgrade(v)
     }
 
-    fn create_closure<'a>(&self, closure: Box<dyn Callable>) -> ValueRef<'a> {
+    fn create_closure<'a>(&self, closure: Box<dyn Callable>) -> Value<'a> {
         self.runtime.create_closure(closure)
     }
 
-    fn create_table<'a>(&self) -> ValueRef<'a> {
+    fn create_table<'a>(&self) -> Value<'a> {
         self.runtime.create_table()
     }
 
-    fn set_metatable<'a>(&self, v: ValueRef<'a>, mt: ValueRef<'a>) {
+    fn set_metatable<'a>(&self, v: Value<'a>, mt: Value<'a>) {
         self.runtime.set_metatable(v, mt)
     }
 
-    fn get_metatable<'a>(&self, v: ValueRef<'a>) -> ValueRef<'a> {
+    fn get_metatable<'a>(&self, v: Value<'a>) -> Value<'a> {
         self.runtime.get_metatable(v)
     }
 
     fn table_rawset<'a>(
         &'a self,
-        table: ValueRef<'a>,
-        key: ValueRef<'a>,
-        value: ValueRef<'a>,
+        table: Value<'a>,
+        key: Value<'a>,
+        value: Value<'a>,
     ) -> Result<(), RuntimeError> {
         self.runtime.table_rawset(table, key, value)
     }
 
     fn table_rawget<'a>(
         &'a self,
-        table: ValueRef<'a>,
-        key: ValueRef<'a>,
-    ) -> Result<ValueRef<'a>, RuntimeError> {
+        table: Value<'a>,
+        key: Value<'a>,
+    ) -> Result<Value<'a>, RuntimeError> {
         self.runtime.table_rawget(table, key)
     }
 
-    fn get_global_env<'a>(&self) -> ValueRef<'a> {
+    fn get_global_env<'a>(&self) -> Value<'a> {
         self.runtime.get_global_env()
     }
 }
 impl StateApi for Instance {
     fn table_set<'a>(
         &'a self,
-        table: crate::runtime::ValueRef<'a>,
-        key: crate::runtime::ValueRef<'a>,
-        value: crate::runtime::ValueRef<'a>,
+        table: crate::runtime::Value<'a>,
+        key: crate::runtime::Value<'a>,
+        value: crate::runtime::Value<'a>,
     ) -> Result<(), RuntimeError> {
         self.state.table_set(table.value, key.value, value.value)
     }
 
     fn table_get<'a>(
         &'a self,
-        table: crate::runtime::ValueRef<'a>,
-        key: crate::runtime::ValueRef<'a>,
-    ) -> Result<crate::runtime::ValueRef<'a>, RuntimeError> {
-        Ok(ValueRef::new(self.state.table_get(table.value, key.value)?))
+        table: crate::runtime::Value<'a>,
+        key: crate::runtime::Value<'a>,
+    ) -> Result<crate::runtime::Value<'a>, RuntimeError> {
+        Ok(Value::new(self.state.table_get(table.value, key.value)?))
     }
 }
 impl Traceable for Instance {

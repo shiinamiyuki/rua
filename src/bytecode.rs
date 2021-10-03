@@ -1,7 +1,7 @@
 use std::fmt::Debug;
 
 use crate::parse::SourceLocation;
-use crate::{closure::ClosurePrototype, value::Value};
+use crate::{closure::ClosurePrototype, value::RawValue};
 use std::collections::{BTreeMap, HashMap};
 
 #[repr(u8)]
@@ -129,7 +129,7 @@ pub enum ByteCode {
 pub struct ByteCodeModule {
     pub(crate) prototypes: Vec<ClosurePrototype>,
     pub(crate) string_pool: Vec<String>,
-    pub(crate) string_pool_cache: Vec<Value>,
+    pub(crate) string_pool_cache: Vec<RawValue>,
     pub(crate) code: Vec<ByteCode>,
     // pub(crate) debug_info: ModuleDebugInfo,
 }

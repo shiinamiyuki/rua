@@ -12,7 +12,7 @@ use crate::{
     gc::{GcState, Traceable},
     runtime::RuntimeError,
     state::CallContext,
-    value::Value,
+    value::RawValue,
 };
 
 pub trait Callable: Traceable {
@@ -43,8 +43,8 @@ impl Callable for NativeFunction {
 #[derive(Clone, Copy)]
 pub(crate) enum UpValueInner {
     Empty,
-    Open(*mut Value),
-    Closed(Value),
+    Open(*mut RawValue),
+    Closed(RawValue),
 }
 
 #[derive(Clone)]
@@ -81,7 +81,7 @@ pub struct Closure {
     // pub(crate) upvalues: HashMap<u32, UpValue>,
 }
 impl Closure {
-    pub(crate) fn set_upvalue(&self, i: u32, value: Value) {
+    pub(crate) fn set_upvalue(&self, i: u32, value: RawValue) {
         unsafe {
             debug_println!(
                 "store upvalue {} {:?}, {}",
@@ -110,7 +110,7 @@ impl Closure {
     //         }
     //     }
     // }
-    pub(crate) fn get_upvalue(&self, i: u32) -> Value {
+    pub(crate) fn get_upvalue(&self, i: u32) -> RawValue {
         unsafe {
             // let v = (*self.upvalues[i as usize].inner).borrow();
             debug_println!(

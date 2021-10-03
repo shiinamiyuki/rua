@@ -431,6 +431,7 @@ impl Compiler {
                             self.compile_expr(lhs, Default::default())?;
                             self.emit(ByteCode::Op3U8(OpCode::TestJump, [1, 0, 1]));
                             let l = self.new_label();
+                            self.emit(ByteCode::Label(l.to_le_bytes()));
                             self.compile_expr(rhs, Default::default())?;
                             self.emit_label(l);
                             return Ok(());

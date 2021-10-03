@@ -4,8 +4,8 @@ use std::io::{BufReader, BufWriter};
 use std::rc::Rc;
 
 use crate::api::*;
-use crate::runtime::{ErrorKind, Runtime, RuntimeError, ValueRef};
-use crate::value::Value;
+use crate::runtime::{ErrorKind, Runtime, RuntimeError, Value};
+use crate::value::RawValue;
 
 // macro_rules! bind_function {
 //     ($func:ident, fn($arg0:ty)->$ret:ty) => {
@@ -84,9 +84,9 @@ pub(crate) fn add_table_lib(runtime: &Runtime) {
                 (ctx.arg(1)?, ctx.arg(2)?)
             } else {
                 let len = table.len();
-                let i = Value::from_number(len as f64 + 1.0);
+                let i = RawValue::from_number(len as f64 + 1.0);
                 let v = ctx.arg(1)?;
-                (ValueRef::new(i), v)
+                (Value::new(i), v)
             };
             let _ = i.cast::<f64>()?;
             table.set(i.value, v.value);
@@ -135,7 +135,7 @@ pub(crate) fn add_string_lib(runtime: &Runtime) {
         if ctx.arg_count() >= 2 {
             let i = *ctx.arg(1)?.cast::<f64>()? as usize;
             if !(i >= 1 && i <= s.len()) {
-                ctx.ret(0, ValueRef::new(Value::Nil));
+                ctx.ret(0, Value::new(RawValue::Nil));
             } else {
                 ctx.ret(
                     0,

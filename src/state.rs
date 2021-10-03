@@ -5,9 +5,9 @@ use crate::{
     closure::Closure,
     debug_println,
     gc::{Gc, GcState, Traceable},
-    runtime::{ConstantsIndex, ErrorKind, GlobalState, RuntimeError, ValueRef},
+    runtime::{ConstantsIndex, ErrorKind, GlobalState, RuntimeError, Value},
     table::Table,
-    value::{Managed, Tuple, UserData, Value},
+    value::{Managed, Tuple, UserData, RawValue},
     vm::Instance,
     Stack,
 };
@@ -20,7 +20,7 @@ use std::{
 
 pub const MAX_LOCALS: usize = 256;
 pub(crate) struct Frame {
-    pub(crate) locals: [Value; MAX_LOCALS],
+    pub(crate) locals: [RawValue; MAX_LOCALS],
     // pub(crate) frame_bottom: usize, //stack[frame_buttom..frame_buttom_n_args]
     pub(crate) closure: Option<Gc<Closure>>,
     pub(crate) ip: usize,
@@ -36,7 +36,7 @@ impl Frame {
     }
     pub(crate) fn new(n_args: usize, closure: Option<Gc<Closure>>) -> Self {
         Self {
-            locals: [Value::default(); MAX_LOCALS],
+            locals: [RawValue::default(); MAX_LOCALS],
             closure,
             ip: Self::get_ip(closure),
             n_args,
@@ -65,17 +65,17 @@ A runtime has multiple instances
 */
 pub struct State {
     pub(crate) gc: Rc<GcState>,
-    pub(crate) globals: Value,
+    pub(crate) globals: RawValue,
     pub(crate) global_state: Rc<GlobalState>,
     pub(crate) frames: RefCell<Stack<Frame>>,
-    pub(crate) eval_stack: RefCell<Vec<Value>>,
+    pub(crate) eval_stack: RefCell<Vec<RawValue>>,
     pub(crate) instance: Weak<Instance>,
 }
 
 macro_rules! binary_op_impl_closue {
     ($self:expr, $op:expr, $op_str:expr, $a:expr,$b:expr,$metamethod:ident) => {
         if let (Some(a), Some(b)) = ($a.number(), $b.number()) {
-            Ok(Value::from_number($op(a, b)))
+            Ok(RawValue::from_number($op(a, b)))
         } else {
             macro_rules! error {
                 () => {
@@ -147,7 +147,7 @@ macro_rules! int_binary_op_impl {
                 }
                 b.trunc() as i64
             };
-            Ok(Value::from_number((a $op b) as f64))
+            Ok(RawValue::from_number((a $op b) as f64))
         } else {
             Err(RuntimeError {
                 kind:ErrorKind::ArithmeticError,
@@ -164,7 +164,7 @@ macro_rules! int_binary_op_impl {
 pub struct CallContext<'a> {
     pub(crate) state: &'a State,
     pub(crate) instance: &'a Instance,
-    pub(crate) ret_values: RefCell<SmallVec<[Value; 8]>>,
+    pub(crate) ret_values: RefCell<SmallVec<[RawValue; 8]>>,
     pub(crate) frame: Frame,
     pub(crate) n_expected_rets: u8,
 }
@@ -176,7 +176,7 @@ impl<'a> CallContext<'a> {
             msg,
         })
     }
-    fn call_raw(&self, closure: Value, args: &[Value]) -> Result<Value, RuntimeError> {
+    fn call_raw(&self, closure: RawValue, args: &[RawValue]) -> Result<RawValue, RuntimeError> {
         Ok(self.instance.call(closure, args)?)
     }
 }
@@ -185,21 +185,21 @@ impl<'a> Drop for CallContext<'a> {
         let mut ret_values = self.ret_values.borrow_mut();
         if self.n_expected_rets == u8::MAX {
             let ret = if ret_values.is_empty() {
-                Value::nil()
+                RawValue::nil()
             } else if ret_values.len() == 1 {
                 ret_values[0]
             } else {
                 let rv = std::mem::replace(&mut *ret_values, smallvec![]);
-                Value::Tuple(self.state.gc.allocate(Tuple {
+                RawValue::Tuple(self.state.gc.allocate(Tuple {
                     values: RefCell::new(rv),
-                    metatable: Cell::new(Value::Nil),
+                    metatable: Cell::new(RawValue::Nil),
                     flag: crate::value::TupleFlag::VarArgs,
                 }))
             };
             let mut st = self.state.eval_stack.borrow_mut();
             st.push(ret);
         } else {
-            ret_values.resize(self.n_expected_rets as usize, Value::Nil);
+            ret_values.resize(self.n_expected_rets as usize, RawValue::Nil);
             let mut st = self.state.eval_stack.borrow_mut();
             for v in ret_values.iter() {
                 st.push(*v);
@@ -233,7 +233,7 @@ impl State {
     //         Value::nil()
     //     }
     // }
-    pub(crate) fn table_rawget(&self, table: Value, key: Value) -> Result<Value, RuntimeError> {
+    pub(crate) fn table_rawget(&self, table: RawValue, key: RawValue) -> Result<RawValue, RuntimeError> {
         let table = match table.as_table() {
             Some(x) => x,
             None => {
@@ -252,9 +252,9 @@ impl State {
     }
     pub(crate) fn table_rawset(
         &self,
-        table: Value,
-        key: Value,
-        value: Value,
+        table: RawValue,
+        key: RawValue,
+        value: RawValue,
     ) -> Result<(), RuntimeError> {
         let table = match table.as_table() {
             Some(x) => x,
@@ -274,15 +274,15 @@ impl State {
         table.set(key, value);
         Ok(())
     }
-    pub(crate) fn table_get(&self, table: Value, key: Value) -> Result<Value, RuntimeError> {
+    pub(crate) fn table_get(&self, table: RawValue, key: RawValue) -> Result<RawValue, RuntimeError> {
         self.table_get_impl(table, key, 0)
     }
     pub(crate) fn table_get_impl(
         &self,
-        mut table: Value,
-        key: Value,
+        mut table: RawValue,
+        key: RawValue,
         mut depth: u32,
-    ) -> Result<Value, RuntimeError> {
+    ) -> Result<RawValue, RuntimeError> {
         loop {
             if depth >= 32 {
                 return Err(RuntimeError {
@@ -309,7 +309,7 @@ impl State {
                                 ),
                             });
                         } else {
-                            (Value::Nil, mt)
+                            (RawValue::Nil, mt)
                         }
                     }
                 }
@@ -328,24 +328,24 @@ impl State {
                 return instance.call(table, &[origin_table, key]);
             }
             if table.as_table().is_none() {
-                return Ok(Value::Nil);
+                return Ok(RawValue::Nil);
             }
             depth += 1;
         }
     }
     pub(crate) fn table_set(
         &self,
-        table: Value,
-        key: Value,
-        value: Value,
+        table: RawValue,
+        key: RawValue,
+        value: RawValue,
     ) -> Result<(), RuntimeError> {
         self.table_set_impl(table, key, value, 0)
     }
     pub(crate) fn table_set_impl(
         &self,
-        table: Value,
-        key: Value,
-        value: Value,
+        table: RawValue,
+        key: RawValue,
+        value: RawValue,
         depth: u32,
     ) -> Result<(), RuntimeError> {
         if let Some(table) = table.as_table() {
@@ -390,32 +390,32 @@ impl State {
         Ok(())
     }
 
-    pub(crate) fn create_userdata<T: UserData + Traceable>(&self, userdata: T) -> Value {
+    pub(crate) fn create_userdata<T: UserData + Traceable>(&self, userdata: T) -> RawValue {
         let p: Box<dyn UserData> = Box::new(userdata);
         let s = self.gc.allocate(p);
-        Value::UserData(s)
+        RawValue::UserData(s)
     }
 
-    pub(crate) fn create_string(&self, s: String) -> Value {
+    pub(crate) fn create_string(&self, s: String) -> RawValue {
         let s = self.gc.allocate(Managed::new(s));
-        Value::String(s)
+        RawValue::String(s)
     }
-    pub(crate) fn create_table(&self, t: Table) -> Value {
+    pub(crate) fn create_table(&self, t: Table) -> RawValue {
         let t = self.gc.allocate(RefCell::new(t));
-        Value::Table(t)
+        RawValue::Table(t)
     }
-    pub(crate) fn create_closure(&self, c: Closure) -> Value {
+    pub(crate) fn create_closure(&self, c: Closure) -> RawValue {
         let c = self.gc.allocate(c);
-        Value::Closure(c)
+        RawValue::Closure(c)
     }
-    pub(crate) fn concat(&self, a: Value, b: Value) -> Result<Value, RuntimeError> {
+    pub(crate) fn concat(&self, a: RawValue, b: RawValue) -> Result<RawValue, RuntimeError> {
         match (a, b) {
-            (Value::String(a), Value::String(b)) => {
+            (RawValue::String(a), RawValue::String(b)) => {
                 let mut a = a.data.clone();
                 a.push_str(&b.data);
                 Ok(self.create_string(a))
             }
-            (Value::String(a), Value::Number(b)) => {
+            (RawValue::String(a), RawValue::Number(b)) => {
                 let mut a = a.data.clone();
                 a.push_str(&b.to_string());
                 Ok(self.create_string(a))
@@ -450,22 +450,22 @@ impl State {
             }
         }
     }
-    pub(crate) fn add(&self, a: Value, b: Value) -> Result<Value, RuntimeError> {
+    pub(crate) fn add(&self, a: RawValue, b: RawValue) -> Result<RawValue, RuntimeError> {
         binary_op_impl!(self, +, a,b, MtKeyAdd)
     }
-    pub(crate) fn sub(&self, a: Value, b: Value) -> Result<Value, RuntimeError> {
+    pub(crate) fn sub(&self, a: RawValue, b: RawValue) -> Result<RawValue, RuntimeError> {
         binary_op_impl!(self, -, a,b, MtKeySub)
     }
-    pub(crate) fn mul(&self, a: Value, b: Value) -> Result<Value, RuntimeError> {
+    pub(crate) fn mul(&self, a: RawValue, b: RawValue) -> Result<RawValue, RuntimeError> {
         binary_op_impl!(self, *, a,b, MtKeyMul)
     }
-    pub(crate) fn div(&self, a: Value, b: Value) -> Result<Value, RuntimeError> {
+    pub(crate) fn div(&self, a: RawValue, b: RawValue) -> Result<RawValue, RuntimeError> {
         binary_op_impl!(self,/, a,b, MtKeyDiv)
     }
-    pub(crate) fn mod_(&self, a: Value, b: Value) -> Result<Value, RuntimeError> {
+    pub(crate) fn mod_(&self, a: RawValue, b: RawValue) -> Result<RawValue, RuntimeError> {
         binary_op_impl!(self,%, a,b,MtKeyMod)
     }
-    pub(crate) fn pow(&self, a: Value, b: Value) -> Result<Value, RuntimeError> {
+    pub(crate) fn pow(&self, a: RawValue, b: RawValue) -> Result<RawValue, RuntimeError> {
         binary_op_impl_closue!(
             self,
             |a: f64, b: f64| -> f64 { a.powf(b) },
@@ -475,10 +475,10 @@ impl State {
             MtKeyPow
         )
     }
-    pub(crate) fn bitwise_and(&self, a: Value, b: Value) -> Result<Value, RuntimeError> {
+    pub(crate) fn bitwise_and(&self, a: RawValue, b: RawValue) -> Result<RawValue, RuntimeError> {
         int_binary_op_impl!(&, a, b)
     }
-    pub(crate) fn bitwise_or(&self, a: Value, b: Value) -> Result<Value, RuntimeError> {
+    pub(crate) fn bitwise_or(&self, a: RawValue, b: RawValue) -> Result<RawValue, RuntimeError> {
         int_binary_op_impl!(|, a, b)
     }
 
@@ -522,13 +522,13 @@ impl State {
     //     res
     // }
 
-    pub(crate) fn lt(&self, a: Value, b: Value) -> Result<Value, RuntimeError> {
+    pub(crate) fn lt(&self, a: RawValue, b: RawValue) -> Result<RawValue, RuntimeError> {
         match (a, b) {
-            (Value::Number(a), Value::Number(b)) => Ok(Value::from_bool(a < b)),
-            (Value::String(a), Value::String(b)) => {
+            (RawValue::Number(a), RawValue::Number(b)) => Ok(RawValue::from_bool(a < b)),
+            (RawValue::String(a), RawValue::String(b)) => {
                 let a = &(*a).data;
                 let b = &(*b).data;
-                Ok(Value::from_bool(a < b))
+                Ok(RawValue::from_bool(a < b))
             }
             _ => {
                 let mt_a = self.get_metatable(a);
@@ -578,13 +578,13 @@ impl State {
             }
         }
     }
-    pub(crate) fn le(&self, a: Value, b: Value) -> Result<Value, RuntimeError> {
+    pub(crate) fn le(&self, a: RawValue, b: RawValue) -> Result<RawValue, RuntimeError> {
         match (a, b) {
-            (Value::Number(a), Value::Number(b)) => Ok(Value::from_bool(a <= b)),
-            (Value::String(a), Value::String(b)) => {
+            (RawValue::Number(a), RawValue::Number(b)) => Ok(RawValue::from_bool(a <= b)),
+            (RawValue::String(a), RawValue::String(b)) => {
                 let a = &(*a).data;
                 let b = &(*b).data;
-                Ok(Value::from_bool(a <= b))
+                Ok(RawValue::from_bool(a <= b))
             }
             _ => {
                 macro_rules! error {
@@ -634,31 +634,31 @@ impl State {
             }
         }
     }
-    pub(crate) fn gt(&self, a: Value, b: Value) -> Result<Value, RuntimeError> {
+    pub(crate) fn gt(&self, a: RawValue, b: RawValue) -> Result<RawValue, RuntimeError> {
         self.lt(b, a)
     }
-    pub(crate) fn ge(&self, a: Value, b: Value) -> Result<Value, RuntimeError> {
+    pub(crate) fn ge(&self, a: RawValue, b: RawValue) -> Result<RawValue, RuntimeError> {
         self.le(b, a)
     }
-    pub(crate) fn eq(&self, a: Value, b: Value) -> Result<Value, RuntimeError> {
+    pub(crate) fn eq(&self, a: RawValue, b: RawValue) -> Result<RawValue, RuntimeError> {
         match (a, b) {
-            (Value::Nil, Value::Nil) => Ok(Value::from_bool(true)),
-            (Value::Bool(a), Value::Bool(b)) => Ok(Value::from_bool(a == b)),
-            (Value::Number(a), Value::Number(b)) => Ok(Value::from_bool(a == b)),
-            (Value::String(a), Value::String(b)) => {
+            (RawValue::Nil, RawValue::Nil) => Ok(RawValue::from_bool(true)),
+            (RawValue::Bool(a), RawValue::Bool(b)) => Ok(RawValue::from_bool(a == b)),
+            (RawValue::Number(a), RawValue::Number(b)) => Ok(RawValue::from_bool(a == b)),
+            (RawValue::String(a), RawValue::String(b)) => {
                 let a = &(*a).data;
                 let b = &(*b).data;
-                Ok(Value::from_bool(a == b))
+                Ok(RawValue::from_bool(a == b))
             }
-            (Value::Closure(a), Value::Closure(b)) => Ok(Value::from_bool(a == b)),
-            (Value::Callable(a), Value::Callable(b)) => Ok(Value::from_bool(a == b)),
-            (Value::Table(a), Value::Table(b)) if a == b => Ok(Value::from_bool(true)),
+            (RawValue::Closure(a), RawValue::Closure(b)) => Ok(RawValue::from_bool(a == b)),
+            (RawValue::Callable(a), RawValue::Callable(b)) => Ok(RawValue::from_bool(a == b)),
+            (RawValue::Table(a), RawValue::Table(b)) if a == b => Ok(RawValue::from_bool(true)),
             _ => {
                 let mt_a = self.get_metatable(a);
                 let mt_b = self.get_metatable(b);
                 macro_rules! error {
                     () => {
-                        Ok(Value::from_bool(false))
+                        Ok(RawValue::from_bool(false))
                     };
                 }
                 if !mt_a.is_nil() {
@@ -682,15 +682,15 @@ impl State {
                     let instance = self.instance.upgrade().unwrap();
                     return instance.call(method, &[a, b]);
                 } else {
-                    Ok(Value::from_bool(false))
+                    Ok(RawValue::from_bool(false))
                 }
             }
         }
     }
-    pub(crate) fn ne(&self, a: Value, b: Value) -> Result<Value, RuntimeError> {
-        Ok(Value::from_bool(!self.eq(a, b)?.to_bool()))
+    pub(crate) fn ne(&self, a: RawValue, b: RawValue) -> Result<RawValue, RuntimeError> {
+        Ok(RawValue::from_bool(!self.eq(a, b)?.to_bool()))
     }
-    pub(crate) fn idiv(&self, a: Value, b: Value) -> Result<Value, RuntimeError> {
+    pub(crate) fn idiv(&self, a: RawValue, b: RawValue) -> Result<RawValue, RuntimeError> {
         if let (Some(a), Some(b)) = (a.number(), b.number()) {
             if b == 0.0 {
                 return Err(RuntimeError {
@@ -698,7 +698,7 @@ impl State {
                     msg: "attempt to divide by zero".into(),
                 });
             }
-            Ok(Value::from_number((a / b).floor()))
+            Ok(RawValue::from_number((a / b).floor()))
         } else {
             macro_rules! error {
                 () => {
@@ -739,20 +739,20 @@ impl State {
             }
         }
     }
-    pub(crate) fn len(&self, a: Value) -> Result<Value, RuntimeError> {
+    pub(crate) fn len(&self, a: RawValue) -> Result<RawValue, RuntimeError> {
         match a {
             // Value::Nil => todo!(),
             // Value::Bool(_) => todo!(),
             // Value::Number(_) => todo!(),
-            Value::String(x) => Ok(Value::from_number((*x).data.len() as f64)),
+            RawValue::String(x) => Ok(RawValue::from_number((*x).data.len() as f64)),
             // Value::Closure(_) => todo!(),
             // Value::Callable(_) => todo!(),
-            Value::Tuple(x) => Ok(Value::from_number((*x).values.borrow().len() as f64)),
+            RawValue::Tuple(x) => Ok(RawValue::from_number((*x).values.borrow().len() as f64)),
             _ => {
                 let mt = self.get_metatable(a);
                 if mt.is_nil() {
                     match a {
-                        Value::Table(x) => Ok(Value::from_number((*x).borrow_mut().len() as f64)),
+                        RawValue::Table(x) => Ok(RawValue::from_number((*x).borrow_mut().len() as f64)),
                         _ => Err(RuntimeError {
                             kind: ErrorKind::ArithmeticError,
                             msg: format!(" attempt to get length of a {} value", a.type_of(),),
@@ -776,17 +776,17 @@ impl State {
             }
         }
     }
-    pub(crate) fn not(&self, a: Value) -> Result<Value, RuntimeError> {
-        Ok(Value::from_bool(!a.to_bool()))
+    pub(crate) fn not(&self, a: RawValue) -> Result<RawValue, RuntimeError> {
+        Ok(RawValue::from_bool(!a.to_bool()))
     }
-    pub(crate) fn bitwise_not(&self, a: Value) -> Result<Value, RuntimeError> {
+    pub(crate) fn bitwise_not(&self, a: RawValue) -> Result<RawValue, RuntimeError> {
         match a {
             // Value::Nil => todo!(),
             // Value::Bool(_) => todo!(),
-            Value::Number(_) => {
+            RawValue::Number(_) => {
                 let i = a.as_i64();
                 if let Some(i) = i {
-                    Ok(Value::from_number((!i) as f64))
+                    Ok(RawValue::from_number((!i) as f64))
                 } else {
                     Err(RuntimeError {
                         kind: ErrorKind::ArithmeticError,
@@ -800,11 +800,11 @@ impl State {
             }),
         }
     }
-    pub(crate) fn neg(&self, a: Value) -> Result<Value, RuntimeError> {
+    pub(crate) fn neg(&self, a: RawValue) -> Result<RawValue, RuntimeError> {
         match a {
             // Value::Nil => todo!(),
             // Value::Bool(_) => todo!(),
-            Value::Number(x) => Ok(Value::from_number(*-x)),
+            RawValue::Number(x) => Ok(RawValue::from_number(*-x)),
             _ => {
                 macro_rules! error {
                     () => {
@@ -834,67 +834,67 @@ impl State {
             }
         }
     }
-    pub(crate) fn get_metatable(&self, a: Value) -> Value {
+    pub(crate) fn get_metatable(&self, a: RawValue) -> RawValue {
         self.global_state.get_metatable(a)
     }
 }
 
 impl<'b> BaseApi for CallContext<'b> {
-    fn create_number<'a>(&'a self, x: f64) -> ValueRef<'a> {
-        ValueRef::new(Value::from_number(x))
+    fn create_number<'a>(&'a self, x: f64) -> Value<'a> {
+        Value::new(RawValue::from_number(x))
     }
 
-    fn create_bool<'a>(&self, x: bool) -> ValueRef<'a> {
-        ValueRef::new(Value::from_bool(x))
+    fn create_bool<'a>(&self, x: bool) -> Value<'a> {
+        Value::new(RawValue::from_bool(x))
     }
 
-    fn create_userdata<'a, T: UserData + Traceable>(&self, userdata: T) -> ValueRef<'a> {
-        ValueRef::new(self.state.create_userdata(userdata))
+    fn create_userdata<'a, T: UserData + Traceable>(&self, userdata: T) -> Value<'a> {
+        Value::new(self.state.create_userdata(userdata))
     }
 
-    fn create_string<'a>(&self, s: String) -> ValueRef<'a> {
-        ValueRef::new(self.state.create_string(s))
+    fn create_string<'a>(&self, s: String) -> Value<'a> {
+        Value::new(self.state.create_string(s))
     }
 
-    fn upgrade<'a>(&'a self, v: ValueRef<'_>) -> crate::runtime::GcValue {
+    fn upgrade<'a>(&'a self, v: Value<'_>) -> crate::runtime::GcValue {
         let instance = self.state.instance.upgrade().unwrap();
         instance.upgrade(v)
     }
 
-    fn create_closure<'a>(&self, closure: Box<dyn crate::closure::Callable>) -> ValueRef<'a> {
-        ValueRef::new(Value::Callable(self.state.gc.allocate(closure)))
+    fn create_closure<'a>(&self, closure: Box<dyn crate::closure::Callable>) -> Value<'a> {
+        Value::new(RawValue::Callable(self.state.gc.allocate(closure)))
     }
 
-    fn create_table<'a>(&self) -> ValueRef<'a> {
-        ValueRef::new(self.state.create_table(Table::new()))
+    fn create_table<'a>(&self) -> Value<'a> {
+        Value::new(self.state.create_table(Table::new()))
     }
 
-    fn set_metatable<'a>(&self, v: ValueRef<'a>, mt: ValueRef<'a>) {
+    fn set_metatable<'a>(&self, v: Value<'a>, mt: Value<'a>) {
         self.state.global_state.set_metatable(v.value, mt.value)
     }
 
-    fn get_metatable<'a>(&self, v: ValueRef<'a>) -> ValueRef<'a> {
-        ValueRef::new(self.state.global_state.get_metatable(v.value))
+    fn get_metatable<'a>(&self, v: Value<'a>) -> Value<'a> {
+        Value::new(self.state.global_state.get_metatable(v.value))
     }
 
     fn table_rawset<'a>(
         &'a self,
-        table: ValueRef<'a>,
-        key: ValueRef<'a>,
-        value: ValueRef<'a>,
+        table: Value<'a>,
+        key: Value<'a>,
+        value: Value<'a>,
     ) -> Result<(), RuntimeError> {
         self.instance.table_rawset(table, key, value)
     }
 
     fn table_rawget<'a>(
         &'a self,
-        table: ValueRef<'a>,
-        key: ValueRef<'a>,
-    ) -> Result<ValueRef<'a>, RuntimeError> {
+        table: Value<'a>,
+        key: Value<'a>,
+    ) -> Result<Value<'a>, RuntimeError> {
         self.instance.table_rawget(table, key)
     }
 
-    fn get_global_env<'a>(&self) -> ValueRef<'a> {
+    fn get_global_env<'a>(&self) -> Value<'a> {
         self.instance.get_global_env()
     }
 }
@@ -902,19 +902,19 @@ impl<'b> BaseApi for CallContext<'b> {
 impl<'b> StateApi for CallContext<'b> {
     fn table_set<'a>(
         &'a self,
-        table: ValueRef<'a>,
-        key: ValueRef<'a>,
-        value: ValueRef<'a>,
+        table: Value<'a>,
+        key: Value<'a>,
+        value: Value<'a>,
     ) -> Result<(), RuntimeError> {
         self.state.table_set(table.value, key.value, value.value)
     }
 
     fn table_get<'a>(
         &'a self,
-        table: ValueRef<'a>,
-        key: ValueRef<'a>,
-    ) -> Result<ValueRef<'a>, RuntimeError> {
-        Ok(ValueRef::new(self.state.table_get(table.value, key.value)?))
+        table: Value<'a>,
+        key: Value<'a>,
+    ) -> Result<Value<'a>, RuntimeError> {
+        Ok(Value::new(self.state.table_get(table.value, key.value)?))
     }
 }
 impl<'b> CallApi for CallContext<'b> {
@@ -922,18 +922,18 @@ impl<'b> CallApi for CallContext<'b> {
         self.frame.n_args
     }
 
-    fn arg_or_nil<'a>(&'a self, i: usize) -> ValueRef<'a> {
+    fn arg_or_nil<'a>(&'a self, i: usize) -> Value<'a> {
         if i < self.frame.n_args {
-            ValueRef::new(self.frame.locals[i])
+            Value::new(self.frame.locals[i])
             // Some(self.eval_stack.borrow()[frame.frame_bottom + i])
         } else {
-            ValueRef::new(Value::nil())
+            Value::new(RawValue::nil())
         }
     }
 
-    fn arg<'a>(&'a self, i: usize) -> Result<ValueRef<'a>, RuntimeError> {
+    fn arg<'a>(&'a self, i: usize) -> Result<Value<'a>, RuntimeError> {
         if i < self.frame.n_args {
-            Ok(ValueRef::new(self.frame.locals[i]))
+            Ok(Value::new(self.frame.locals[i]))
             // Some(self.eval_stack.borrow()[frame.frame_bottom + i])
         } else {
             Err(RuntimeError {
@@ -943,20 +943,20 @@ impl<'b> CallApi for CallContext<'b> {
         }
     }
 
-    fn ret<'a>(&'a self, i: usize, value: ValueRef<'a>) {
+    fn ret<'a>(&'a self, i: usize, value: Value<'a>) {
         let mut ret_values = self.ret_values.borrow_mut();
         if i >= ret_values.len() {
-            ret_values.resize(i + 1, Value::nil());
+            ret_values.resize(i + 1, RawValue::nil());
         }
         ret_values[i] = value.value;
     }
 
     fn call<'a>(
         &self,
-        closure: ValueRef<'a>,
-        args: &[ValueRef<'a>],
-    ) -> Result<ValueRef<'a>, RuntimeError> {
+        closure: Value<'a>,
+        args: &[Value<'a>],
+    ) -> Result<Value<'a>, RuntimeError> {
         let args: Vec<_> = args.iter().map(|x| x.value).collect();
-        Ok(ValueRef::new(self.instance.call(closure.value, &args)?))
+        Ok(Value::new(self.instance.call(closure.value, &args)?))
     }
 }

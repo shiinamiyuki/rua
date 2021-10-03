@@ -24,16 +24,6 @@ end
 -- standard library for rua
 std = {}
 
-local null = {}
-
-function std.is_null(object)
-    return rawequal(null, object)
-end
-
-function std.null()
-    return null
-end
-
 function std.instance(object, class)
     
 end

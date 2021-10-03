@@ -13,21 +13,21 @@ use crate::{
     bytecode::ByteCodeModule,
     closure::{Callable, Closure},
     gc::{Gc, GcState, Traceable},
-    runtime::ValueRef,
+    runtime::Value,
     state::State,
     table::Table,
 };
 
 pub struct Managed<T: 'static + Any> {
     pub data: T,
-    metatable: Cell<Value>,
+    metatable: Cell<RawValue>,
 }
 pub type LightUserData<T> = Managed<T>;
 impl<T> Managed<T> {
     pub fn new(data: T) -> Self {
         Self {
             data,
-            metatable: Cell::new(Value::Nil),
+            metatable: Cell::new(RawValue::Nil),
         }
     }
 }
@@ -43,8 +43,8 @@ pub trait UserData: Traceable + Any {
     fn as_traceable(&self) -> &dyn Traceable;
     fn as_any(&self) -> &dyn Any;
     fn type_name(&self) -> &'static str;
-    fn set_metatable(&self, v: ValueRef<'_>);
-    fn get_metatable<'a>(&'a self) -> ValueRef<'a>;
+    fn set_metatable(&self, v: Value<'_>);
+    fn get_metatable<'a>(&'a self) -> Value<'a>;
 }
 impl<T> UserData for Managed<T>
 where
@@ -60,12 +60,12 @@ where
         std::any::type_name::<T>()
     }
 
-    fn set_metatable(&self, v: ValueRef<'_>) {
+    fn set_metatable(&self, v: Value<'_>) {
         self.metatable.set(v.value);
     }
 
-    fn get_metatable<'a>(&'a self) -> ValueRef<'a> {
-        ValueRef::new(self.metatable.get())
+    fn get_metatable<'a>(&'a self) -> Value<'a> {
+        Value::new(self.metatable.get())
         // ValueRef::new(Value::Nil)
     }
 }
@@ -82,8 +82,8 @@ pub(crate) enum TupleFlag {
 }
 
 pub struct Tuple {
-    pub(crate) values: RefCell<SmallVec<[Value; 8]>>,
-    pub(crate) metatable: Cell<Value>,
+    pub(crate) values: RefCell<SmallVec<[RawValue; 8]>>,
+    pub(crate) metatable: Cell<RawValue>,
     pub(crate) flag: TupleFlag,
 }
 impl Traceable for Tuple {
@@ -96,7 +96,7 @@ impl Traceable for Tuple {
     }
 }
 
-pub(crate) enum Value {
+pub(crate) enum RawValue {
     Nil,
     Bool(bool),
     Number(OrderedFloat<f64>),
@@ -107,22 +107,22 @@ pub(crate) enum Value {
     Tuple(Gc<Tuple>),
     UserData(Gc<Box<dyn UserData>>),
 }
-impl Copy for Value {}
-impl Clone for Value {
+impl Copy for RawValue {}
+impl Clone for RawValue {
     fn clone(&self) -> Self {
         *self
     }
 }
-impl PartialEq for Value {
+impl PartialEq for RawValue {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
-            (Value::Nil, Value::Nil) => true,
-            (Value::Bool(a), Value::Bool(b)) => a == b,
-            (Value::Number(a), Value::Number(b)) => a == b,
-            (Value::Table(a), Value::Table(b)) => a.ptr_eq(b),
-            (Value::Callable(a), Value::Callable(b)) => a.ptr_eq(b),
-            (Value::Closure(a), Value::Closure(b)) => a.ptr_eq(b),
-            (Value::String(a), Value::String(b)) => {
+            (RawValue::Nil, RawValue::Nil) => true,
+            (RawValue::Bool(a), RawValue::Bool(b)) => a == b,
+            (RawValue::Number(a), RawValue::Number(b)) => a == b,
+            (RawValue::Table(a), RawValue::Table(b)) => a.ptr_eq(b),
+            (RawValue::Callable(a), RawValue::Callable(b)) => a.ptr_eq(b),
+            (RawValue::Closure(a), RawValue::Closure(b)) => a.ptr_eq(b),
+            (RawValue::String(a), RawValue::String(b)) => {
                 if a.ptr_eq(b) {
                     return true;
                 }
@@ -137,25 +137,25 @@ impl PartialEq for Value {
     }
 }
 
-impl Hash for Value {
+impl Hash for RawValue {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         match self {
-            Value::Nil => ().hash(state),
-            Value::Bool(x) => x.hash(state),
-            Value::Number(x) => x.hash(state),
-            Value::Table(x) => std::ptr::hash(x.as_ptr(), state),
-            Value::String(x) => {
+            RawValue::Nil => ().hash(state),
+            RawValue::Bool(x) => x.hash(state),
+            RawValue::Number(x) => x.hash(state),
+            RawValue::Table(x) => std::ptr::hash(x.as_ptr(), state),
+            RawValue::String(x) => {
                 let s = &(*x).data;
                 s.hash(state)
             }
-            Value::Closure(x) => std::ptr::hash(x.as_ptr(), state),
-            Value::Callable(x) => std::ptr::hash(x.as_ptr(), state),
-            Value::Tuple(x) => std::ptr::hash(x.as_ptr(), state),
-            Value::UserData(x) => std::ptr::hash(x.as_ptr(), state),
+            RawValue::Closure(x) => std::ptr::hash(x.as_ptr(), state),
+            RawValue::Callable(x) => std::ptr::hash(x.as_ptr(), state),
+            RawValue::Tuple(x) => std::ptr::hash(x.as_ptr(), state),
+            RawValue::UserData(x) => std::ptr::hash(x.as_ptr(), state),
         }
     }
 }
-impl Eq for Value {}
+impl Eq for RawValue {}
 // impl Hash for Value {
 //     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
 //         self.data.hash(state);
@@ -168,23 +168,23 @@ impl Eq for Value {}
 //     }
 // }
 // impl Eq for Value {}
-impl Traceable for Value {
+impl Traceable for RawValue {
     fn trace(&self, gc: &GcState) {
         match self {
-            Value::Table(x) => gc.trace_ptr(*x),
-            Value::String(x) => gc.trace_ptr(*x),
-            Value::Closure(x) => gc.trace_ptr(*x),
-            Value::Callable(x) => gc.trace_ptr(*x),
-            Value::Tuple(x) => gc.trace_ptr(*x),
+            RawValue::Table(x) => gc.trace_ptr(*x),
+            RawValue::String(x) => gc.trace_ptr(*x),
+            RawValue::Closure(x) => gc.trace_ptr(*x),
+            RawValue::Callable(x) => gc.trace_ptr(*x),
+            RawValue::Tuple(x) => gc.trace_ptr(*x),
             _ => {}
         }
     }
 }
 
-impl Value {
+impl RawValue {
     pub(crate) fn is_nil(&self) -> bool {
         match self {
-            Value::Nil => true,
+            RawValue::Nil => true,
             _ => false,
         }
     }
@@ -192,15 +192,15 @@ impl Value {
         Default::default()
     }
     pub(crate) fn from_bool(x: bool) -> Self {
-        Value::Bool(x)
+        RawValue::Bool(x)
     }
     pub(crate) fn from_number(x: f64) -> Self {
-        Value::Number(OrderedFloat(x))
+        RawValue::Number(OrderedFloat(x))
     }
     pub(crate) fn number(&self) -> Option<f64> {
         match self {
-            Value::Number(x) => Some(x.0),
-            Value::String(s) => {
+            RawValue::Number(x) => Some(x.0),
+            RawValue::String(s) => {
                 if let Ok(x) = (*s).data.parse::<f64>() {
                     Some(x)
                 } else {
@@ -212,51 +212,51 @@ impl Value {
     }
     pub(crate) fn as_f64(&self) -> Option<&f64> {
         match &self {
-            Value::Number(x) => Some(&x.0),
+            RawValue::Number(x) => Some(&x.0),
             _ => None,
         }
     }
     pub(crate) fn as_bool(&self) -> Option<&bool> {
         match &self {
-            Value::Bool(x) => Some(x),
+            RawValue::Bool(x) => Some(x),
             _ => None,
         }
     }
     pub(crate) fn to_bool(&self) -> bool {
         match self {
-            Value::Number(x) => *x != 0.0,
-            Value::Bool(x) => *x,
-            Value::Nil => false,
+            RawValue::Number(x) => *x != 0.0,
+            RawValue::Bool(x) => *x,
+            RawValue::Nil => false,
             _ => true,
         }
     }
     pub(crate) fn as_string<'a>(&'a self) -> Option<&'a String> {
         match self {
-            Value::String(s) => unsafe { Some(&(*s.as_ptr()).data) },
+            RawValue::String(s) => unsafe { Some(&(*s.as_ptr()).data) },
             _ => None,
         }
     }
     pub(crate) fn as_table<'a>(&'a self) -> Option<&'a RefCell<Table>> {
         match self {
-            Value::Table(t) => unsafe { Some(&(*t.as_ptr())) },
+            RawValue::Table(t) => unsafe { Some(&(*t.as_ptr())) },
             _ => None,
         }
     }
     pub(crate) fn as_closure<'a>(&'a self) -> Option<&'a Closure> {
         match self {
-            Value::Closure(t) => unsafe { Some(&(*t.as_ptr())) },
+            RawValue::Closure(t) => unsafe { Some(&(*t.as_ptr())) },
             _ => None,
         }
     }
     pub(crate) fn as_callable<'a>(&'a self) -> Option<&'a Box<dyn Callable>> {
         match self {
-            Value::Callable(t) => unsafe { Some(&(*t.as_ptr())) },
+            RawValue::Callable(t) => unsafe { Some(&(*t.as_ptr())) },
             _ => None,
         }
     }
     pub(crate) fn as_userdata<'a>(&'a self) -> Option<&'a dyn UserData> {
         match self {
-            Value::UserData(t) => unsafe { Some(&(**t.as_ptr())) },
+            RawValue::UserData(t) => unsafe { Some(&(**t.as_ptr())) },
             _ => None,
         }
     }
@@ -272,42 +272,42 @@ impl Value {
 
     pub(crate) fn type_of(&self) -> &'static str {
         match self {
-            Value::Nil => "nil",
-            Value::Bool(_) => "boolean",
-            Value::Number(_) => "number",
-            Value::Table(_) => "table",
-            Value::String(_) => "string",
-            Value::Closure(_) => "function",
-            Value::Callable(_) => "function",
-            Value::Tuple(_) => "tuple",
-            Value::UserData(x) => x.type_name(),
+            RawValue::Nil => "nil",
+            RawValue::Bool(_) => "boolean",
+            RawValue::Number(_) => "number",
+            RawValue::Table(_) => "table",
+            RawValue::String(_) => "string",
+            RawValue::Closure(_) => "function",
+            RawValue::Callable(_) => "function",
+            RawValue::Tuple(_) => "tuple",
+            RawValue::UserData(x) => x.type_name(),
         }
     }
     pub(crate) fn print(&self) -> String {
         match self {
-            Value::Nil => String::from("nil"),
-            Value::Bool(t) => {
+            RawValue::Nil => String::from("nil"),
+            RawValue::Bool(t) => {
                 if *t {
                     String::from("true")
                 } else {
                     String::from("false")
                 }
             }
-            Value::Number(x) => x.to_string(),
-            Value::Table(table) => {
+            RawValue::Number(x) => x.to_string(),
+            RawValue::Table(table) => {
                 format!("table: 0x{:0x}", table.as_ptr() as u64)
             }
-            Value::String(s) => (*s).data.clone(),
-            Value::Closure(closure) => {
+            RawValue::String(s) => (*s).data.clone(),
+            RawValue::Closure(closure) => {
                 format!("function: 0x{:0x}", closure.as_ptr() as u64)
             }
-            Value::Callable(callable) => {
+            RawValue::Callable(callable) => {
                 format!("function: 0x{:0x}", callable.as_ptr() as u64)
             }
-            Value::UserData(p) => {
+            RawValue::UserData(p) => {
                 format!("userdata: 0x{:0x}", p.as_ptr() as u64)
             }
-            Value::Tuple(tuple) => {
+            RawValue::Tuple(tuple) => {
                 let mut s = String::from("(");
                 let values = tuple.values.borrow();
                 for (i, v) in values.iter().enumerate() {
@@ -323,8 +323,8 @@ impl Value {
     }
 }
 
-impl Default for Value {
+impl Default for RawValue {
     fn default() -> Self {
-        Value::Nil
+        RawValue::Nil
     }
 }
