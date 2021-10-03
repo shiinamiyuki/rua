@@ -1,6 +1,10 @@
 # Rua 
 Lua 5.4 implementation in Rust
 
+## Features
+- Safe Rust API
+-
+
 ## Compliance with Lua
 - No binary compatibility
 - Standard library is incomplete
