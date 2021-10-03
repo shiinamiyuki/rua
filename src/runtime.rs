@@ -807,6 +807,28 @@ impl RuntimeInner {
             print!("\n");
             Ok(())
         });
+        {
+            let ipairs_iter: Box<dyn Callable> = Box::new(NativeFunction::new(|ctx| {
+                let a = ctx.arg(0)?;
+                let i = ctx.arg(1)?;
+                let i = Value::new(ctx.state.add(i.value, RawValue::from_number(1.0))?);
+                let v = ctx.table_get(a, i)?;
+                if v.to_bool() {
+                    ctx.ret(0, i);
+                    ctx.ret(1, v);
+                }
+                Ok(())
+            }));
+            let ipairs_iter = RawValue::Callable(self.gc.allocate(ipairs_iter));
+            let ipairs_iter = pself.upgrade().unwrap().upgrade(Value::new(ipairs_iter));
+            self.add_function("ipairs".into(), move |ctx| {
+                let it = ipairs_iter.borrow();
+                ctx.ret(0, *it);
+                ctx.ret(1, ctx.arg(0)?);
+                ctx.ret(2, Value::from(0));
+                Ok(())
+            });
+        }
         self.add_function("assert".into(), |ctx| {
             let v = ctx.arg(0)?;
             assert!(v.value.to_bool());
@@ -1166,7 +1188,8 @@ impl BaseApi for Rc<RefCell<RuntimeInner>> {
     }
 
     fn upgrade<'a>(&'a self, v: Value<'_>) -> GcValue {
-        let inner = self.borrow();
+        let inner =  (**self).as_ptr();
+        let inner = unsafe{&*inner};
         let head = inner.gc_value_list.head.as_ref();
         let head_next = head.next.get();
         // let tail = inner.gc_value_list.tail.as_ref();
@@ -1252,6 +1275,6 @@ impl Drop for Runtime {
                 "Runtime dropped before instances"
             );
         }
-        println!("total alloc {}",self.inner.borrow().gc.inner.borrow().alloc_count);
+        // println!("total alloc {}",self.inner.borrow().gc.inner.borrow().alloc_count);
     }
 }

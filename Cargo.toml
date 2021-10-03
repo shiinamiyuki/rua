@@ -9,7 +9,7 @@ edition = "2018"
 # pest = "*"
 # pest_derive = "*"
 ordered-float = "2.0"
-smallvec = "1.6.1"
+smallvec = "1.7.0"
 nalgebra = {version ="0.26.2", features = ["serde-serialize"], optional=true }
 # rua-derive ={path="rua-derive", optional=true }
 parking_lot = {version="*"}
@@ -28,4 +28,3 @@ complete = ["nalgebra"]
 
 [profile.dev]
 opt-level = 2
-

@@ -7,7 +7,7 @@ use crate::{
     runtime::{ConstantsIndex, ErrorKind, RuntimeError, RuntimeInner, Value},
     state::{CallContext, Frame, State},
     table::Table,
-    value::{Managed, ManagedCell, Tuple, TupleFlag, RawValue},
+    value::{Managed, ManagedCell, RawValue, Tuple, TupleFlag},
     Stack,
 };
 use smallvec::{smallvec, SmallVec};
@@ -111,7 +111,11 @@ impl Instance {
     // pub fn lock<'a>(&self) -> RefMut<State> {
     //     self.state.borrow_mut()
     // }
-    pub(crate) fn call(&self, closure: RawValue, args: &[RawValue]) -> Result<RawValue, RuntimeError> {
+    pub(crate) fn call(
+        &self,
+        closure: RawValue,
+        args: &[RawValue],
+    ) -> Result<RawValue, RuntimeError> {
         match closure {
             RawValue::Closure(closure) => {
                 let frame = { new_frame_direct!(self.gc, args, Some(closure)) };
@@ -448,7 +452,7 @@ impl Instance {
                         };
                         ip = addr as usize;
                     }
-                   
+
                     _ => panic!("unreachable, instruction is {:#?}", instruction),
                 },
                 ByteCode::Op3U8(op, operands) => match op {
@@ -582,6 +586,10 @@ impl Instance {
                         let idx = operands[0];
                         let mut frames = state.frames.borrow_mut();
                         let frame = frames.last_mut().unwrap();
+                        let idx = idx as usize;
+                        if idx >= frame.locals.len() {
+                            frame.locals.resize(idx, RawValue::Nil);
+                        }
                         frame.locals[idx as usize] = eval_stack.pop().unwrap();
                     }
                     OpCode::CloseUpvalue => {

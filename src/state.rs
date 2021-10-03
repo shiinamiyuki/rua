@@ -7,20 +7,19 @@ use crate::{
     gc::{Gc, GcState, Traceable},
     runtime::{ConstantsIndex, ErrorKind, GlobalState, RuntimeError, Value},
     table::Table,
-    value::{Managed, Tuple, UserData, RawValue},
+    value::{Managed, RawValue, Tuple, UserData},
     vm::Instance,
     Stack,
 };
 use std::{
     cell::{Cell, RefCell},
-    cmp::Ordering,
-    process::abort,
     rc::{Rc, Weak},
 };
 
 pub const MAX_LOCALS: usize = 256;
 pub(crate) struct Frame {
-    pub(crate) locals: [RawValue; MAX_LOCALS],
+    // pub(crate) locals: [RawValue; MAX_LOCALS],
+    pub(crate) locals: SmallVec<[RawValue; 32]>,
     // pub(crate) frame_bottom: usize, //stack[frame_buttom..frame_buttom_n_args]
     pub(crate) closure: Option<Gc<Closure>>,
     pub(crate) ip: usize,
@@ -36,7 +35,7 @@ impl Frame {
     }
     pub(crate) fn new(n_args: usize, closure: Option<Gc<Closure>>) -> Self {
         Self {
-            locals: [RawValue::default(); MAX_LOCALS],
+            locals: smallvec![RawValue::default();16.max(n_args)], //[RawValue::default(); MAX_LOCALS],
             closure,
             ip: Self::get_ip(closure),
             n_args,
@@ -219,7 +218,11 @@ impl State {
     //         Value::nil()
     //     }
     // }
-    pub(crate) fn table_rawget(&self, table: RawValue, key: RawValue) -> Result<RawValue, RuntimeError> {
+    pub(crate) fn table_rawget(
+        &self,
+        table: RawValue,
+        key: RawValue,
+    ) -> Result<RawValue, RuntimeError> {
         let table = match table.as_table() {
             Some(x) => x,
             None => {
@@ -260,7 +263,11 @@ impl State {
         table.set(key, value);
         Ok(())
     }
-    pub(crate) fn table_get(&self, table: RawValue, key: RawValue) -> Result<RawValue, RuntimeError> {
+    pub(crate) fn table_get(
+        &self,
+        table: RawValue,
+        key: RawValue,
+    ) -> Result<RawValue, RuntimeError> {
         self.table_get_impl(table, key, 0)
     }
     pub(crate) fn table_get_impl(
@@ -738,7 +745,9 @@ impl State {
                 let mt = self.get_metatable(a);
                 if mt.is_nil() {
                     match a {
-                        RawValue::Table(x) => Ok(RawValue::from_number((*x).borrow_mut().len() as f64)),
+                        RawValue::Table(x) => {
+                            Ok(RawValue::from_number((*x).borrow_mut().len() as f64))
+                        }
                         _ => Err(RuntimeError {
                             kind: ErrorKind::ArithmeticError,
                             msg: format!(" attempt to get length of a {} value", a.type_of(),),
@@ -937,11 +946,7 @@ impl<'b> CallApi for CallContext<'b> {
         ret_values[i] = value.value;
     }
 
-    fn call<'a>(
-        &self,
-        closure: Value<'a>,
-        args: &[Value<'a>],
-    ) -> Result<Value<'a>, RuntimeError> {
+    fn call<'a>(&self, closure: Value<'a>, args: &[Value<'a>]) -> Result<Value<'a>, RuntimeError> {
         let args: Vec<_> = args.iter().map(|x| x.value).collect();
         Ok(Value::new(self.instance.call(closure.value, &args)?))
     }
