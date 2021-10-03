@@ -9,25 +9,18 @@ use std::{
 use ordered_float::OrderedFloat;
 use smallvec::SmallVec;
 
-use crate::{
-    bytecode::ByteCodeModule,
-    closure::{Callable, Closure},
-    gc::{Gc, GcState, Traceable},
-    runtime::Value,
-    state::State,
-    table::Table,
-};
+use crate::{CloneCell, bytecode::ByteCodeModule, closure::{Callable, Closure}, gc::{Gc, GcState, Traceable}, runtime::Value, state::State, table::Table};
 
 pub struct Managed<T: 'static + Any> {
     pub data: T,
-    metatable: Cell<RawValue>,
+    metatable: CloneCell<RawValue>,
 }
 pub type LightUserData<T> = Managed<T>;
 impl<T> Managed<T> {
     pub fn new(data: T) -> Self {
         Self {
             data,
-            metatable: Cell::new(RawValue::Nil),
+            metatable: CloneCell::new(RawValue::Nil),
         }
     }
 }
@@ -83,7 +76,7 @@ pub(crate) enum TupleFlag {
 
 pub struct Tuple {
     pub(crate) values: RefCell<SmallVec<[RawValue; 8]>>,
-    pub(crate) metatable: Cell<RawValue>,
+    pub(crate) metatable: CloneCell<RawValue>,
     pub(crate) flag: TupleFlag,
 }
 impl Traceable for Tuple {
@@ -95,7 +88,7 @@ impl Traceable for Tuple {
         gc.trace(&self.metatable.get());
     }
 }
-
+#[derive(Clone)]
 pub(crate) enum RawValue {
     Nil,
     Bool(bool),
@@ -107,12 +100,8 @@ pub(crate) enum RawValue {
     Tuple(Gc<Tuple>),
     UserData(Gc<Box<dyn UserData>>),
 }
-impl Copy for RawValue {}
-impl Clone for RawValue {
-    fn clone(&self) -> Self {
-        *self
-    }
-}
+// impl Copy for RawValue {}
+
 impl PartialEq for RawValue {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
@@ -171,11 +160,11 @@ impl Eq for RawValue {}
 impl Traceable for RawValue {
     fn trace(&self, gc: &GcState) {
         match self {
-            RawValue::Table(x) => gc.trace_ptr(*x),
-            RawValue::String(x) => gc.trace_ptr(*x),
-            RawValue::Closure(x) => gc.trace_ptr(*x),
-            RawValue::Callable(x) => gc.trace_ptr(*x),
-            RawValue::Tuple(x) => gc.trace_ptr(*x),
+            RawValue::Table(x) => gc.trace_ptr(&*x),
+            RawValue::String(x) => gc.trace_ptr(&*x),
+            RawValue::Closure(x) => gc.trace_ptr(&*x),
+            RawValue::Callable(x) => gc.trace_ptr(&*x),
+            RawValue::Tuple(x) => gc.trace_ptr(&*x),
             _ => {}
         }
     }

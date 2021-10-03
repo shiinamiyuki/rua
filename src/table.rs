@@ -11,7 +11,7 @@ use std::{
 
 use crate::{gc::Traceable, runtime::RuntimeError, value::RawValue};
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct Entry {
     key: RawValue,
     value: RawValue,
@@ -64,7 +64,7 @@ impl<'a> Iterator for LinkedHashMapIter<'a> {
         if self.i == usize::MAX {
             None
         } else {
-            let e = self.map.table[self.i];
+            let e = self.map.table[self.i].clone();
             self.i = e.next;
             Some((e.key, e.value))
         }
@@ -181,7 +181,7 @@ impl LinkedHashMap {
         if self.table[idx].value.is_nil() {
             return;
         }
-        let entry = self.table[idx];
+        let entry = self.table[idx].clone();
         let prev = entry.prev;
         let next = entry.next;
         if idx == self.head {
@@ -197,10 +197,10 @@ impl LinkedHashMap {
         self.len -= 1;
         // debug_assert!(!self.check_cycle());
     }
-    fn get(&self, key: RawValue) -> RawValue {
+    fn get(&self, key: &RawValue) -> RawValue {
         // println!("get {}", key.print());
-        if let Some(idx) = self.get_index(&key) {
-            self.table[idx].value
+        if let Some(idx) = self.get_index(key) {
+            self.table[idx].value.clone()
         } else {
             RawValue::nil()
         }
@@ -279,7 +279,7 @@ impl Table {
             if !self.array.is_empty() {
                 return Ok(RawValue::from_number(1 as f64));
             } else if !self.map.table.is_empty() {
-                return Ok(self.map.table[self.map.head].key);
+                return Ok(self.map.table[self.map.head].key.clone());
             } else {
                 return Ok(RawValue::nil());
             }
@@ -294,7 +294,7 @@ impl Table {
             _ => {}
         }
         if let Some(i) = self.map.get_index(&key) {
-            let entry = self.map.table[i];
+            let entry = self.map.table[i].clone();
             if entry.value.is_nil() {
                 Err(RuntimeError {
                     kind: crate::runtime::ErrorKind::TypeError,
@@ -302,7 +302,7 @@ impl Table {
                 })
             } else {
                 if entry.next != usize::MAX {
-                    Ok(self.map.table[entry.next].key)
+                    Ok(self.map.table[entry.next].key.clone())
                 } else {
                     Ok(RawValue::nil())
                 }
@@ -334,7 +334,7 @@ impl Table {
             }
             for i in (self.array.len() + 1) as u64..=self.largest_uint {
                 let v = RawValue::from_number(i as f64);
-                if self.get(v).is_nil() {
+                if self.get(&v).is_nil() {
                     self.len = i as usize - 1;
                     return self.len;
                 }
@@ -343,12 +343,12 @@ impl Table {
             self.len
         }
     }
-    pub(crate) fn get(&self, key: RawValue) -> RawValue {
+    pub(crate) fn get(&self, key: &RawValue) -> RawValue {
         match key {
             RawValue::Number(x) if is_int(x.0) => {
                 let i = x.trunc() as i64;
                 if i >= 1 && i <= self.array.len() as i64 {
-                    return self.array[(i - 1) as usize];
+                    return self.array[(i - 1) as usize].clone();
                 }
             }
             _ => {}

@@ -5,15 +5,7 @@ use std::{
     rc::Rc,
 };
 
-use crate::{
-    bytecode::ByteCodeModule,
-    compile::UpValueInfo,
-    debug_println,
-    gc::{GcState, Traceable},
-    runtime::RuntimeError,
-    state::CallContext,
-    value::RawValue,
-};
+use crate::{CloneCell, bytecode::ByteCodeModule, compile::UpValueInfo, debug_println, gc::{GcState, Traceable}, runtime::RuntimeError, state::CallContext, value::RawValue};
 
 pub trait Callable: Traceable {
     fn call<'a>(&self, ctx: &CallContext<'a>) -> Result<(), RuntimeError>;
@@ -40,7 +32,7 @@ impl Callable for NativeFunction {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(crate) enum UpValueInner {
     Empty,
     Open(*mut RawValue),
@@ -49,7 +41,7 @@ pub(crate) enum UpValueInner {
 
 #[derive(Clone)]
 pub(crate) struct UpValue {
-    pub(crate) inner: RefCell<Rc<Cell<UpValueInner>>>, // Rc or Gc?
+    pub(crate) inner: RefCell<Rc<CloneCell<UpValueInner>>>, // Rc or Gc?
 }
 
 impl std::fmt::Display for UpValue {
@@ -122,7 +114,7 @@ impl Closure {
             let v = self.upvalues[i as usize].inner.borrow();
 
             match (**v).get() {
-                UpValueInner::Open(p) => *p.as_ref().unwrap(),
+                UpValueInner::Open(p) => (*p).clone(),
                 UpValueInner::Closed(c) => c,
                 UpValueInner::Empty => {
                     unreachable!()

@@ -1,4 +1,4 @@
-use std::{alloc::Layout, any::TypeId, marker::PhantomData, mem::size_of};
+use std::{alloc::Layout, any::TypeId, cell::UnsafeCell, marker::PhantomData, mem::size_of};
 
 pub mod api;
 pub mod bind;
@@ -216,7 +216,25 @@ pub(crate) fn dummy_convert<T: 'static + Sized, U: 'static + Sized>(x: T) -> U {
         unreachable!()
     }
 }
-
+pub(crate) struct CloneCell<T> {
+    cell: UnsafeCell<T>,
+}
+impl<T: Clone> CloneCell<T> {
+    pub(crate) fn new(x: T) -> Self {
+        Self {
+            cell: UnsafeCell::new(x),
+        }
+    }
+    pub(crate) fn set(&self, x: T) {
+        unsafe {
+            let ptr = self.cell.get();
+            *ptr = x;
+        }
+    }
+    pub(crate) fn get(&self) -> T {
+        unsafe { (*self.cell.get()).clone() }
+    }
+}
 #[macro_export]
 macro_rules! debug_println {
     ($($arg:expr),+) => {

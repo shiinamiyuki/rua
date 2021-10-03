@@ -17,7 +17,21 @@ pub struct GcState {
 pub(crate) struct GcBox<T: Traceable + ?Sized + 'static> {
     marked: Cell<bool>,
     next: Cell<PtrTraceable>,
+    prev: Cell<PtrTraceable>,
+    strong_ref_count: Cell<usize>,
     data: T,
+}
+impl<T: Traceable + ?Sized + 'static> GcBox<T> {
+    unsafe fn remove(&self) {
+        let prev = self.prev.get();
+        let next = self.next.get();
+        if let Some(prev) = prev {
+            prev.as_ref().next.set(next);
+        }
+        if let Some(next) = next {
+            next.as_ref().prev.set(prev);
+        }
+    }
 }
 pub(crate) type PtrTraceable = Option<NonNull<GcBox<dyn Traceable>>>;
 pub trait Traceable {
@@ -65,19 +79,43 @@ impl<T: Traceable + 'static + ?Sized> Deref for Gc<T> {
         unsafe { &self.ptr.as_ref().data }
     }
 }
-impl<T> Copy for Gc<T> where T: Traceable + 'static + ?Sized {}
+// impl<T> Copy for Gc<T> where T: Traceable + 'static + ?Sized {}
 impl<T> Clone for Gc<T>
 where
     T: Traceable + 'static + ?Sized,
 {
     fn clone(&self) -> Self {
-        *self
+        unsafe {
+            self.ptr
+                .as_ref()
+                .strong_ref_count
+                .set(self.ptr.as_ref().strong_ref_count.get() + 1);
+            Self { ptr: self.ptr }
+        }
+    }
+}
+impl<T> Drop for Gc<T>
+where
+    T: Traceable + 'static + ?Sized,
+{
+    fn drop(&mut self) {
+        unsafe {
+            let cnt = self.ptr.as_ref().strong_ref_count.get();
+            if cnt == 1 {
+                self.ptr.as_ref().remove();
+                Box::from_raw(self.ptr.as_ptr());
+            } else if cnt > 1 {
+                self.ptr.as_ref().strong_ref_count.set(cnt - 1);
+            } else {
+                panic!("cnt=0");
+            }
+        }
     }
 }
 pub(crate) struct GcInner {
     head: PtrTraceable,
     lock: usize,
-    pub(crate) alloc_count:usize,
+    pub(crate) alloc_count: usize,
 }
 pub struct GcLockGuard {
     gc: Rc<GcState>,
@@ -95,6 +133,8 @@ impl GcState {
             marked: Cell::new(false),
             data: object,
             next: Cell::new(None),
+            prev: Cell::new(None),
+            strong_ref_count: Cell::new(1),
         }));
         // println!("allocate object {:0x}",gc_box as u64);
         unsafe {
@@ -106,13 +146,18 @@ impl GcState {
                     .next
                     .set(Some(NonNull::new(head.as_ptr()).unwrap()));
             }
+            if let Some(head) = gc.head {
+                head.as_ref()
+                    .prev
+                    .set(Some(NonNull::new(gc_box_dyn).unwrap()));
+            }
             gc.head = Some(NonNull::new(gc_box_dyn).unwrap());
         }
         Gc {
             ptr: NonNull::new(gc_box).unwrap(),
         }
     }
-    pub(crate) fn trace_ptr<T: Traceable + ?Sized + 'static>(&self, obj: Gc<T>) {
+    pub(crate) fn trace_ptr<T: Traceable + ?Sized + 'static>(&self, obj: &Gc<T>) {
         unsafe {
             let ptr = obj.ptr;
             let gc_box = ptr.as_ref();
@@ -131,7 +176,7 @@ impl GcState {
             inner: RefCell::new(GcInner {
                 head: None,
                 lock: 0,
-                alloc_count:0,
+                alloc_count: 0,
             }),
         }
     }
@@ -146,7 +191,6 @@ impl GcState {
         let mut gc = self.inner.borrow_mut();
         assert!(!force || gc.lock == 0);
         let mut cur = gc.head;
-        let mut prev: Option<NonNull<GcBox<dyn Traceable>>> = None;
         // println!("collecting");
         unsafe {
             while let Some(p) = cur {
@@ -155,15 +199,12 @@ impl GcState {
                 if !object.marked.get() {
                     if cur == gc.head {
                         gc.head = next;
-                    } else {
-                        let prev = prev.unwrap().as_ref();
-                        prev.next.set(next);
                     }
+                    object.remove();
                     // println!("collected object {:0x}", p.as_ptr().cast::<()>() as u64);
                     Box::from_raw(p.as_ptr());
                 } else {
                     object.marked.set(false);
-                    prev = cur;
                 }
                 cur = next;
             }

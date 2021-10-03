@@ -7,8 +7,8 @@ use crate::{
     runtime::{ConstantsIndex, ErrorKind, RuntimeError, RuntimeInner, Value},
     state::{CallContext, Frame, State},
     table::Table,
-    value::{Managed, ManagedCell, Tuple, TupleFlag, RawValue},
-    Stack,
+    value::{Managed, ManagedCell, RawValue, Tuple, TupleFlag},
+    CloneCell, Stack,
 };
 use smallvec::{smallvec, SmallVec};
 use std::{
@@ -37,16 +37,16 @@ macro_rules! new_frame {
     ($gc:expr, $eval_stack:expr, $n_args:expr,$closure:expr) => {{
         let mut args: SmallVec<[RawValue; 8]> = SmallVec::new();
         for i in 0..$n_args {
-            args.push($eval_stack[$eval_stack.len() - 1 - i]);
+            args.push($eval_stack[$eval_stack.len() - 1 - i].clone());
         }
         if !args.is_empty() {
-            match *args.last().unwrap() {
+            match args.last().unwrap().clone() {
                 RawValue::Tuple(tuple) => {
                     if tuple.flag == TupleFlag::VarArgs {
                         args.pop().unwrap();
                         let values = tuple.values.borrow();
                         for v in values.iter() {
-                            args.push(*v);
+                            args.push(v.clone());
                         }
                     }
                 }
@@ -67,25 +67,25 @@ macro_rules! new_frame_direct {
         let closure: Option<Gc<Closure>> = $closure;
         let mut frame = Frame::new(n_args, $closure);
         let is_ext = closure.is_none();
-        let n_parameters: usize = closure.map_or(u8::MAX as usize, |c| c.n_args);
-        let has_varargs = closure.map_or(false, |c| c.has_varargs);
+        let n_parameters: usize = closure.clone().map_or(u8::MAX as usize, |c| c.n_args);
+        let has_varargs = closure.clone().map_or(false, |c| c.has_varargs);
         let n_arg_to_local = if is_ext {
             n_args
         } else {
             (n_args).min(n_parameters)
         };
         for i in 0..n_arg_to_local {
-            frame.locals[i] = $args[i];
+            frame.locals[i] = $args[i].clone();
         }
         if !is_ext && has_varargs {
             let mut tv = smallvec![];
             for i in n_parameters..n_args {
-                tv.push($args[i]);
+                tv.push($args[i].clone());
             }
             frame.locals[n_parameters] = RawValue::Tuple($gc.allocate(Tuple {
                 values: RefCell::new(tv),
                 flag: TupleFlag::VarArgs,
-                metatable: Cell::new(RawValue::Nil),
+                metatable: CloneCell::new(RawValue::Nil),
             }));
         }
         frame
@@ -111,10 +111,14 @@ impl Instance {
     // pub fn lock<'a>(&self) -> RefMut<State> {
     //     self.state.borrow_mut()
     // }
-    pub(crate) fn call(&self, closure: RawValue, args: &[RawValue]) -> Result<RawValue, RuntimeError> {
+    pub(crate) fn call(
+        &self,
+        closure: RawValue,
+        args: &[RawValue],
+    ) -> Result<RawValue, RuntimeError> {
         match closure {
             RawValue::Closure(closure) => {
-                let frame = { new_frame_direct!(self.gc, args, Some(closure)) };
+                let frame = { new_frame_direct!(self.gc, args, Some(closure.clone())) };
                 let level = {
                     let mut frames = self.state.frames.borrow_mut();
                     let level = frames.len();
@@ -175,7 +179,7 @@ impl Instance {
                     debug_println!("closing upvalue {} {:?} {}", i, Rc::as_ptr(&v), uv);
                     match inner {
                         UpValueInner::Open(p) => {
-                            v.set(UpValueInner::Closed(*p));
+                            v.set(UpValueInner::Closed((*p).clone()));
                         }
                         UpValueInner::Empty => {
                             unreachable!()
@@ -186,13 +190,13 @@ impl Instance {
                     }
                     std::mem::drop(v);
                     let mut v = uv.inner.borrow_mut();
-                    *v = Rc::new(Cell::new(UpValueInner::Empty));
+                    *v = Rc::new(CloneCell::new(UpValueInner::Empty));
                 }
             }
         }
     }
     fn setup_upvalue(&self, frame: &mut Frame) {
-        let closure = &frame.closure.unwrap();
+        let closure = &frame.closure.clone().unwrap();
         if closure.proto_idx == usize::MAX {
             assert!(closure.upvalues.len() == 1);
         } else if frame.ip == closure.entry {
@@ -201,7 +205,7 @@ impl Instance {
                 let info = &proto.upvalues[i];
                 if i == 0 && info.is_special {
                     let mut v = v.inner.borrow_mut();
-                    *v = Rc::new(Cell::new(UpValueInner::Closed(self.state.globals)));
+                    *v = Rc::new(CloneCell::new(UpValueInner::Closed(self.state.globals.clone())));
                 } else {
                     if !info.from_parent {
                         let mut v = v.inner.borrow_mut();
@@ -209,7 +213,7 @@ impl Instance {
                         //     UpValueInner::Empty => {}
                         //     _ => unreachable!(),
                         // }
-                        *v = Rc::new(Cell::new(UpValueInner::Open(
+                        *v = Rc::new(CloneCell::new(UpValueInner::Open(
                             &mut frame.locals[info.location as usize] as *mut RawValue,
                         )));
                     }
@@ -233,7 +237,7 @@ impl Instance {
         let (mut ip, code_len, module) = {
             let mut frames = state.frames.borrow_mut();
             let frame = frames.last_mut().unwrap();
-            let module = frame.closure.unwrap().module.clone();
+            let module = frame.closure.clone().unwrap().module.clone();
             (frame.ip, module.code.len(), module)
         };
         macro_rules! on_return {
@@ -259,16 +263,16 @@ impl Instance {
             macro_rules! binary_op_impl {
                 ($func:ident) => {{
                     let rhs = eval_stack.pop().unwrap();
-                    let mut lhs = *eval_stack.last_mut().unwrap();
+                    let mut lhs = eval_stack.last_mut().unwrap().clone();
                     std::mem::drop(eval_stack);
-                    lhs = state.$func(lhs, rhs)?;
+                    lhs = state.$func(&lhs, &rhs)?;
                     let mut eval_stack = state.eval_stack.borrow_mut();
                     *eval_stack.last_mut().unwrap() = lhs;
                 }};
             }
             macro_rules! unary_op_impl {
                 ($func:ident) => {{
-                    let top = *eval_stack.last_mut().unwrap();
+                    let top = eval_stack.last_mut().unwrap().clone();
                     std::mem::drop(eval_stack);
                     let top = state.$func(top)?;
                     let mut eval_stack = state.eval_stack.borrow_mut();
@@ -290,21 +294,21 @@ impl Instance {
                 ByteCode::Op(op) => match op {
                     OpCode::Nop => {}
                     OpCode::Dup => {
-                        let top = *eval_stack.last().unwrap();
+                        let top = eval_stack.last().unwrap().clone();
                         eval_stack.push(top);
                     }
                     OpCode::RotBCA => {
                         let i = eval_stack.len() - 1;
-                        let (a, b, c) = (eval_stack[i - 2], eval_stack[i - 1], eval_stack[i]);
+                        let (a, b, c) = (eval_stack[i - 2].clone(), eval_stack[i - 1].clone(), eval_stack[i].clone());
                         eval_stack[i - 2] = b;
                         eval_stack[i - 1] = c;
                         eval_stack[i] = a;
                     }
                     OpCode::Self_ => {
                         let method = eval_stack.pop().unwrap();
-                        let table = *eval_stack.last().unwrap();
+                        let table = eval_stack.last().unwrap().clone();
                         std::mem::drop(eval_stack);
-                        let f = state.table_get(table, method)?;
+                        let f = state.table_get(&table, &method)?;
                         let mut eval_stack = self.state.eval_stack.borrow_mut();
                         eval_stack.push(f);
                     }
@@ -352,7 +356,7 @@ impl Instance {
                         let table = eval_stack.pop().unwrap();
                         let key = eval_stack.pop().unwrap();
                         std::mem::drop(eval_stack);
-                        let v = state.table_get(table, key)?;
+                        let v = state.table_get(&table, &key)?;
                         let mut eval_stack = state.eval_stack.borrow_mut();
                         eval_stack.push(v);
                     }
@@ -361,7 +365,7 @@ impl Instance {
                         let key = eval_stack.pop().unwrap();
                         let value = eval_stack.pop().unwrap();
                         std::mem::drop(eval_stack);
-                        self.state.table_set(table, key, value)?;
+                        self.state.table_set(&table, &key, &value)?;
                     }
                     // OpCode::StoreGlobal => {
                     //     let name = eval_stack.pop().unwrap();
@@ -451,14 +455,14 @@ impl Instance {
                     OpCode::Return => {
                         assert!(n_expected_rets > 0);
                         if n_expected_rets != u8::MAX {
-                            let ret = *eval_stack.last().unwrap();
+                            let ret = eval_stack.last().unwrap().clone();
                             match ret {
                                 RawValue::Tuple(tuple) => {
                                     if tuple.flag == TupleFlag::VarArgs {
                                         eval_stack.pop();
                                         let values = tuple.values.borrow();
                                         for i in 0..(n_expected_rets as usize).min(values.len()) {
-                                            eval_stack.push(values[i]);
+                                            eval_stack.push(values[i].clone());
                                         }
                                         for _ in values.len()..(n_expected_rets as usize) {
                                             eval_stack.push(RawValue::Nil);
@@ -506,14 +510,14 @@ impl Instance {
                         let cnt = u32_from_3xu8(operands) as usize;
                         let mut tv = smallvec![];
                         for i in 0..cnt {
-                            tv.push(eval_stack[eval_stack.len() + i - cnt]);
+                            tv.push(eval_stack[eval_stack.len() + i - cnt].clone());
                         }
                         let st_len = eval_stack.len() - cnt;
                         eval_stack.resize(st_len, RawValue::Nil);
                         eval_stack.push(RawValue::Tuple(self.gc.allocate(Tuple {
                             values: RefCell::new(tv),
                             flag: TupleFlag::VarArgs,
-                            metatable: Cell::new(RawValue::nil()),
+                            metatable: CloneCell::new(RawValue::nil()),
                         })));
                     }
                     OpCode::NewTable => {
@@ -529,16 +533,16 @@ impl Instance {
                     }
                     OpCode::LoadStr => {
                         let idx = u32_from_3xu8(operands);
-                        eval_stack.push(module.string_pool_cache[idx as usize]);
+                        eval_stack.push(module.string_pool_cache[idx as usize].clone());
                         // eval_stack
                         // .push(state.create_string(module.string_pool[idx as usize].clone()));
                     }
                     OpCode::LoadTableStringKey => {
                         let table = eval_stack.pop().unwrap();
                         let idx = u32_from_3xu8(operands);
-                        let key = module.string_pool_cache[idx as usize];
+                        let key = &module.string_pool_cache[idx as usize];
                         std::mem::drop(eval_stack);
-                        let v = state.table_get(table, key)?;
+                        let v = state.table_get(&table, &key)?;
                         let mut eval_stack = state.eval_stack.borrow_mut();
                         eval_stack.push(v);
                     }
@@ -546,9 +550,9 @@ impl Instance {
                         let table = eval_stack.pop().unwrap();
                         let value = eval_stack.pop().unwrap();
                         let idx = u32_from_3xu8(operands);
-                        let key = module.string_pool_cache[idx as usize];
+                        let key = &module.string_pool_cache[idx as usize];
                         std::mem::drop(eval_stack);
-                        self.state.table_set(table, key, value)?;
+                        self.state.table_set(&table, key, &value)?;
                     }
                     OpCode::StoreUpvalue => {
                         let idx = u32_from_3xu8(operands);
@@ -574,7 +578,7 @@ impl Instance {
                         let idx = operands[0];
                         let mut frames = state.frames.borrow_mut();
                         let frame = frames.last_mut().unwrap();
-                        eval_stack.push(frame.locals[idx as usize]);
+                        eval_stack.push(frame.locals[idx as usize].clone());
                         // println!("{}",eval_stack.last().unwrap().print());
                     }
                     OpCode::StoreLocal => {
@@ -603,8 +607,8 @@ impl Instance {
                             let inner = v.get();
                             match inner {
                                 UpValueInner::Open(p) => {
-                                    v.set(UpValueInner::Closed(*p));
-                                    *v = Rc::new(Cell::new(UpValueInner::Open(p)));
+                                    v.set(UpValueInner::Closed((*p).clone()));
+                                    *v = Rc::new(CloneCell::new(UpValueInner::Open(p)));
                                 }
                                 _ => unreachable!(),
                             }
@@ -612,23 +616,23 @@ impl Instance {
                     }
                     OpCode::StoreTableArray => {
                         let cnt = u32_from_3xu8(operands);
-                        let table = eval_stack[eval_stack.len() - cnt as usize - 1];
+                        let table = &eval_stack[eval_stack.len() - cnt as usize - 1];
                         if cnt > 0 {
                             for i in 0..(cnt - 1) {
                                 self.state.table_rawset(
-                                    table,
-                                    RawValue::from_number((i + 1) as f64),
-                                    eval_stack[eval_stack.len() + i as usize - cnt as usize],
+                                    &table,
+                                    &RawValue::from_number((i + 1) as f64),
+                                    &eval_stack[eval_stack.len() + i as usize - cnt as usize],
                                 )?;
                             }
-                            let last = eval_stack[eval_stack.len() - 1];
+                            let last = &eval_stack[eval_stack.len() - 1];
                             match last {
                                 RawValue::Tuple(tuple) => match tuple.flag {
                                     crate::value::TupleFlag::Empty => {
                                         self.state.table_rawset(
                                             table,
-                                            RawValue::from_number(cnt as f64),
-                                            last,
+                                            &RawValue::from_number(cnt as f64),
+                                            &last,
                                         )?;
                                     }
                                     crate::value::TupleFlag::VarArgs => {
@@ -636,16 +640,16 @@ impl Instance {
                                         for (i, v) in values.iter().enumerate() {
                                             self.state.table_rawset(
                                                 table,
-                                                RawValue::from_number((cnt + i as u32) as f64),
-                                                *v,
+                                                &RawValue::from_number((cnt + i as u32) as f64),
+                                                v,
                                             )?;
                                         }
                                     }
                                 },
                                 _ => {
                                     self.state.table_rawset(
-                                        table,
-                                        RawValue::from_number(cnt as f64),
+                                       & table,
+                                        &RawValue::from_number(cnt as f64),
                                         last,
                                     )?;
                                 }
@@ -665,8 +669,13 @@ impl Instance {
                                     frame.has_closed = true;
                                     Self::close_all_upvalues(&frame.closure.as_ref().unwrap());
                                     ip_modified = true;
-                                    ip = Frame::get_ip(Some(closure));
-                                    *frame = new_frame!(self.gc, eval_stack, n_args, Some(closure));
+                                    ip = Frame::get_ip(Some(closure.clone()));
+                                    *frame = new_frame!(
+                                        self.gc,
+                                        eval_stack,
+                                        n_args,
+                                        Some(closure.clone())
+                                    );
                                     self.setup_upvalue(frame);
                                     n_expected_rets = operands[1];
                                     break;
@@ -684,7 +693,7 @@ impl Instance {
                                     on_return!(Ok(Continue::CallExt(callable, frame, operands[1])));
                                 }
                                 _ => {
-                                    let mt = self.state.get_metatable(func);
+                                    let mt = self.state.get_metatable(&func);
                                     if mt.is_nil() {
                                         on_return!(Err(RuntimeError {
                                             kind: ErrorKind::TypeError,
@@ -695,8 +704,8 @@ impl Instance {
                                         }))
                                     } else {
                                         func = self.state.table_get(
-                                            mt,
-                                            self.state.global_state.constants
+                                            &mt,
+                                            &self.state.global_state.constants
                                                 [ConstantsIndex::MtKeyCall as usize]
                                                 .get(),
                                         )?;
@@ -712,8 +721,12 @@ impl Instance {
                             match func {
                                 RawValue::Closure(closure) => {
                                     ip += 1;
-                                    let frame =
-                                        new_frame!(self.gc, eval_stack, n_args, Some(closure));
+                                    let frame = new_frame!(
+                                        self.gc,
+                                        eval_stack,
+                                        n_args,
+                                        Some(closure.clone())
+                                    );
                                     on_return!(Ok(Continue::NewFrame(frame, operands[1])));
                                 }
                                 RawValue::Callable(callable) => {
@@ -722,7 +735,7 @@ impl Instance {
                                     on_return!(Ok(Continue::CallExt(callable, frame, operands[1])));
                                 }
                                 _ => {
-                                    let mt = self.state.get_metatable(func);
+                                    let mt = self.state.get_metatable(&func);
                                     if mt.is_nil() {
                                         on_return!(Err(RuntimeError {
                                             kind: ErrorKind::TypeError,
@@ -733,8 +746,8 @@ impl Instance {
                                         }))
                                     } else {
                                         let new_func = self.state.table_get(
-                                            mt,
-                                            self.state.global_state.constants
+                                            &mt,
+                                            &self.state.global_state.constants
                                                 [ConstantsIndex::MtKeyCall as usize]
                                                 .get(),
                                         )?;
@@ -755,7 +768,7 @@ impl Instance {
                     }
                     OpCode::TestJump => {
                         ip_modified = true;
-                        let top = *eval_stack.last().unwrap();
+                        let top = eval_stack.last().unwrap().clone();
                         let addr = match module.code[ip + 1] {
                             ByteCode::Address(bytes) => u32::from_le_bytes(bytes),
                             _ => unreachable!(),
@@ -804,7 +817,7 @@ impl Instance {
                                     p
                                 } else {
                                     UpValue {
-                                        inner: RefCell::new(Rc::new(Cell::new(
+                                        inner: RefCell::new(Rc::new(CloneCell::new(
                                             UpValueInner::Empty,
                                         ))),
                                     }
@@ -815,7 +828,7 @@ impl Instance {
                             proto_idx: proto_idx as usize,
                             n_args: proto.n_args,
                             entry: entry as usize,
-                            module: frame.closure.unwrap().module.clone(),
+                            module: frame.closure.clone().unwrap().module.clone(),
                             upvalues,
                             has_varargs: proto.has_varargs,
                             called: Cell::new(false),
@@ -894,7 +907,9 @@ impl Instance {
             has_varargs: false,
             module: Rc::new(module),
             upvalues: vec![UpValue {
-                inner: RefCell::new(Rc::new(Cell::new(UpValueInner::Closed(self.state.globals)))),
+                inner: RefCell::new(Rc::new(CloneCell::new(UpValueInner::Closed(
+                    self.state.globals.clone(),
+                )))),
             }],
             called: Cell::new(false),
             proto_idx: usize::MAX,
@@ -1027,7 +1042,7 @@ impl StateApi for Instance {
         key: crate::runtime::Value<'a>,
         value: crate::runtime::Value<'a>,
     ) -> Result<(), RuntimeError> {
-        self.state.table_set(table.value, key.value, value.value)
+        self.state.table_set(&table.value, &key.value, &value.value)
     }
 
     fn table_get<'a>(
@@ -1035,7 +1050,7 @@ impl StateApi for Instance {
         table: crate::runtime::Value<'a>,
         key: crate::runtime::Value<'a>,
     ) -> Result<crate::runtime::Value<'a>, RuntimeError> {
-        Ok(Value::new(self.state.table_get(table.value, key.value)?))
+        Ok(Value::new(self.state.table_get(&table.value, &key.value)?))
     }
 }
 impl Traceable for Instance {
@@ -1051,7 +1066,7 @@ impl Traceable for Instance {
                 gc.trace(v)
             }
             if let Some(c) = &f.closure {
-                gc.trace_ptr(*c);
+                gc.trace_ptr(&*c);
             }
         }
     }

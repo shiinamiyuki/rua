@@ -7,9 +7,9 @@ use crate::{
     gc::{Gc, GcState, Traceable},
     runtime::{ConstantsIndex, ErrorKind, GlobalState, RuntimeError, Value},
     table::Table,
-    value::{Managed, Tuple, UserData, RawValue},
+    value::{Managed, RawValue, Tuple, UserData},
     vm::Instance,
-    Stack,
+    CloneCell, Stack,
 };
 use std::{
     cell::{Cell, RefCell},
@@ -20,7 +20,7 @@ use std::{
 
 pub const MAX_LOCALS: usize = 256;
 pub(crate) struct Frame {
-    pub(crate) locals: [RawValue; MAX_LOCALS],
+    pub(crate) locals: SmallVec<[RawValue; MAX_LOCALS]>,
     // pub(crate) frame_bottom: usize, //stack[frame_buttom..frame_buttom_n_args]
     pub(crate) closure: Option<Gc<Closure>>,
     pub(crate) ip: usize,
@@ -36,9 +36,9 @@ impl Frame {
     }
     pub(crate) fn new(n_args: usize, closure: Option<Gc<Closure>>) -> Self {
         Self {
-            locals: [RawValue::default(); MAX_LOCALS],
-            closure,
-            ip: Self::get_ip(closure),
+            locals: smallvec![RawValue::default(); MAX_LOCALS],
+            closure:closure.clone(),
+            ip: Self::get_ip(closure.clone()),
             n_args,
             has_closed: false,
         }
@@ -76,29 +76,29 @@ macro_rules! binary_op_impl_closue {
                     })
                 };
             }
-            let mt = $self.get_metatable($a);
+            let mt = $self.get_metatable(&$a);
             if !mt.is_nil() {
                 let method = $self.table_get(
-                    mt,
-                    $self.global_state.constants[ConstantsIndex::$metamethod as usize].get(),
+                    &mt,
+                    &$self.global_state.constants[ConstantsIndex::$metamethod as usize].get(),
                 )?;
                 if method.is_nil() {
                     return error!();
                 }
                 let instance = $self.instance.upgrade().unwrap();
-                return instance.call(method, &[$a, $b]);
+                return instance.call(method, &[$a.clone(), $b.clone()]);
             }
-            let mt = $self.get_metatable($b);
+            let mt = $self.get_metatable(&$b);
             if !mt.is_nil() {
                 let method = $self.table_get(
-                    mt,
-                    $self.global_state.constants[ConstantsIndex::$metamethod as usize].get(),
+                    &mt,
+                    &$self.global_state.constants[ConstantsIndex::$metamethod as usize].get(),
                 )?;
                 if method.is_nil() {
                     return error!();
                 }
                 let instance = $self.instance.upgrade().unwrap();
-                return instance.call(method, &[$a, $b]);
+                return instance.call(method, &[$a.clone(), $b.clone()]);
             } else {
                 return error!();
             }
@@ -173,12 +173,12 @@ impl<'a> Drop for CallContext<'a> {
             let ret = if ret_values.is_empty() {
                 RawValue::nil()
             } else if ret_values.len() == 1 {
-                ret_values[0]
+                ret_values[0].clone()
             } else {
                 let rv = std::mem::replace(&mut *ret_values, smallvec![]);
                 RawValue::Tuple(self.state.gc.allocate(Tuple {
                     values: RefCell::new(rv),
-                    metatable: Cell::new(RawValue::Nil),
+                    metatable: CloneCell::new(RawValue::Nil),
                     flag: crate::value::TupleFlag::VarArgs,
                 }))
             };
@@ -188,7 +188,7 @@ impl<'a> Drop for CallContext<'a> {
             ret_values.resize(self.n_expected_rets as usize, RawValue::Nil);
             let mut st = self.state.eval_stack.borrow_mut();
             for v in ret_values.iter() {
-                st.push(*v);
+                st.push(v.clone());
             }
         }
     }
@@ -219,7 +219,11 @@ impl State {
     //         Value::nil()
     //     }
     // }
-    pub(crate) fn table_rawget(&self, table: RawValue, key: RawValue) -> Result<RawValue, RuntimeError> {
+    pub(crate) fn table_rawget(
+        &self,
+        table: &RawValue,
+        key: &RawValue,
+    ) -> Result<RawValue, RuntimeError> {
         let table = match table.as_table() {
             Some(x) => x,
             None => {
@@ -238,9 +242,9 @@ impl State {
     }
     pub(crate) fn table_rawset(
         &self,
-        table: RawValue,
-        key: RawValue,
-        value: RawValue,
+        table: &RawValue,
+        key: &RawValue,
+        value: &RawValue,
     ) -> Result<(), RuntimeError> {
         let table = match table.as_table() {
             Some(x) => x,
@@ -257,16 +261,20 @@ impl State {
             }
         };
         let mut table = table.borrow_mut();
-        table.set(key, value);
+        table.set(key.clone(), value.clone());
         Ok(())
     }
-    pub(crate) fn table_get(&self, table: RawValue, key: RawValue) -> Result<RawValue, RuntimeError> {
-        self.table_get_impl(table, key, 0)
+    pub(crate) fn table_get(
+        &self,
+        table: &RawValue,
+        key: &RawValue,
+    ) -> Result<RawValue, RuntimeError> {
+        self.table_get_impl(table.clone(), key, 0)
     }
     pub(crate) fn table_get_impl(
         &self,
         mut table: RawValue,
-        key: RawValue,
+        key: &RawValue,
         mut depth: u32,
     ) -> Result<RawValue, RuntimeError> {
         loop {
@@ -276,13 +284,13 @@ impl State {
                     msg: format!("__index chain too long,possible loop",),
                 });
             }
-            let origin_table = table;
+            let origin_table = table.clone();
             let (value, mt) = {
-                let mt = self.get_metatable(table);
+                let mt = self.get_metatable(&table);
                 match table.as_table() {
                     Some(x) => {
                         let table = x.borrow();
-                        (table.get(key), mt)
+                        (table.get(&key), mt)
                     }
                     None => {
                         if mt.is_nil() {
@@ -306,12 +314,12 @@ impl State {
 
             table = self.table_get_impl(
                 mt,
-                self.global_state.constants[ConstantsIndex::MtKeyIndex as usize].get(),
+                &self.global_state.constants[ConstantsIndex::MtKeyIndex as usize].get(),
                 depth + 1,
             )?;
             if table.as_callable().is_some() || table.as_closure().is_some() {
                 let instance = self.instance.upgrade().unwrap();
-                return instance.call(table, &[origin_table, key]);
+                return instance.call(table, &[origin_table, key.clone()]);
             }
             if table.as_table().is_none() {
                 return Ok(RawValue::Nil);
@@ -321,23 +329,23 @@ impl State {
     }
     pub(crate) fn table_set(
         &self,
-        table: RawValue,
-        key: RawValue,
-        value: RawValue,
+        table: &RawValue,
+        key: &RawValue,
+        value: &RawValue,
     ) -> Result<(), RuntimeError> {
         self.table_set_impl(table, key, value, 0)
     }
     pub(crate) fn table_set_impl(
         &self,
-        table: RawValue,
-        key: RawValue,
-        value: RawValue,
+        table: &RawValue,
+        key: &RawValue,
+        value: &RawValue,
         depth: u32,
     ) -> Result<(), RuntimeError> {
         if let Some(table) = table.as_table() {
             let mut table = table.borrow_mut();
             if !table.get(key).is_nil() {
-                table.set(key, value);
+                table.set(key.clone(), value.clone());
                 return Ok(());
             }
         }
@@ -345,15 +353,15 @@ impl State {
         if !mt.is_nil() {
             let newindex = self.table_get_impl(
                 mt,
-                self.global_state.constants[ConstantsIndex::MtKeyNewIndex as usize].get(),
+                &self.global_state.constants[ConstantsIndex::MtKeyNewIndex as usize].get(),
                 depth + 1,
             )?;
             if newindex.as_table().is_some() {
-                return self.table_set_impl(newindex, key, value, depth + 1);
+                return self.table_set_impl(&newindex, key, value, depth + 1);
             }
             if newindex.as_callable().is_some() || newindex.as_closure().is_some() {
                 let instance = self.instance.upgrade().unwrap();
-                instance.call(newindex, &[table, key, value])?;
+                instance.call(newindex, &[table.clone(), key.clone(), value.clone()])?;
                 return Ok(());
             }
         }
@@ -372,7 +380,7 @@ impl State {
             }
         };
         let mut table = table.borrow_mut();
-        table.set(key, value);
+        table.set(key.clone(), value.clone());
         Ok(())
     }
 
@@ -394,7 +402,7 @@ impl State {
         let c = self.gc.allocate(c);
         RawValue::Closure(c)
     }
-    pub(crate) fn concat(&self, a: RawValue, b: RawValue) -> Result<RawValue, RuntimeError> {
+    pub(crate) fn concat(&self, a:& RawValue, b: &RawValue) -> Result<RawValue, RuntimeError> {
         match (a, b) {
             (RawValue::String(a), RawValue::String(b)) => {
                 let mut a = a.data.clone();
@@ -407,22 +415,22 @@ impl State {
                 Ok(self.create_string(a))
             }
             _ => {
-                let mt_a = self.get_metatable(a);
-                let mt_b = self.get_metatable(b);
+                let mt_a = self.get_metatable(&a);
+                let mt_b = self.get_metatable(&b);
                 if !mt_a.is_nil() {
                     let method = self.table_get(
-                        mt_a,
-                        self.global_state.constants[ConstantsIndex::MtKeyConcat as usize].get(),
+                        &mt_a,
+                        &self.global_state.constants[ConstantsIndex::MtKeyConcat as usize].get(),
                     )?;
                     let instance = self.instance.upgrade().unwrap();
-                    return instance.call(method, &[a, b]);
+                    return instance.call(method, &[a.clone(), b.clone()]);
                 } else if !mt_b.is_nil() {
                     let method = self.table_get(
-                        mt_b,
-                        self.global_state.constants[ConstantsIndex::MtKeyConcat as usize].get(),
+                        &mt_b,
+                        &self.global_state.constants[ConstantsIndex::MtKeyConcat as usize].get(),
                     )?;
                     let instance = self.instance.upgrade().unwrap();
-                    return instance.call(method, &[a, b]);
+                    return instance.call(method, &[a.clone(), b.clone()]);
                 } else {
                     Err(RuntimeError {
                         kind: ErrorKind::ArithmeticError,
@@ -436,22 +444,22 @@ impl State {
             }
         }
     }
-    pub(crate) fn add(&self, a: RawValue, b: RawValue) -> Result<RawValue, RuntimeError> {
+    pub(crate) fn add(&self, a: &RawValue, b: &RawValue) -> Result<RawValue, RuntimeError> {
         binary_op_impl!(self, +, a,b, MtKeyAdd)
     }
-    pub(crate) fn sub(&self, a: RawValue, b: RawValue) -> Result<RawValue, RuntimeError> {
+    pub(crate) fn sub(&self, a: &RawValue, b: &RawValue) -> Result<RawValue, RuntimeError> {
         binary_op_impl!(self, -, a,b, MtKeySub)
     }
-    pub(crate) fn mul(&self, a: RawValue, b: RawValue) -> Result<RawValue, RuntimeError> {
+    pub(crate) fn mul(&self, a: &RawValue, b: &RawValue) -> Result<RawValue, RuntimeError> {
         binary_op_impl!(self, *, a,b, MtKeyMul)
     }
-    pub(crate) fn div(&self, a: RawValue, b: RawValue) -> Result<RawValue, RuntimeError> {
+    pub(crate) fn div(&self, a: &RawValue, b: &RawValue) -> Result<RawValue, RuntimeError> {
         binary_op_impl!(self,/, a,b, MtKeyDiv)
     }
-    pub(crate) fn mod_(&self, a: RawValue, b: RawValue) -> Result<RawValue, RuntimeError> {
+    pub(crate) fn mod_(&self, a: &RawValue, b: &RawValue) -> Result<RawValue, RuntimeError> {
         binary_op_impl!(self,%, a,b,MtKeyMod)
     }
-    pub(crate) fn pow(&self, a: RawValue, b: RawValue) -> Result<RawValue, RuntimeError> {
+    pub(crate) fn pow(&self, a: &RawValue, b: &RawValue) -> Result<RawValue, RuntimeError> {
         binary_op_impl_closue!(
             self,
             |a: f64, b: f64| -> f64 { a.powf(b) },
@@ -461,10 +469,10 @@ impl State {
             MtKeyPow
         )
     }
-    pub(crate) fn bitwise_and(&self, a: RawValue, b: RawValue) -> Result<RawValue, RuntimeError> {
+    pub(crate) fn bitwise_and(&self, a: &RawValue, b: &RawValue) -> Result<RawValue, RuntimeError> {
         int_binary_op_impl!(&, a, b)
     }
-    pub(crate) fn bitwise_or(&self, a: RawValue, b: RawValue) -> Result<RawValue, RuntimeError> {
+    pub(crate) fn bitwise_or(&self, a: &RawValue, b: &RawValue) -> Result<RawValue, RuntimeError> {
         int_binary_op_impl!(|, a, b)
     }
 
@@ -508,7 +516,7 @@ impl State {
     //     res
     // }
 
-    pub(crate) fn lt(&self, a: RawValue, b: RawValue) -> Result<RawValue, RuntimeError> {
+    pub(crate) fn lt(&self, a: &RawValue, b: &RawValue) -> Result<RawValue, RuntimeError> {
         match (a, b) {
             (RawValue::Number(a), RawValue::Number(b)) => Ok(RawValue::from_bool(a < b)),
             (RawValue::String(a), RawValue::String(b)) => {
@@ -517,8 +525,8 @@ impl State {
                 Ok(RawValue::from_bool(a < b))
             }
             _ => {
-                let mt_a = self.get_metatable(a);
-                let mt_b = self.get_metatable(b);
+                let mt_a = self.get_metatable(&a);
+                let mt_b = self.get_metatable(&b);
                 macro_rules! error {
                     () => {
                         Err(RuntimeError {
@@ -533,24 +541,24 @@ impl State {
                 }
                 if !mt_a.is_nil() {
                     let method = self.table_get(
-                        mt_a,
-                        self.global_state.constants[ConstantsIndex::MtKeyLt as usize].get(),
+                        &mt_a,
+                        &self.global_state.constants[ConstantsIndex::MtKeyLt as usize].get(),
                     )?;
                     if method.is_nil() {
                         return error!();
                     }
                     let instance = self.instance.upgrade().unwrap();
-                    return instance.call(method, &[a, b]);
+                    return instance.call(method, &[a.clone(), b.clone()]);
                 } else if !mt_b.is_nil() {
                     let method = self.table_get(
-                        mt_b,
-                        self.global_state.constants[ConstantsIndex::MtKeyLt as usize].get(),
+                        &mt_b,
+                        &self.global_state.constants[ConstantsIndex::MtKeyLt as usize].get(),
                     )?;
                     if method.is_nil() {
                         return error!();
                     }
                     let instance = self.instance.upgrade().unwrap();
-                    return instance.call(method, &[a, b]);
+                    return instance.call(method, &[a.clone(), b.clone()]);
                 } else {
                     Err(RuntimeError {
                         kind: ErrorKind::ArithmeticError,
@@ -564,7 +572,7 @@ impl State {
             }
         }
     }
-    pub(crate) fn le(&self, a: RawValue, b: RawValue) -> Result<RawValue, RuntimeError> {
+    pub(crate) fn le(&self, a: &RawValue, b: &RawValue) -> Result<RawValue, RuntimeError> {
         match (a, b) {
             (RawValue::Number(a), RawValue::Number(b)) => Ok(RawValue::from_bool(a <= b)),
             (RawValue::String(a), RawValue::String(b)) => {
@@ -585,28 +593,28 @@ impl State {
                         })
                     };
                 }
-                let mt_a = self.get_metatable(a);
-                let mt_b = self.get_metatable(b);
+                let mt_a = self.get_metatable(&a);
+                let mt_b = self.get_metatable(&b);
                 if !mt_a.is_nil() {
                     let method = self.table_get(
-                        mt_a,
-                        self.global_state.constants[ConstantsIndex::MtKeyLe as usize].get(),
+                        &mt_a,
+                        &self.global_state.constants[ConstantsIndex::MtKeyLe as usize].get(),
                     )?;
                     if method.is_nil() {
                         return error!();
                     }
                     let instance = self.instance.upgrade().unwrap();
-                    return instance.call(method, &[a, b]);
+                    return instance.call(method, &[a.clone(), b.clone()]);
                 } else if !mt_b.is_nil() {
                     let method = self.table_get(
-                        mt_b,
-                        self.global_state.constants[ConstantsIndex::MtKeyLe as usize].get(),
+                        &mt_b,
+                        &self.global_state.constants[ConstantsIndex::MtKeyLe as usize].get(),
                     )?;
                     if method.is_nil() {
                         return error!();
                     }
                     let instance = self.instance.upgrade().unwrap();
-                    return instance.call(method, &[a, b]);
+                    return instance.call(method, &[a.clone(), b.clone()]);
                 } else {
                     Err(RuntimeError {
                         kind: ErrorKind::ArithmeticError,
@@ -620,13 +628,13 @@ impl State {
             }
         }
     }
-    pub(crate) fn gt(&self, a: RawValue, b: RawValue) -> Result<RawValue, RuntimeError> {
+    pub(crate) fn gt(&self, a: &RawValue, b: &RawValue) -> Result<RawValue, RuntimeError> {
         self.lt(b, a)
     }
-    pub(crate) fn ge(&self, a: RawValue, b: RawValue) -> Result<RawValue, RuntimeError> {
+    pub(crate) fn ge(&self, a: &RawValue, b: &RawValue) -> Result<RawValue, RuntimeError> {
         self.le(b, a)
     }
-    pub(crate) fn eq(&self, a: RawValue, b: RawValue) -> Result<RawValue, RuntimeError> {
+    pub(crate) fn eq(&self, a: &RawValue, b: &RawValue) -> Result<RawValue, RuntimeError> {
         match (a, b) {
             (RawValue::Nil, RawValue::Nil) => Ok(RawValue::from_bool(true)),
             (RawValue::Bool(a), RawValue::Bool(b)) => Ok(RawValue::from_bool(a == b)),
@@ -640,8 +648,8 @@ impl State {
             (RawValue::Callable(a), RawValue::Callable(b)) => Ok(RawValue::from_bool(a == b)),
             (RawValue::Table(a), RawValue::Table(b)) if a == b => Ok(RawValue::from_bool(true)),
             _ => {
-                let mt_a = self.get_metatable(a);
-                let mt_b = self.get_metatable(b);
+                let mt_a = self.get_metatable(&a);
+                let mt_b = self.get_metatable(&b);
                 macro_rules! error {
                     () => {
                         Ok(RawValue::from_bool(false))
@@ -649,34 +657,34 @@ impl State {
                 }
                 if !mt_a.is_nil() {
                     let method = self.table_get(
-                        mt_a,
-                        self.global_state.constants[ConstantsIndex::MtKeyEq as usize].get(),
+                        &mt_a,
+                        &self.global_state.constants[ConstantsIndex::MtKeyEq as usize].get(),
                     )?;
                     if method.is_nil() {
                         return error!();
                     }
                     let instance = self.instance.upgrade().unwrap();
-                    return instance.call(method, &[a, b]);
+                    return instance.call(method, &[a.clone(), b.clone()]);
                 } else if !mt_b.is_nil() {
                     let method = self.table_get(
-                        mt_b,
-                        self.global_state.constants[ConstantsIndex::MtKeyEq as usize].get(),
+                        &mt_b,
+                        &self.global_state.constants[ConstantsIndex::MtKeyEq as usize].get(),
                     )?;
                     if method.is_nil() {
                         return error!();
                     }
                     let instance = self.instance.upgrade().unwrap();
-                    return instance.call(method, &[a, b]);
+                    return instance.call(method, &[a.clone(), b.clone()]);
                 } else {
                     Ok(RawValue::from_bool(false))
                 }
             }
         }
     }
-    pub(crate) fn ne(&self, a: RawValue, b: RawValue) -> Result<RawValue, RuntimeError> {
+    pub(crate) fn ne(&self, a: &RawValue, b: &RawValue) -> Result<RawValue, RuntimeError> {
         Ok(RawValue::from_bool(!self.eq(a, b)?.to_bool()))
     }
-    pub(crate) fn idiv(&self, a: RawValue, b: RawValue) -> Result<RawValue, RuntimeError> {
+    pub(crate) fn idiv(&self, a: &RawValue, b:& RawValue) -> Result<RawValue, RuntimeError> {
         if let (Some(a), Some(b)) = (a.number(), b.number()) {
             if b == 0.0 {
                 return Err(RuntimeError {
@@ -698,28 +706,28 @@ impl State {
                     })
                 };
             }
-            let mt_a = self.get_metatable(a);
-            let mt_b = self.get_metatable(b);
+            let mt_a = self.get_metatable(&a);
+            let mt_b = self.get_metatable(&b);
             if !mt_a.is_nil() {
                 let method = self.table_get(
-                    mt_a,
-                    self.global_state.constants[ConstantsIndex::MtKeyIDiv as usize].get(),
+                    &mt_a,
+                    &self.global_state.constants[ConstantsIndex::MtKeyIDiv as usize].get(),
                 )?;
                 if method.is_nil() {
                     return error!();
                 }
                 let instance = self.instance.upgrade().unwrap();
-                return instance.call(method, &[a, b]);
+                return instance.call(method, &[a.clone(), b.clone()]);
             } else if !mt_b.is_nil() {
                 let method = self.table_get(
-                    mt_b,
-                    self.global_state.constants[ConstantsIndex::MtKeyIDiv as usize].get(),
+                    &mt_b,
+                    &self.global_state.constants[ConstantsIndex::MtKeyIDiv as usize].get(),
                 )?;
                 if method.is_nil() {
                     return error!();
                 }
                 let instance = self.instance.upgrade().unwrap();
-                return instance.call(method, &[a, b]);
+                return instance.call(method, &[a.clone(), b.clone()]);
             } else {
                 error!()
             }
@@ -735,10 +743,12 @@ impl State {
             // Value::Callable(_) => todo!(),
             RawValue::Tuple(x) => Ok(RawValue::from_number((*x).values.borrow().len() as f64)),
             _ => {
-                let mt = self.get_metatable(a);
+                let mt = self.get_metatable(&a);
                 if mt.is_nil() {
                     match a {
-                        RawValue::Table(x) => Ok(RawValue::from_number((*x).borrow_mut().len() as f64)),
+                        RawValue::Table(x) => {
+                            Ok(RawValue::from_number((*x).borrow_mut().len() as f64))
+                        }
                         _ => Err(RuntimeError {
                             kind: ErrorKind::ArithmeticError,
                             msg: format!(" attempt to get length of a {} value", a.type_of(),),
@@ -746,8 +756,8 @@ impl State {
                     }
                 } else {
                     let method = self.table_get(
-                        mt,
-                        self.global_state.constants[ConstantsIndex::MtKeyLen as usize].get(),
+                        &mt,
+                        &self.global_state.constants[ConstantsIndex::MtKeyLen as usize].get(),
                     )?;
                     if method.is_nil() {
                         Err(RuntimeError {
@@ -803,13 +813,13 @@ impl State {
                         })
                     };
                 }
-                let mt = self.get_metatable(a);
+                let mt = self.get_metatable(&a);
                 if mt.is_nil() {
                     return error!();
                 }
                 let method = self.table_get(
-                    mt,
-                    self.global_state.constants[ConstantsIndex::MtKeyNeg as usize].get(),
+                    &mt,
+                    &self.global_state.constants[ConstantsIndex::MtKeyNeg as usize].get(),
                 )?;
                 if method.is_nil() {
                     return error!();
@@ -820,7 +830,7 @@ impl State {
             }
         }
     }
-    pub(crate) fn get_metatable(&self, a: RawValue) -> RawValue {
+    pub(crate) fn get_metatable(&self, a: &RawValue) -> RawValue {
         self.global_state.get_metatable(a)
     }
 }
@@ -856,11 +866,11 @@ impl<'b> BaseApi for CallContext<'b> {
     }
 
     fn set_metatable<'a>(&self, v: Value<'a>, mt: Value<'a>) {
-        self.state.global_state.set_metatable(v.value, mt.value)
+        self.state.global_state.set_metatable(&v.value, &mt.value)
     }
 
     fn get_metatable<'a>(&self, v: Value<'a>) -> Value<'a> {
-        Value::new(self.state.global_state.get_metatable(v.value))
+        Value::new(self.state.global_state.get_metatable(&v.value))
     }
 
     fn table_rawset<'a>(
@@ -892,7 +902,7 @@ impl<'b> StateApi for CallContext<'b> {
         key: Value<'a>,
         value: Value<'a>,
     ) -> Result<(), RuntimeError> {
-        self.state.table_set(table.value, key.value, value.value)
+        self.state.table_set(&table.value, &key.value, &value.value)
     }
 
     fn table_get<'a>(
@@ -900,7 +910,7 @@ impl<'b> StateApi for CallContext<'b> {
         table: Value<'a>,
         key: Value<'a>,
     ) -> Result<Value<'a>, RuntimeError> {
-        Ok(Value::new(self.state.table_get(table.value, key.value)?))
+        Ok(Value::new(self.state.table_get(&table.value, &key.value)?))
     }
 }
 impl<'b> CallApi for CallContext<'b> {
@@ -910,7 +920,7 @@ impl<'b> CallApi for CallContext<'b> {
 
     fn arg_or_nil<'a>(&'a self, i: usize) -> Value<'a> {
         if i < self.frame.n_args {
-            Value::new(self.frame.locals[i])
+            Value::new(self.frame.locals[i].clone())
             // Some(self.eval_stack.borrow()[frame.frame_bottom + i])
         } else {
             Value::new(RawValue::nil())
@@ -919,7 +929,7 @@ impl<'b> CallApi for CallContext<'b> {
 
     fn arg<'a>(&'a self, i: usize) -> Result<Value<'a>, RuntimeError> {
         if i < self.frame.n_args {
-            Ok(Value::new(self.frame.locals[i]))
+            Ok(Value::new(self.frame.locals[i].clone()))
             // Some(self.eval_stack.borrow()[frame.frame_bottom + i])
         } else {
             Err(RuntimeError {
@@ -937,12 +947,8 @@ impl<'b> CallApi for CallContext<'b> {
         ret_values[i] = value.value;
     }
 
-    fn call<'a>(
-        &self,
-        closure: Value<'a>,
-        args: &[Value<'a>],
-    ) -> Result<Value<'a>, RuntimeError> {
-        let args: Vec<_> = args.iter().map(|x| x.value).collect();
+    fn call<'a>(&self, closure: Value<'a>, args: &[Value<'a>]) -> Result<Value<'a>, RuntimeError> {
+        let args: Vec<_> = args.iter().map(|x| x.value.clone()).collect();
         Ok(Value::new(self.instance.call(closure.value, &args)?))
     }
 }

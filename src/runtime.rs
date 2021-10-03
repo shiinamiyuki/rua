@@ -9,7 +9,7 @@ use std::{
 
 use ordered_float::OrderedFloat;
 
-use crate::{api::StateApi, runtime::ErrorKind::ExternalError};
+use crate::{api::StateApi, runtime::ErrorKind::ExternalError, CloneCell};
 use crate::{
     api::{BaseApi, CallApi},
     bytecode::ByteCodeModule,
@@ -71,7 +71,7 @@ impl GcValueList {
 }
 
 pub(crate) struct GlobalState {
-    pub(crate) constants: Vec<Cell<RawValue>>,
+    pub(crate) constants: Vec<CloneCell<RawValue>>,
 }
 
 pub(crate) struct RuntimeInner {
@@ -173,7 +173,7 @@ impl From<f64> for RustPrimitive {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct Value<'a> {
     pub(crate) value: RawValue,
     pub(crate) phantom: PhantomData<&'a u32>,
@@ -495,7 +495,7 @@ impl GcValue {
         let b = self.inner.value.borrow_mut();
         RootBorrowMut {
             // inner: self.inner.as_ref(),
-            value: Value::new(*b),
+            value: Value::new((*b).clone()),
             _ref: b,
         }
     }
@@ -503,7 +503,7 @@ impl GcValue {
         let b = self.inner.value.borrow();
         RootBorrow {
             // inner: self.inner.as_ref(),
-            value: Value::new(*b),
+            value: Value::new((*b).clone()),
             _ref: b,
         }
     }
@@ -522,7 +522,7 @@ impl Drop for GcValue {
 
 impl<'a> Drop for RootBorrowMut<'a> {
     fn drop(&mut self) {
-        *self._ref = self.value.value;
+        *self._ref = self.value.value.clone();
     }
 }
 // pub struct LuaClass {
@@ -735,7 +735,7 @@ impl RuntimeInner {
             runtime: pself.clone(),
             state: State {
                 gc: self.gc.clone(),
-                globals: self.globals,
+                globals: self.globals.clone(),
                 frames: RefCell::new(Stack::new()),
                 eval_stack: RefCell::new(vec![]),
                 global_state: self.global_state.clone().unwrap(),
@@ -763,7 +763,7 @@ impl RuntimeInner {
             self.add_function("tostring".into(), move |ctx| {
                 let v = ctx.arg(0)?;
                 let s = {
-                    let mt = ctx.get_metatable(v);
+                    let mt = ctx.get_metatable(v.clone());
                     if !mt.value.is_nil() {
                         let tostring = ctx.table_get(
                             mt,
@@ -833,7 +833,7 @@ impl RuntimeInner {
             let key = ctx.arg_or_nil(1);
             ctx.ret(
                 0,
-                Value::new(ctx.state.table_rawget(table.value, key.value)?),
+                Value::new(ctx.state.table_rawget(&table.value, &key.value)?),
             );
             Ok(())
         });
@@ -842,7 +842,7 @@ impl RuntimeInner {
             let key = ctx.arg_or_nil(1);
             let value = ctx.arg_or_nil(2);
             ctx.state
-                .table_rawset(table.value, key.value, value.value)?;
+                .table_rawset(&table.value, &key.value, &value.value)?;
             Ok(())
         });
         self.add_function("rawequal".into(), |ctx| {
@@ -861,7 +861,7 @@ impl RuntimeInner {
             let mt = match &t.value {
                 RawValue::Table(t) => {
                     let t = t.borrow();
-                    t.metatable
+                    t.metatable.clone()
                 }
                 _ => RawValue::Nil,
             };
@@ -917,7 +917,7 @@ impl RuntimeInner {
             let table = table.borrow();
             let next = table.next(key.value)?;
             let value = if !next.is_nil() {
-                table.get(next)
+                table.get(&next)
             } else {
                 RawValue::Nil
             };
@@ -939,10 +939,10 @@ impl RuntimeInner {
     }
     pub(crate) fn create_pooled_string(&mut self, s: &String) -> RawValue {
         if let Some(v) = self.string_pool.get(s) {
-            *v
+            v.clone()
         } else {
             let v = RawValue::String(self.gc.allocate(Managed::new(s.clone())));
-            self.string_pool.insert(s.clone(), v);
+            self.string_pool.insert(s.clone(), v.clone());
             v
         }
     }
@@ -1004,23 +1004,23 @@ impl RuntimeInner {
             assert!(!v.is_nil());
         }
         let global_state = GlobalState {
-            constants: constants.into_iter().map(|x| Cell::new(x)).collect(),
+            constants: constants.into_iter().map(|x| CloneCell::new(x)).collect(),
         };
         runtime.global_state = Some(Rc::new(global_state));
-        runtime.add_var("_G".into(), runtime.globals);
+        runtime.add_var("_G".into(), runtime.globals.clone());
         runtime
     }
 }
 
 impl GlobalState {
-    pub(crate) fn get_metatable(&self, v: RawValue) -> RawValue {
+    pub(crate) fn get_metatable(&self, v: &RawValue) -> RawValue {
         match v {
             RawValue::Nil => RawValue::Nil,
             RawValue::Bool(_) => self.constants[ConstantsIndex::MtBool as usize].get(),
             RawValue::Number(_) => self.constants[ConstantsIndex::MtNumber as usize].get(),
             RawValue::Table(t) => {
                 let t = t.borrow();
-                t.metatable
+                t.metatable.clone()
             }
             RawValue::String(_) => self.constants[ConstantsIndex::MtString as usize].get(),
             RawValue::Closure(_) => RawValue::Nil,
@@ -1029,22 +1029,26 @@ impl GlobalState {
             RawValue::UserData(p) => p.get_metatable().value,
         }
     }
-    pub(crate) fn set_metatable(&self, v: RawValue, mt: RawValue) {
+    pub(crate) fn set_metatable(&self, v: &RawValue, mt: &RawValue) {
         match v {
             RawValue::Nil => {}
-            RawValue::Bool(_) => self.constants[ConstantsIndex::MtBool as usize].set(mt),
-            RawValue::Number(_) => self.constants[ConstantsIndex::MtNumber as usize].set(mt),
+            RawValue::Bool(_) => self.constants[ConstantsIndex::MtBool as usize].set(mt.clone()),
+            RawValue::Number(_) => {
+                self.constants[ConstantsIndex::MtNumber as usize].set(mt.clone())
+            }
             RawValue::Table(t) => {
                 let mut t = t.borrow_mut();
-                t.metatable = mt;
+                t.metatable = mt.clone();
             }
-            RawValue::String(_) => self.constants[ConstantsIndex::MtString as usize].set(mt),
+            RawValue::String(_) => {
+                self.constants[ConstantsIndex::MtString as usize].set(mt.clone())
+            }
             RawValue::Closure(_) => {}
             RawValue::Callable(_) => {}
             RawValue::Tuple(t) => {
-                t.metatable.set(mt);
+                t.metatable.set(mt.clone());
             }
-            RawValue::UserData(p) => p.set_metatable(Value::new(mt)),
+            RawValue::UserData(p) => p.set_metatable(Value::new(mt.clone())),
         }
     }
 }
@@ -1140,7 +1144,7 @@ impl BaseApi for Runtime {
 
 impl BaseApi for Rc<RefCell<RuntimeInner>> {
     fn get_global_env<'a>(&self) -> Value<'a> {
-        Value::new(self.borrow().globals)
+        Value::new(self.borrow().globals.clone())
     }
     fn create_number<'a>(&'a self, x: f64) -> Value<'a> {
         Value::new(RawValue::from_number(x))
@@ -1203,12 +1207,12 @@ impl BaseApi for Rc<RefCell<RuntimeInner>> {
             .global_state
             .as_ref()
             .unwrap()
-            .set_metatable(v.value, mt.value)
+            .set_metatable(&v.value, &mt.value)
     }
 
     fn get_metatable<'a>(&self, v: Value<'a>) -> Value<'a> {
         let inner = self.borrow();
-        Value::new(inner.global_state.as_ref().unwrap().get_metatable(v.value))
+        Value::new(inner.global_state.as_ref().unwrap().get_metatable(&v.value))
     }
 
     fn table_rawset<'a>(
@@ -1234,7 +1238,7 @@ impl BaseApi for Rc<RefCell<RuntimeInner>> {
         key: Value<'a>,
     ) -> Result<Value<'a>, RuntimeError> {
         if let Some(table) = table.value.as_table() {
-            Ok(Value::new(table.borrow().get(key.value)))
+            Ok(Value::new(table.borrow().get(&key.value)))
         } else {
             Err(RuntimeError {
                 kind: ErrorKind::TypeError,
@@ -1252,6 +1256,9 @@ impl Drop for Runtime {
                 "Runtime dropped before instances"
             );
         }
-        println!("total alloc {}",self.inner.borrow().gc.inner.borrow().alloc_count);
+        println!(
+            "total alloc {}",
+            self.inner.borrow().gc.inner.borrow().alloc_count
+        );
     }
 }
