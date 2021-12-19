@@ -913,6 +913,10 @@ impl Compiler {
                 self.store_variable(var)?;
                 let step_var = format!("##step{}", self.module.code.len());
                 self.add_var(step_var.clone());
+                let end_var = format!("##end{}", self.module.code.len());
+                self.add_var(end_var.clone());
+                self.compile_expr(end, Default::default())?;
+                self.store_variable(&end_var)?;
                 if let Some(step) = step {
                     self.compile_expr(step, Default::default())?;
                 } else {
@@ -925,7 +929,7 @@ impl Compiler {
                         let begin = self.new_label();
                         self.emit_label(begin);
                         self.load_identifier(var)?;
-                        self.compile_expr(end, Default::default())?;
+                        self.load_identifier(&end_var)?;
                         self.emit(ByteCode::Op(OpCode::$op));
                         self.emit(ByteCode::Op3U8(OpCode::TestJump, [0, 1, 1]));
                         let l = self.new_label();
