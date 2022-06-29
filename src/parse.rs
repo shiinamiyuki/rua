@@ -16,7 +16,25 @@ pub enum Token {
     Keyword { value: String, loc: SourceLocation },
     EOF { loc: SourceLocation },
 }
+impl ToString for Token {
+    fn to_string(&self) -> String {
+        match self {
+            Token::Number { value, loc: _ } => value.to_string(),
+            Token::Symbol { value, loc: _ } => value.to_string(),
+            Token::String { value, loc: _ } => value.to_string(),
+            Token::Identifier { value, loc: _ } => value.to_string(),
+            Token::Keyword { value, loc: _ } => value.to_string(),
+            Token::EOF { loc } => "".into(),
+        }
+    }
+}
 impl Token {
+    pub fn as_identifier(&self) -> Option<&String> {
+        match self {
+            Token::Identifier { value, loc: _ } => Some(value),
+            _ => None,
+        }
+    }
     pub fn is_eof(&self) -> bool {
         match self {
             Token::EOF { .. } => true,
@@ -582,6 +600,7 @@ pub enum ErrorKind {
     UnexpectedEOF,
     SyntaxError,
 }
+#[derive(Debug)]
 pub struct ParseError {
     pub kind: ErrorKind,
     pub msg: String,
@@ -1310,13 +1329,13 @@ impl Parser {
             let rhs = self.parse_expr_list(true)?;
             Ok(Rc::new(Stmt::Assign { loc, lhs, rhs }))
         } else {
-            // if lhs.len() > 1 {
-            //     return Err(self.error(
-            //         ErrorKind::SyntaxError,
-            //         "parallel assignment expect right hand side",
-            //         loc,
-            //     ));
-            // }
+            if lhs.len() > 1 {
+                return Err(self.error(
+                    ErrorKind::SyntaxError,
+                    "parallel assignment expect right hand side",
+                    loc,
+                ));
+            }
             Ok(Rc::new(Stmt::Expr {
                 loc,
                 expr: lhs[0].clone(),
@@ -1490,11 +1509,29 @@ impl Parser {
                 _ => unreachable!(),
             }
         } else {
-            let assignment = self.parse_assignment_stmt()?;
-            Ok(Rc::new(Stmt::LocalVar {
-                loc: assignment.loc().clone(),
-                vars: assignment,
-            }))
+            let loc = self.peek().loc().clone();
+            let lhs = self.parse_expr_list(true)?;
+            if self.has("=") {
+                self.advance(1);
+                let rhs = self.parse_expr_list(true)?;
+                Ok(Rc::new(Stmt::LocalVar {
+                    loc: loc.clone(),
+                    vars: Rc::new(Stmt::Assign {
+                        loc: loc.clone(),
+                        lhs,
+                        rhs,
+                    }),
+                }))
+            } else {
+                Ok(Rc::new(Stmt::LocalVar {
+                    loc: loc.clone(),
+                    vars: Rc::new(Stmt::Assign {
+                        loc: loc.clone(),
+                        lhs,
+                        rhs: vec![],
+                    }),
+                }))
+            }
         }
     }
     fn parse_stmt(&mut self) -> Result<Rc<Stmt>, ParseError> {
@@ -1508,7 +1545,7 @@ impl Parser {
             self.parse_return_stmt()
         } else if self.has("break") {
             self.parse_break_stmt()
-        }else if self.has("repeat") {
+        } else if self.has("repeat") {
             self.parse_repeat_stmt()
         } else if self.has("function") {
             self.parse_function()

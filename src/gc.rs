@@ -1,177 +1,304 @@
-use std::cell::{Cell, RefCell};
+use lazy_static::lazy_static;
+use parking_lot::RwLock;
+use std::alloc::Layout;
 use std::ops::Deref;
-use std::ptr::NonNull;
-use std::rc::Rc;
-pub struct GcState {
-    pub(crate) inner: RefCell<GcInner>,
-}
-// #[derive(Clone, Copy, PartialEq, Eq)]
-// enum Color {
-//     White,
-//     Black,
-//     Grey,
-// }
-// #[derive(Clone, Copy, PartialEq, Eq)]
-// enum Mark
-#[repr(C)]
-pub(crate) struct GcBox<T: Traceable + ?Sized + 'static> {
-    marked: Cell<bool>,
-    next: Cell<PtrTraceable>,
-    data: T,
-}
-pub(crate) type PtrTraceable = Option<NonNull<GcBox<dyn Traceable>>>;
-pub trait Traceable {
-    fn trace(&self, gc: &GcState);
+use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+pub struct Heap {
+    pid: usize, // processor id
+    pub(crate) head: AtomicUsize,
+    // pub(crate) lock: usize,
+    pub(crate) alloc_count: AtomicUsize,
+    trace_list: RwLock<Vec<PtrTraceable>>,
 }
 
+#[derive(Clone, Copy, Debug)]
+#[repr(u8)]
+pub enum Color {
+    Black = 0,
+    Grey = 1,
+    White = 2,
+}
+#[repr(C)]
+pub(crate) struct GcObjectHeader {
+    color: AtomicU8,
+    next: AtomicUsize,
+}
+type Deleter = fn(*const TraceableObejct);
+struct TraceableObejct {
+    header: GcObjectHeader,
+    deleter: Deleter,
+    vtable_data: *const dyn Traceable,
+    offset: usize,
+}
+struct TraceableObjectExplicit<T: Traceable + Sized + 'static> {
+    object: TraceableObejct,
+    data: T,
+}
+#[derive(Clone, Copy)]
+pub(crate) struct PtrTraceable(*const TraceableObejct);
+unsafe impl Sync for PtrTraceable {}
+unsafe impl Send for PtrTraceable {}
+fn deleter<T: Traceable + 'static + Sized>(ptr: *const TraceableObejct) {
+    // let ptr = ptr as *mut TraceableObjectExplicit<T>;
+    let ptr = PtrTraceable(ptr);
+    let layout = Layout::new::<TraceableObjectExplicit<T>>();
+    unsafe {
+        std::mem::drop(std::ptr::read(ptr.cast::<T>()));
+        std::alloc::dealloc(ptr.0 as *mut u8, layout);
+    }
+}
+impl PtrTraceable {
+    fn null() -> Self {
+        Self(std::ptr::null())
+    }
+    fn new<T: Traceable + 'static + Sized>(object: T) -> (Self, *const TraceableObjectExplicit<T>) {
+        unsafe {
+            let layout = Layout::new::<TraceableObjectExplicit<T>>();
+            let ptr = std::alloc::alloc(layout) as *mut TraceableObjectExplicit<T>;
+
+            let r = ptr.as_mut().unwrap();
+            assert_eq!(ptr as usize, &mut r.object as *mut TraceableObejct as usize);
+            std::ptr::write(&mut r.data as *mut T, object);
+            std::ptr::write(
+                &mut r.object,
+                TraceableObejct {
+                    header: GcObjectHeader {
+                        color: AtomicU8::new(Color::Black as u8),
+                        next: AtomicUsize::new(std::ptr::null::<()>() as usize),
+                    },
+                    deleter: deleter::<T>,
+                    vtable_data: &r.data as &dyn Traceable as *const dyn Traceable,
+                    offset: &mut r.data as *mut T as usize - ptr as usize,
+                },
+            );
+            (
+                Self(ptr as *const TraceableObejct),
+                ptr as *const TraceableObjectExplicit<T>,
+            )
+        }
+    }
+    unsafe fn cast<T: Traceable + 'static + Sized>(&self) -> *const T {
+        let ptr = (self.0 as *mut u8).offset((*self.0).offset as isize) as *const T;
+        ptr
+    }
+    fn as_ref(&self) -> &dyn Traceable {
+        unsafe { &*(*self.0).vtable_data }
+    }
+    fn dealloc(self) {
+        unsafe {
+            ((*self.0).deleter)(self.0);
+        }
+    }
+}
+
+pub unsafe trait Traceable: Sync + Send {
+    fn trace(&self, ctx: &mut TraceContext);
+}
+
+mod test {
+
+    #[test]
+    fn test_size() {
+        use std::mem::size_of;
+
+        use crate::gc::PtrTraceable;
+        assert!(size_of::<PtrTraceable>() == 8);
+    }
+}
 /*
 A garbage collected *raw* pointer
 Eq and Hash implemented on pointer value alone
-
 */
-pub(crate) struct Gc<T: Traceable + 'static + ?Sized> {
-    ptr: NonNull<GcBox<T>>,
+pub struct Gc<T: Traceable + 'static> {
+    ptr: *const TraceableObjectExplicit<T>,
 }
+unsafe impl<T> Sync for Gc<T> where T: Traceable + 'static {}
+unsafe impl<T> Send for Gc<T> where T: Traceable + 'static {}
 impl<T> Gc<T>
 where
-    T: Traceable + 'static + ?Sized,
+    T: Traceable + 'static,
 {
     pub fn ptr_eq(&self, other: &Gc<T>) -> bool {
         self.ptr == other.ptr
     }
     pub fn as_ptr(&self) -> *const T {
-        unsafe { &self.ptr.as_ref().data as *const T }
+        unsafe { &(&*self.ptr).data as *const T }
     }
 }
-impl<T: Traceable + 'static + ?Sized> std::hash::Hash for Gc<T> {
+impl<T: Traceable + 'static> std::hash::Hash for Gc<T> {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         std::ptr::hash(self.as_ptr(), state)
     }
 }
-impl<T: Traceable + 'static + ?Sized> AsRef<T> for Gc<T> {
+impl<T: Traceable + 'static> AsRef<T> for Gc<T> {
     fn as_ref(&self) -> &T {
-        unsafe { &self.ptr.as_ref().data }
+        unsafe { &(&*self.ptr).data }
     }
 }
-impl<T: Traceable + 'static + ?Sized> PartialEq for Gc<T> {
+impl<T: Traceable + 'static> PartialEq for Gc<T> {
     fn eq(&self, other: &Self) -> bool {
         self.ptr_eq(other)
     }
 }
-impl<T: Traceable + 'static + ?Sized> Eq for Gc<T> {}
-impl<T: Traceable + 'static + ?Sized> Deref for Gc<T> {
+impl<T: Traceable + 'static> Eq for Gc<T> {}
+impl<T: Traceable + 'static> Deref for Gc<T> {
     type Target = T;
     fn deref(&self) -> &Self::Target {
-        unsafe { &self.ptr.as_ref().data }
+        unsafe { &(&*self.ptr).data }
     }
 }
-impl<T> Copy for Gc<T> where T: Traceable + 'static + ?Sized {}
+
+impl<T> Copy for Gc<T> where T: Traceable + 'static {}
 impl<T> Clone for Gc<T>
 where
-    T: Traceable + 'static + ?Sized,
+    T: Traceable + 'static,
 {
     fn clone(&self) -> Self {
         *self
     }
 }
-pub(crate) struct GcInner {
-    head: PtrTraceable,
-    lock: usize,
-    pub(crate) alloc_count:usize,
+// pub struct GcLockGuard {
+//     gc: Rc<GcState>,
+// }
+// impl Drop for GcLockGuard {
+//     fn drop(&mut self) {
+//         self.gc.inner.borrow_mut().lock -= 1;
+//     }
+// }
+pub struct TraceContext {
+    depth: usize,
+    heap: *const Heap,
 }
-pub struct GcLockGuard {
-    gc: Rc<GcState>,
-}
-impl Drop for GcLockGuard {
-    fn drop(&mut self) {
-        self.gc.inner.borrow_mut().lock -= 1;
+impl TraceContext {
+    pub fn trace_ptr<T: Traceable + Sized + 'static>(&mut self, ptr: Gc<T>) {
+        unsafe {
+            let heap = &*self.heap;
+            self.depth += 1;
+            let p = PtrTraceable(ptr.ptr as *const TraceableObejct);
+            if heap.mark_ptr(p) {
+                if self.depth <= 128 {
+                    (*ptr).trace(self);
+                } else {
+                    heap.push_ptr(p);
+                }
+            }
+            self.depth -= 1;
+        }
+    }
+    pub fn trace<T: Traceable + Sized + 'static>(&mut self, object: &T) {
+        unsafe {
+            let heap = &*self.heap;
+            self.depth += 1;
+            object.trace(self);
+            self.depth -= 1;
+        }
     }
 }
-impl GcState {
+impl Heap {
     // move an object onto heap
     pub(crate) fn allocate<T: Traceable + 'static>(&self, object: T) -> Gc<T> {
-        let gc_box: *mut GcBox<T> = Box::into_raw(Box::new(GcBox {
-            // color: Cell::new(Color::White),
-            marked: Cell::new(false),
-            data: object,
-            next: Cell::new(None),
-        }));
-        // println!("allocate object {:0x}",gc_box as u64);
+        let (ptr_dyn, ptr) = PtrTraceable::new(object);
+        // println!("allocated {:?}", ptr);
         unsafe {
-            let gc_box_dyn: *mut GcBox<dyn Traceable> = gc_box;
-            let mut gc = self.inner.borrow_mut();
-            gc.alloc_count += 1;
-            if let Some(head) = &mut gc.head {
-                (*gc_box_dyn)
-                    .next
-                    .set(Some(NonNull::new(head.as_ptr()).unwrap()));
-            }
-            gc.head = Some(NonNull::new(gc_box_dyn).unwrap());
-        }
-        Gc {
-            ptr: NonNull::new(gc_box).unwrap(),
-        }
-    }
-    pub(crate) fn trace_ptr<T: Traceable + ?Sized + 'static>(&self, obj: Gc<T>) {
-        unsafe {
-            let ptr = obj.ptr;
-            let gc_box = ptr.as_ref();
-            // println!("tracing object {:0x} {}", obj.as_ptr().cast::<()>() as u64, gc_box.marked.get());
-            if !gc_box.marked.get() {
-                gc_box.marked.set(true);
-                return obj.trace(self);
-            }
-        }
-    }
-    pub fn trace<T: Traceable + ?Sized + 'static>(&self, obj: &T) {
-        obj.trace(self);
-    }
-    pub fn new() -> Self {
-        Self {
-            inner: RefCell::new(GcInner {
-                head: None,
-                lock: 0,
-                alloc_count:0,
-            }),
-        }
-    }
-    pub fn lock(self: &Rc<GcState>) -> GcLockGuard {
-        self.inner.borrow_mut().lock += 1;
-        GcLockGuard { gc: self.clone() }
-    }
-
-    pub(crate) fn start_trace(&self) {}
-    pub(crate) fn end_trace(&self) {}
-    pub(crate) fn collect(&self, force: bool) {
-        let mut gc = self.inner.borrow_mut();
-        assert!(!force || gc.lock == 0);
-        let mut cur = gc.head;
-        let mut prev: Option<NonNull<GcBox<dyn Traceable>>> = None;
-        // println!("collecting");
-        unsafe {
-            while let Some(p) = cur {
-                let object = p.as_ref();
-                let next = object.next.get();
-                if !object.marked.get() {
-                    if cur == gc.head {
-                        gc.head = next;
-                    } else {
-                        let prev = prev.unwrap().as_ref();
-                        prev.next.set(next);
+            self.alloc_count.fetch_add(1, Ordering::Relaxed);
+            let trace_object = &*ptr_dyn.0;
+            // trace_object.header.next.set(gc.head.0 as usize);
+            let mut old_head = self.head.load(Ordering::Acquire);
+            loop {
+                trace_object.header.next.store(old_head, Ordering::Relaxed);
+                match self.head.compare_exchange_weak(
+                    old_head,
+                    ptr_dyn.0 as usize,
+                    Ordering::Acquire,
+                    Ordering::Relaxed,
+                ) {
+                    Err(x) => {
+                        old_head = x;
                     }
-                    // println!("collected object {:0x}", p.as_ptr().cast::<()>() as u64);
-                    Box::from_raw(p.as_ptr());
-                } else {
-                    object.marked.set(false);
-                    prev = cur;
+                    Ok(_) => {
+                        break;
+                    }
                 }
-                cur = next;
             }
+        }
+        Gc { ptr }
+    }
+    pub(crate) fn push_ptr(&self, ptr: PtrTraceable) {
+        let mut trace_list = self.trace_list.write();
+        trace_list.push(ptr);
+    }
+    pub(crate) fn mark_ptr(&self, ptr: PtrTraceable) -> bool {
+        unsafe {
+            let gc_box = &*ptr.0;
+            let color = &gc_box.header.color;
+            if color.load(Ordering::Relaxed) == Color::Black as u8 {
+                return false;
+            }
+
+            let need_scan = match color.compare_exchange(
+                Color::White as u8,
+                Color::Grey as u8,
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => true,
+                Err(color) => {
+                    if color == Color::Black as u8 {
+                        return false;
+                    }
+                    false
+                }
+            };
+            // grey
+            // some other thread is scanning the object
+            if !need_scan {
+                return false;
+            }
+            true
+        }
+    }
+    // pub(crate) fn trace_ptr<T: Traceable + 'static>(&self, obj: Gc<T>, defer: bool) {
+    //     self.trace_raw_ptr(PtrTraceable(obj.ptr as *const TraceableObejct), defer)
+    //     // self.trace_raw_ptr(PtrTraceable(obj.ptr as *const TraceableObejct));
+    //     // let mutself.trace_list
+    //     // .push(PtrTraceable(obj.ptr as *const TraceableObejct));
+    // }
+
+    pub fn new(pid: usize) -> Self {
+        Self {
+            pid,
+            head: AtomicUsize::new(0),
+            alloc_count: AtomicUsize::new(0),
+            trace_list: RwLock::new(Vec::new()),
         }
     }
 }
-impl Drop for GcState {
-    fn drop(&mut self) {
-        self.collect(true);
+impl Drop for Heap {
+    fn drop(&mut self) {}
+}
+
+struct GcState {
+    heaps: Vec<Heap>,
+}
+
+impl GcState {
+    fn new() -> Self {
+        let n_cpus = num_cpus::get();
+        let heaps = (0..n_cpus).map(|pid| Heap::new(pid)).collect();
+        Self { heaps }
     }
+}
+lazy_static! {
+    static ref GC: GcState = GcState::new();
+}
+static THREAD_ID_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+thread_local! {
+    static THREAD_ID:usize = THREAD_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
+}
+
+pub(crate) fn gc_new<T: Traceable + 'static>(object: T) -> Gc<T> {
+    let heap_id = THREAD_ID.with(|tid| *tid % GC.heaps.len());
+    let heap = &GC.heaps[heap_id];
+    heap.allocate(object)
 }

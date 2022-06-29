@@ -1,0 +1,18 @@
+trait Iterator{
+    type Item
+    def next(self)->Item?
+    def map[T](self, f:(Self.Item)->T) -> Iterator[Item=T] {        
+        Map(f)
+    }
+}
+class Map : Iterator{
+    type Iterator.Item = T
+    var f:(Self.Item)->T
+    def init(self, f){
+        self.f = f
+    }
+    def next(self) {
+        var next = self.next()
+        self.f(next?)
+    }
+}

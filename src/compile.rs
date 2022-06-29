@@ -1,27 +1,28 @@
 use std::{
-    cell::{Ref, RefCell},
-    collections::{BTreeMap, HashMap, HashSet},
+    cell::Cell,
+    collections::{HashMap, HashSet},
     convert::TryInto,
-    fmt::format,
+    hash::Hash,
+    ops::Range,
     rc::Rc,
     vec,
 };
 
 use crate::{
-    bytecode::*,
-    closure::ClosurePrototype,
-    debug_println, log_2,
-    parse::{Expr, FunctionName, SourceLocation, Stmt, TableField, Token},
-    state::MAX_LOCALS,
+    get_3xu8,
+    parse::{Expr, FunctionName, SourceLocation, Stmt, Token},
+    u32_from_3xu8,
+    vm::{BinaryOp, ByteCodeModule, CompiledFunction, Instruction, LoadConst, MAX_REG},
 };
 
 #[derive(Clone, Copy, Debug)]
 pub enum ErrorKind {
     ParseOrTokenizeError,
-    TooManyLocals,
+    NotEnoughRegisters,
     OutOfMemoryError,
     SemanticError,
     InternalError,
+    NameError,
 }
 
 #[derive(Clone, Debug)]
@@ -31,299 +32,221 @@ pub struct CompileError {
     pub loc: SourceLocation,
 }
 #[derive(Clone, Copy, Debug)]
+pub(crate) enum UpValueInfo {
+    Parent { id: u32, location: u32 },
+    Child { id: u32, parent_location: u32 },
+}
+#[derive(Clone, Copy, Debug)]
 struct VarInfo {
     func_scope: usize,
     location: u32,
     uid: u32,
-    // is_on_stack: bool,
-    is_upvalue: bool,
+    is_onstack: bool,
+    is_upvalue: Option<UpValueInfo>,
+    // is_optional: bool,
+    is_const: bool,
+}
+
+struct SymbolTableScope {
+    vars: HashMap<String, VarInfo>,
+}
+impl SymbolTableScope {
+    fn new() -> Self {
+        Self {
+            vars: HashMap::new(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Reg {
+    Unused,
+    Local,
+    Used,
+}
+
+struct RegAllocator {
+    regs: [Reg; MAX_REG],
+    max_reg_usized: usize,
+}
+
+impl RegAllocator {
+    // allocate n contiguous registers
+    fn allocate(&mut self, n: usize) -> Option<Range<usize>> {
+        for i in 0..MAX_REG {
+            if (i..i + n).all(|x| self.regs[x] == Reg::Unused) {
+                for j in i..i + n {
+                    self.regs[j] = Reg::Used;
+                }
+                self.max_reg_usized = self.max_reg_usized.max(i + n);
+                return Some(i..i + n);
+            }
+        }
+        None
+    }
+    fn free_all(&mut self) {
+        for r in &mut self.regs {
+            if *r != Reg::Local {
+                *r = Reg::Unused;
+            }
+        }
+    }
+    fn free_one(&mut self, i: usize) {
+        if self.regs[i] != Reg::Local {
+            self.regs[i] = Reg::Unused;
+        }
+    }
+    fn free(&mut self, range: Range<usize>) {
+        for i in range {
+            assert!(self.regs[i] == Reg::Used);
+            self.regs[i] = Reg::Unused;
+        }
+    }
+}
+
+struct PerFunctionSymbolTable {
+    scopes: Vec<SymbolTableScope>,
+    nlocals: usize,
+    upvalues: Vec<UpValueInfo>,
+    reg_alloc: RegAllocator,
+}
+
+impl PerFunctionSymbolTable {
+    fn new() -> Self {
+        Self {
+            nlocals: 0,
+            upvalues: vec![],
+            scopes: vec![SymbolTableScope::new()],
+            reg_alloc: RegAllocator {
+                regs: [Reg::Unused; MAX_REG],
+                max_reg_usized: 0,
+            },
+        }
+    }
+    fn push(&mut self) {
+        self.scopes.push(SymbolTableScope::new())
+    }
+    fn pop(&mut self) {
+        self.scopes.pop().unwrap();
+    }
+    fn get_mut<'a>(&'a mut self, var: &String) -> Option<&'a mut VarInfo> {
+        for scope in self.scopes.iter_mut().rev() {
+            if let Some(info) = scope.vars.get_mut(var) {
+                return Some(info);
+            }
+        }
+        None
+    }
+    fn get(&self, var: &String) -> Option<VarInfo> {
+        for scope in self.scopes.iter().rev() {
+            if let Some(info) = scope.vars.get(var) {
+                return Some(*info);
+            }
+        }
+        None
+    }
+    fn add(&mut self, var: String, info: VarInfo) {
+        self.scopes.last_mut().unwrap().vars.insert(var, info);
+    }
+}
+thread_local! {
+    static UID_GEN:Cell<u32> = Cell::new(0);
+}
+fn gen_uid() -> u32 {
+    UID_GEN.with(|c| {
+        let id = c.get();
+        c.set(id + 1);
+        id
+    })
 }
 struct SymbolTable {
-    vars: HashMap<String, VarInfo>,
-    n_locals: usize,
-    func_scope: usize,
-    parent: *mut SymbolTable,
-}
-#[derive(Clone, Copy)]
-struct CompileExprExtra {
-    n_expect_values: u8,
-}
-impl Default for CompileExprExtra {
-    fn default() -> Self {
-        Self { n_expect_values: 1 }
-    }
+    functions: Vec<PerFunctionSymbolTable>,
 }
 impl SymbolTable {
-    fn set(&mut self, var: String, info: VarInfo) {
-        self.vars.insert(var, info);
+    fn allocator(&mut self) -> &mut RegAllocator {
+        &mut self.functions.last_mut().unwrap().reg_alloc
     }
-    fn get_cur<'a>(&'a mut self, var: &String) -> Option<&'a mut VarInfo> {
-        if let Some(info) = self.vars.get_mut(var) {
-            Some(info)
-        } else {
-            unsafe {
-                if let Some(parent) = self.parent.as_mut() {
-                    if parent.func_scope == self.func_scope {
-                        parent.get_cur(var)
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
-            }
-        }
+    fn get_mut<'a>(&'a mut self, var: &String) -> Option<&'a mut VarInfo> {
+        self.functions.last_mut().unwrap().get_mut(var)
     }
-    fn get_prev<'a>(&'a mut self, var: &String) -> Option<&'a mut VarInfo> {
-        unsafe {
-            if let Some(parent) = self.parent.as_mut() {
-                if parent.func_scope == self.func_scope {
-                    parent.get_prev(var)
-                } else if parent.func_scope == self.func_scope - 1 {
-                    parent.get_cur(var)
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
-        }
+    fn get(&self, var: &String) -> Option<VarInfo> {
+        self.functions.last().unwrap().get(var)
     }
-    fn get<'a>(&'a self, var: &String) -> Option<&'a VarInfo> {
-        if let Some(info) = self.vars.get(var) {
-            Some(info)
-        } else {
-            unsafe {
-                if let Some(parent) = self.parent.as_ref() {
-                    parent.get(var)
-                } else {
-                    None
-                }
-            }
-        }
+    fn add_var(&mut self, var: String) -> u8 {
+        let scope = self.functions.len();
+        let f = self.functions.last_mut().unwrap();
+        f.add(
+            var,
+            VarInfo {
+                is_onstack: true,
+                func_scope: scope,
+                location: f.nlocals as u32,
+                uid: gen_uid(),
+                is_upvalue: None,
+                is_const: false,
+            },
+        );
+        let r = f.nlocals as u8;
+        f.nlocals += 1;
+        r
     }
-    // fn get_mut<'a>(&'a mut self, var: &String) -> Option<&'a mut VarInfo> {
-    //     if let Some(info) = self.vars.get_mut(var) {
-    //         Some(info)
-    //     } else {
-    //         unsafe {
-    //             if let Some(parent) = self.parent.as_mut() {
-    //                 if parent.func_scope == self.func_scope {
-    //                     parent.get_mut(var)
-    //                 } else {
-    //                     None
-    //                 }
-    //             } else {
-    //                 None
-    //             }
-    //         }
-    //     }
-    // }
 }
-enum FunctionLocation {
-    Local,
-    Global,
-    Stack,
-    Repl,
-}
-#[derive(Clone, Debug)]
-pub(crate) struct UpValueInfo {
-    pub(crate) from_parent: bool,
-    pub(crate) id: u32,
-    pub(crate) uid: u32,
-    pub(crate) location: u32,
-    pub(crate) is_special: bool,
-    pub(crate) name: String,
-}
-struct FuncInfo {
-    upvalues: HashMap<u32, UpValueInfo>,
-}
+
 struct Compiler {
+    cur_function: Option<CompiledFunction>,
+    string_cache: HashMap<String, usize>,
+    module: Option<ByteCodeModule>,
     symbols: SymbolTable,
-    funcs: Vec<FuncInfo>,
-    module: ByteCodeModule,
-    str_map: HashMap<String, usize>,
-    var_uid_gen: u32,
-    label_gen: u32,
-    labels: HashMap<u32, usize>,
-    break_labels: Vec<u32>,
+    labels: HashMap<u32, u32>,
+    label_cnt: u32,
+    loop_labels: Vec<(u32, u32)>,
 }
-macro_rules! compile_assign_impl {
-    ($self:expr, $loc:expr, $lhs:expr, $rhs:expr, $is_local_var_def:expr,$handle_var_def:expr, $compile_lhs:expr) => {{
-        let loc = $loc;
-        let lhs = $lhs;
-        let rhs = $rhs;
-        let is_local_var_def = $is_local_var_def;
-        if lhs.len() >= u8::MAX as usize - 1 || rhs.len() >= u8::MAX as usize - 1 {
-            return Err(CompileError {
-                loc: loc.clone(),
-                kind: ErrorKind::TooManyLocals,
-                msg: "number of variables in assignment exceed limit (u8::MAX - 1)".into(),
-            });
-        }
-        let n_vars = lhs.len();
-        let is_last_expr_call = if let Some(e) = rhs.last() {
-            match &**e {
-                Expr::CallExpr { .. } => true,
-                Expr::MethodCallExpr { .. } => true,
-                _ => false,
-            }
-        } else {
-            false
-        };
-        for (i, e) in rhs.iter().enumerate() {
-            if i + 1 < rhs.len() {
-                $self.compile_expr(e, Default::default())?;
-            } else {
-                if n_vars >= rhs.len() {
-                    $self.compile_expr(
-                        e,
-                        CompileExprExtra {
-                            n_expect_values: (n_vars + 1 - rhs.len()) as u8,
-                        },
-                    )?;
-                } else {
-                    $self.compile_expr(e, Default::default())?;
-                    $self.emit(ByteCode::Op(OpCode::Pop));
-                }
-            }
-        }
-        if !is_last_expr_call && rhs.len() < n_vars {
-            for _ in rhs.len()..n_vars {
-                $self.emit(ByteCode::Op(OpCode::LoadNil));
-            }
-        }
-        if is_local_var_def {
-            for var in lhs {
-                ($handle_var_def)($self, var)?;
-            }
-        }
-        for var in lhs.iter().rev() {
-            ($compile_lhs)($self, var)?;
-        }
-        // Ok(())
-    }};
+
+#[derive(Clone, Copy)]
+struct CompileExprArgs {
+    // optional_unwrap_label: Option<u32>,
+    result_reg: Option<usize>,
+}
+impl Default for CompileExprArgs {
+    fn default() -> Self {
+        Self { result_reg: None }
+    }
+}
+
+#[derive(Clone, Debug)]
+enum LValue {
+    Local(u8),
+    UpValue(u32),
+    Global(String),
+    TableAssign(u8, u8),
+    TableKeyAssign(u8, String),
+    // ListAssign(u8, u8),
+}
+
+#[derive(Clone, Copy)]
+struct CompileExprRets {
+    reg: usize,
 }
 impl Compiler {
-    fn emit(&mut self, inst: ByteCode) {
-        // let ret = self.module.code.len();
-        self.module.code.push(inst);
-        // ret
-    }
     fn new_label(&mut self) -> u32 {
-        let l = self.label_gen;
-        self.label_gen += 1;
-        l
+        let i = self.label_cnt;
+        self.label_cnt += 1;
+        i
     }
     fn emit_label(&mut self, l: u32) {
-        self.labels.insert(l, self.module.code.len());
+        self.labels
+            .insert(l, self.cur_function.as_ref().unwrap().code.len() as u32);
     }
-    fn push_number(&mut self, n: f64) {
-        let bytes = n.to_le_bytes();
 
-        self.emit(ByteCode::Op(OpCode::LoadNumber));
-        self.emit(ByteCode::FloatLo([bytes[0], bytes[1], bytes[2], bytes[3]]));
-        self.emit(ByteCode::FloatHi([bytes[4], bytes[5], bytes[6], bytes[7]]));
-    }
-    fn string_pool_index(&mut self, s: &String) -> u32 {
-        let idx = if let Some(idx) = self.str_map.get(s) {
-            *idx
-        } else {
-            let idx = self.module.string_pool.len();
-            self.module.string_pool.push(s.clone());
-            self.str_map.insert(s.clone(), idx);
-            idx
-        } as u32;
-        idx
-    }
-    fn push_string(&mut self, s: &String) {
-        let idx = self.string_pool_index(s);
-        let bytes = idx.to_le_bytes();
-        assert!(bytes[3] == 0);
-        self.emit(ByteCode::Op3U8(
-            OpCode::LoadStr,
-            [bytes[0], bytes[1], bytes[2]],
-        ));
-    }
-    fn resolve_upvalue(&mut self, name: &String) {
-        if let Some(info) = self.symbols.get(name).map(|x| *x) {
-            if info.func_scope != self.funcs.len() {
-                // println!("{} is upvalue", name);
-                // is a upvalue
-                let mut p = &mut self.symbols as *mut SymbolTable;
-                let mut tables = vec![];
-                unsafe {
-                    while let Some(tab) = p.as_mut() {
-                        tables.push(p);
-                        if tab.func_scope < info.func_scope {
-                            break;
-                        }
-
-                        if tab.func_scope == info.func_scope {
-                            // the locals of that function
-
-                            let func = &mut self.funcs[tab.func_scope - 1];
-                            if !func.upvalues.contains_key(&info.uid) {
-                                debug_println!("local upvalue {}", name);
-                                let id = func.upvalues.len() as u32;
-                                let info = tab.get_cur(name).unwrap_or_else(|| {
-                                    panic!("{}", name);
-                                });
-                                func.upvalues.insert(
-                                    info.uid,
-                                    UpValueInfo {
-                                        from_parent: false,
-                                        id,
-                                        uid: info.uid,
-                                        location: info.location,
-                                        is_special: false,
-                                        name: name.clone(),
-                                    },
-                                );
-                            }
-                            break;
-                        }
-
-                        p = tab.parent;
-                    }
-                    tables.reverse();
-                    for p in tables {
-                        let tab = p.as_mut().unwrap();
-                        if tab.func_scope > info.func_scope {
-                            assert!(tab.func_scope <= self.funcs.len());
-                            let func = &mut *self.funcs.as_mut_ptr().add(tab.func_scope - 1);
-
-                            if !func.upvalues.contains_key(&info.uid) {
-                                let prev_func = &mut self.funcs[tab.func_scope - 2];
-                                let id = func.upvalues.len() as u32;
-                                let info = *tab.get_prev(name).unwrap();
-                                let location = prev_func.upvalues.get(&info.uid).unwrap().id;
-                                func.upvalues.insert(
-                                    info.uid,
-                                    UpValueInfo {
-                                        from_parent: true,
-                                        id,
-                                        uid: info.uid,
-                                        location,
-                                        is_special: false,
-                                        name: name.clone(),
-                                    },
-                                );
-                                tab.set(
-                                    name.clone(),
-                                    VarInfo {
-                                        func_scope: tab.func_scope,
-                                        location: id,
-                                        uid: info.uid,
-                                        // is_on_stack: false,
-                                        is_upvalue: true,
-                                    },
-                                )
-                            }
-                        }
-                    }
-                }
-            }
+    fn new() -> Self {
+        Self {
+            loop_labels: vec![],
+            cur_function: None,
+            labels: HashMap::new(),
+            module: None,
+            string_cache: HashMap::new(),
+            symbols: SymbolTable { functions: vec![] },
+            label_cnt: 0,
         }
     }
     fn is_string_literal(expr: &Expr) -> bool {
@@ -338,525 +261,747 @@ impl Compiler {
         }
         false
     }
-    fn is_identifier(expr: &Expr) -> bool {
-        match expr {
-            Expr::Identifier { .. } => true,
-            _ => false,
+
+    fn alloc_reg(&mut self) -> usize {
+        match self.symbols.allocator().allocate(1) {
+            Some(x) => x.start,
+            None => panic!("not enough registers"),
         }
     }
-    fn load_identifier(&mut self, name: &String) -> Result<(), CompileError> {
-        self.resolve_upvalue(name);
-        if let Some(info) = self.symbols.get(name).map(|x| *x) {
-            if info.is_upvalue {
-                self.emit(ByteCode::Op3U8(
-                    OpCode::LoadUpvalue,
-                    get_3xu8(info.location),
-                ));
-            } else {
-                self.emit(ByteCode::Op3U8(OpCode::LoadLocal, get_3xu8(info.location)));
-            }
-        } else {
-            // self.push_string(name);
-            let idx = self.string_pool_index(name);
-            let info = *self.symbols.get(&"_ENV".into()).unwrap();
-            if info.is_upvalue {
-                self.emit(ByteCode::Op3U8(
-                    OpCode::LoadUpvalue,
-                    get_3xu8(info.location),
-                ));
-            } else {
-                self.emit(ByteCode::Op3U8(OpCode::LoadLocal, get_3xu8(info.location)));
-            }
-            // self.emit(ByteCode::Op(OpCode::LoadTable));
-            self.emit(ByteCode::Op3U8(OpCode::LoadTableStringKey, get_3xu8(idx)));
+    fn alloc_reg_n(&mut self, n: usize) -> Range<usize> {
+        match self.symbols.allocator().allocate(n) {
+            Some(x) => x,
+            None => panic!("not enough registers"),
         }
+    }
+    fn alloc_reg_if_need(&mut self, arg: CompileExprArgs) -> usize {
+        if let Some(r) = arg.result_reg {
+            r
+        } else {
+            self.alloc_reg()
+        }
+    }
+    fn emit(&mut self, inst: Instruction) {
+        self.cur_function.as_mut().unwrap().code.push(inst);
+    }
+    fn push_float(&mut self, x: f64, reg: usize) {
+        let bytes = x.to_le_bytes();
+        self.emit(Instruction::LoadFloat {
+            dst: reg as u8,
+            bytes: [bytes[0], bytes[1]],
+        });
+        self.emit(Instruction::Byte([bytes[2], bytes[3], bytes[4]]));
+        self.emit(Instruction::Byte([bytes[5], bytes[6], bytes[7]]));
+    }
+    fn push_int(&mut self, x: i64, reg: usize) {
+        let bytes = x.to_le_bytes();
+        self.emit(Instruction::LoadInt {
+            dst: reg as u8,
+            bytes: [bytes[0], bytes[1]],
+        });
+        self.emit(Instruction::Byte([bytes[2], bytes[3], bytes[4]]));
+        self.emit(Instruction::Byte([bytes[5], bytes[6], bytes[7]]));
+    }
+    // fn resolve_identifier(&mut self, name:&String)->Result<CompileExprRets, CompileError> {
+
+    // }
+    fn push_string(&mut self, s: String, reg: usize) {
+        let i = self.add_string(s.clone());
+        self.emit(Instruction::LoadString {
+            dst: reg as u8,
+            str_id: i as u16,
+        });
+    }
+    fn add_string(&mut self, s: String) -> usize {
+        if let Some(i) = self.string_cache.get(&s) {
+            *i
+        } else {
+            let i = self.module.as_mut().unwrap().string_pool.len();
+            self.string_cache.insert(s.clone(), i);
+            self.module.as_mut().unwrap().string_pool.push(s);
+            i
+        }
+    }
+    fn load_global(&mut self, name: &String, reg: usize) -> Result<(), CompileError> {
+        let i = self.add_string(name.clone());
+        self.emit(Instruction::LoadGlobal {
+            dst: reg as u8,
+            name_id: i as u16,
+        });
         Ok(())
     }
-    fn compile_expr(&mut self, expr: &Expr, ext: CompileExprExtra) -> Result<(), CompileError> {
-        match expr {
-            Expr::ParenExpr { expr, .. } => {
-                self.compile_expr(expr, CompileExprExtra { n_expect_values: 1 })
+    fn store_global(&mut self, name: &String, reg: usize) -> Result<(), CompileError> {
+        let i = self.add_string(name.clone());
+        self.emit(Instruction::StoreGlobal {
+            src: reg as u8,
+            name_id: i as u16,
+        });
+        Ok(())
+    }
+    fn resolve_upvalue(&mut self, name: &String) {
+        if self.symbols.get(name).is_some() {
+            return;
+        }
+
+        let mut idx = None;
+        let mut parent_location = 0;
+        for i in (0..self.symbols.functions.len()).rev() {
+            let table = &mut self.symbols.functions[i];
+            let b = table.get(name).is_some();
+            let id = table.upvalues.len() as u32;
+            if let Some(info) = table.get_mut(name) {
+                assert!(b);
+                idx = Some(i);
+                info.is_upvalue = Some(UpValueInfo::Parent {
+                    id,
+                    location: info.location,
+                });
+                parent_location = info.location;
+            } else {
+                assert!(!b);
             }
-            Expr::VarArgs { token: _ } => self.load_identifier(&"...".into()),
-            Expr::Const { token } => match token {
-                Token::Keyword { value, .. } => {
-                    match value.as_str() {
-                        "nil" => {
-                            self.emit(ByteCode::Op(OpCode::LoadNil));
-                        }
-                        "true" => {
-                            self.emit(ByteCode::Op(OpCode::LoadTrue));
-                        }
-                        "false" => {
-                            self.emit(ByteCode::Op(OpCode::LoadFalse));
-                        }
-                        _ => unreachable!(),
+            if b {
+                // println!("{} is upvalue",name);
+                table.upvalues.push(UpValueInfo::Parent {
+                    id,
+                    location: parent_location,
+                });
+                parent_location = id;
+                break;
+            }
+        }
+        if idx.is_none() {
+            return;
+        }
+
+        let idx = idx.unwrap();
+        for i in idx + 1..self.symbols.functions.len() {
+            let f = &mut self.symbols.functions[i];
+            let loc = f.upvalues.len();
+            f.upvalues.push(UpValueInfo::Child {
+                id: loc as u32,
+                parent_location,
+            });
+            f.add(
+                name.clone(),
+                VarInfo {
+                    func_scope: i,
+                    location: loc as u32,
+                    uid: gen_uid(),
+                    is_onstack: false,
+                    is_upvalue: Some(UpValueInfo::Child {
+                        id: loc as u32,
+                        parent_location,
+                    }),
+                    is_const: false,
+                },
+            );
+            parent_location = loc as u32;
+        }
+    }
+    fn load_identifier(
+        &mut self,
+        name: &String,
+        args: CompileExprArgs,
+    ) -> Result<CompileExprRets, CompileError> {
+        self.resolve_upvalue(name);
+
+        if let Some(v) = self.symbols.get(name) {
+            if v.is_upvalue.is_none() || v.is_onstack {
+                let r = if args.result_reg.is_some() {
+                    let r = args.result_reg.unwrap();
+                    self.emit(Instruction::Move {
+                        dst: r as u8,
+                        src: v.location as u8,
+                    });
+                    r
+                } else {
+                    v.location as usize
+                };
+                Ok(CompileExprRets { reg: r })
+            } else {
+                let r = self.alloc_reg_if_need(args);
+                self.emit(Instruction::LoadUpvalue {
+                    dst: r as u8,
+                    upvalue: v.location as u8,
+                });
+                Ok(CompileExprRets { reg: r })
+            }
+        } else {
+            let r = self.alloc_reg_if_need(args);
+            self.load_global(name, r)?;
+            Ok(CompileExprRets { reg: r })
+        }
+    }
+    fn compile_expr(
+        &mut self,
+        expr: &Rc<Expr>,
+        args: CompileExprArgs,
+    ) -> Result<CompileExprRets, CompileError> {
+        match &**expr {
+            Expr::VarArgs { token } => todo!(),
+            Expr::Const { token } => {
+                let r = self.alloc_reg_if_need(args);
+                match token.to_string().as_str() {
+                    "nil" => {
+                        self.emit(Instruction::LoadConst(LoadConst::Nil, r as u8));
                     }
-                    Ok(())
+                    "true" => {
+                        self.emit(Instruction::LoadConst(LoadConst::True, r as u8));
+                    }
+                    "false" => {
+                        self.emit(Instruction::LoadConst(LoadConst::False, r as u8));
+                    }
+                    _ => unreachable!(),
                 }
-                _ => unreachable!(),
-            },
+                Ok(CompileExprRets { reg: r })
+            }
             Expr::Literal { token } => match token {
                 Token::Number { value, .. } => {
-                    self.push_number(*value);
-                    Ok(())
+                    let r = self.alloc_reg_if_need(args);
+                    // match value {
+                    //     Number::Float(x) => {
+                    //         self.push_float(*x, r);
+                    //     }
+                    //     Number::Int(x) => {
+                    //         self.push_int(*x, r);
+                    //     }
+                    // }
+                    self.push_float(*value, r);
+                    Ok(CompileExprRets { reg: r })
                 }
                 Token::String { value, .. } => {
-                    self.push_string(value);
-                    Ok(())
+                    let r = self.alloc_reg_if_need(args);
+                    self.push_string(value.clone(), r);
+                    Ok(CompileExprRets { reg: r })
                 }
                 _ => unreachable!(),
             },
             Expr::Identifier { token } => {
-                let name = match token {
-                    Token::Identifier { value, .. } => value,
-                    _ => unreachable!(),
-                };
-                self.load_identifier(name)?;
-                Ok(())
+                self.load_identifier(token.as_identifier().unwrap(), args)
             }
             Expr::BinaryExpr { op, lhs, rhs } => {
-                let opcode = match op {
-                    Token::Keyword { value, .. } => match value.as_str() {
-                        "and" => {
-                            self.compile_expr(lhs, Default::default())?;
-                            self.emit(ByteCode::Op3U8(OpCode::TestJump, [0, 0, 1]));
-                            let l = self.new_label();
-                            self.emit(ByteCode::Label(l.to_le_bytes()));
-                            self.compile_expr(rhs, Default::default())?;
-                            self.emit_label(l);
-                            return Ok(());
+                let op = op.to_string();
+                let op = match op.as_str() {
+                    "+" => BinaryOp::Add,
+                    "-" => BinaryOp::Sub,
+                    "*" => BinaryOp::Mul,
+                    "/" => BinaryOp::Div,
+                    "**" => BinaryOp::Pow,
+                    "%" => BinaryOp::Mod,
+                    "^" => BinaryOp::Xor,
+                    "&" => BinaryOp::BitwiseAnd,
+                    "|" => BinaryOp::BitwiseOr,
+                    "//" => BinaryOp::IDiv,
+                    "<" => BinaryOp::LessThan,
+                    "<=" => BinaryOp::LessThanEqual,
+                    ">=" => BinaryOp::GreaterThanEqual,
+                    ">" => BinaryOp::GreaterThan,
+                    "==" => BinaryOp::Equal,
+                    "~=" => BinaryOp::NotEqual,
+                    op @ ("and" | "or") => {
+                        let r = self.alloc_reg_if_need(args);
+                        let _ret_lhs = self.compile_expr(
+                            lhs,
+                            CompileExprArgs {
+                                result_reg: Some(r),
+                            },
+                        )?;
+                        let l = self.new_label();
+                        match op {
+                            "and" => {
+                                self.emit(Instruction::JumpConditional {
+                                    cond: true,
+                                    arg: r as u8,
+                                });
+                            }
+                            "or" => {
+                                self.emit(Instruction::JumpConditional {
+                                    cond: false,
+                                    arg: r as u8,
+                                });
+                            }
+                            _ => unreachable!(),
                         }
-                        "or" => {
-                            self.compile_expr(lhs, Default::default())?;
-                            self.emit(ByteCode::Op3U8(OpCode::TestJump, [1, 0, 1]));
-                            let l = self.new_label();
-                            self.emit(ByteCode::Label(l.to_le_bytes()));
-                            self.compile_expr(rhs, Default::default())?;
-                            self.emit_label(l);
-                            return Ok(());
-                        }
-                        _ => unreachable!(),
-                    },
-                    Token::Symbol { value, .. } => match value.as_str() {
-                        "+" => OpCode::Add,
-                        "-" => OpCode::Sub,
-                        "*" => OpCode::Mul,
-                        "/" => OpCode::Div,
-                        "%" => OpCode::Mod,
-                        "^" => OpCode::Pow,
-                        "&" => OpCode::And,
-                        "|" => OpCode::Or,
-                        "//" => OpCode::IDiv,
-                        "<" => OpCode::LessThan,
-                        "<=" => OpCode::LessThanEqual,
-                        ">=" => OpCode::GreaterThanEqual,
-                        ">" => OpCode::GreaterThan,
-                        "==" => OpCode::Equal,
-                        "~=" => OpCode::NotEqual,
-                        ".." => OpCode::Concat,
-                        _ => unreachable!(),
-                    },
-                    _ => unreachable!(),
-                };
+                        self.emit(Instruction::Label(get_3xu8(l)));
+                        let _ret_rhs = self.compile_expr(
+                            rhs,
+                            CompileExprArgs {
+                                result_reg: Some(r),
+                            },
+                        )?;
+                        self.emit_label(l);
 
-                self.compile_expr(lhs, Default::default())?;
-                self.compile_expr(rhs, Default::default())?;
-                self.emit(ByteCode::Op(opcode));
-                Ok(())
-            }
-            Expr::UnaryExpr { op, arg } => {
-                self.compile_expr(arg, Default::default())?;
-                let opcode = match op {
-                    Token::Symbol { value, .. } => match value.as_str() {
-                        "~" => OpCode::BitwiseNot,
-                        "-" => OpCode::Neg,
-                        "#" => OpCode::Len,
-                        _ => unreachable!(),
-                    },
-                    Token::Keyword { value, .. } if value == "not" => OpCode::Not,
-                    _ => unreachable!(),
-                };
-                self.emit(ByteCode::Op(opcode));
-                Ok(())
-            }
-            Expr::IndexExpr { loc: _, lhs, rhs } => {
-                if Self::is_string_literal(rhs) {
-                    match &**rhs {
-                        Expr::Literal {
-                            token: Token::String { value, .. },
-                        } => {
-                            let idx = self.string_pool_index(value);
-                            self.compile_expr(lhs, Default::default())?;
-                            self.emit(ByteCode::Op3U8(OpCode::LoadTableStringKey, get_3xu8(idx)));
-                        }
-                        _ => unreachable!(),
+                        return Ok(CompileExprRets { reg: r });
                     }
-                } else {
-                    self.compile_expr(rhs, Default::default())?;
-                    self.compile_expr(lhs, Default::default())?;
-                    self.emit(ByteCode::Op(OpCode::LoadTable));
-                }
-                Ok(())
-            }
-            Expr::DotExpr {
-                loc: _,
-                lhs,
-                rhs: token,
-            } => {
-                let name = match token {
-                    Token::Identifier { value, .. } => value,
-                    _ => unreachable!(),
+                    _ => unreachable!(), // ".." => BinaryOp::Concat,
                 };
-                self.push_string(name);
-
-                self.compile_expr(lhs, Default::default())?;
-                self.emit(ByteCode::Op(OpCode::LoadTable));
-                Ok(())
+                let ret_lhs = self.compile_expr(lhs, CompileExprArgs { result_reg: None })?;
+                let ret_rhs = self.compile_expr(rhs, CompileExprArgs { result_reg: None })?;
+                let r = self.alloc_reg_if_need(args);
+                self.emit(Instruction::BinaryInst {
+                    op,
+                    lhs: ret_lhs.reg as u8,
+                    rhs: ret_rhs.reg as u8,
+                    ret: r as u8,
+                });
+                Ok(CompileExprRets { reg: r })
             }
-            Expr::CallExpr { callee, args } => {
-                for (i, arg) in args.iter().rev().enumerate() {
-                    self.compile_expr(
-                        &**arg,
-                        CompileExprExtra {
-                            n_expect_values: if i == 0 { u8::MAX } else { 1 },
-                        },
-                    )?;
-                }
-                self.compile_expr(&*callee, Default::default())?;
-                self.emit(ByteCode::Op3U8(
-                    OpCode::Call,
-                    [args.len() as u8, ext.n_expect_values, 0],
-                ));
-                Ok(())
+            Expr::UnaryExpr { op, arg } => todo!(),
+            Expr::IndexExpr { loc: _, lhs, rhs } => {
+                let ret_lhs = self.compile_expr(lhs, CompileExprArgs { result_reg: None })?;
+
+                let ret_rhs = self.compile_expr(&rhs, CompileExprArgs { result_reg: None })?;
+                let r = self.alloc_reg_if_need(args);
+                self.emit(Instruction::LoadTable {
+                    table: ret_lhs.reg as u8,
+                    key: ret_rhs.reg as u8,
+                    dst: r as u8,
+                });
+                Ok(CompileExprRets { reg: r })
+            }
+            Expr::DotExpr { loc: _, lhs, rhs } => {
+                let ret_lhs = self.compile_expr(lhs, CompileExprArgs { result_reg: None })?;
+                let i = self.add_string(rhs.to_string());
+                let r = self.alloc_reg_if_need(args);
+                self.emit(Instruction::LoadTableStringKey {
+                    table: ret_lhs.reg as u8,
+                    dst: r as u8,
+                });
+                self.emit(Instruction::Byte(get_3xu8(i as u32)));
+                Ok(CompileExprRets { reg: r })
             }
             Expr::MethodCallExpr {
                 callee,
                 method,
-                args,
+                args: call_args,
             } => {
-                // todo!()
-                for (i, arg) in args.iter().rev().enumerate() {
-                    self.compile_expr(
-                        &**arg,
-                        CompileExprExtra {
-                            n_expect_values: if i == 0 { u8::MAX } else { 1 },
-                        },
-                    )?;
-                }
-                self.compile_expr(callee, Default::default())?;
-                let method = match method {
-                    Token::Identifier { value, .. } => value,
-                    _ => unreachable!(),
-                };
-                self.push_string(method);
-                self.emit(ByteCode::Op(OpCode::Self_));
-                self.emit(ByteCode::Op3U8(
-                    OpCode::Call,
-                    [args.len() as u8 + 1, ext.n_expect_values, 0],
-                ));
-                Ok(())
+                let regs = self.alloc_reg_n(call_args.len() + 2);
+                let _: Vec<_> = call_args
+                    .iter()
+                    .enumerate()
+                    .map(|(i, arg)| -> Result<CompileExprRets, CompileError> {
+                        self.compile_expr(
+                            arg,
+                            CompileExprArgs {
+                                result_reg: Some(regs.start + i + 2),
+                            },
+                        )
+                    })
+                    .collect();
+
+                let ret_lhs = self.compile_expr(
+                    callee,
+                    CompileExprArgs {
+                        result_reg: Some(regs.start + 1),
+                    },
+                )?;
+                let i = self.add_string(method.to_string());
+                self.emit(Instruction::LoadTableStringKey {
+                    table: ret_lhs.reg as u8,
+                    dst: regs.start as u8,
+                });
+                self.emit(Instruction::Byte(get_3xu8(i as u32)));
+                let r = self.alloc_reg_if_need(args);
+                self.emit(Instruction::CallMethod {
+                    arg_start: regs.start as u8,
+                    arg_end: regs.end as u8,
+                    ret: r as u8,
+                });
+                Ok(CompileExprRets { reg: r })
             }
-            Expr::FunctionExpr { loc, args, body } => {
-                self.compile_function(None, args, body, FunctionLocation::Stack)
+            Expr::CallExpr {
+                callee,
+                args: call_args,
+            } => {
+                let regs = self.alloc_reg_n(call_args.len() + 1);
+                let _: Vec<_> = call_args
+                    .iter()
+                    .enumerate()
+                    .map(|(i, arg)| -> Result<CompileExprRets, CompileError> {
+                        self.compile_expr(
+                            arg,
+                            CompileExprArgs {
+                                result_reg: Some(regs.start + i + 1),
+                            },
+                        )
+                    })
+                    .collect();
+                let _ = self.compile_expr(
+                    callee,
+                    CompileExprArgs {
+                        result_reg: Some(regs.start),
+                    },
+                )?;
+                let r = self.alloc_reg_if_need(args);
+                self.emit(Instruction::Call {
+                    arg_start: regs.start as u8,
+                    arg_end: regs.end as u8,
+                    ret: r as u8,
+                });
+                Ok(CompileExprRets { reg: r })
+            }
+            Expr::FunctionExpr {
+                loc,
+                args: f_args,
+                body,
+                ..
+            } => {
+                let r = self.alloc_reg_if_need(args);
+                let params: Vec<_> = f_args.iter().map(|x| x.to_string()).collect();
+                let id = self.compile_function(loc, &params, body)?;
+
+                self.emit(Instruction::LoadClosure {
+                    dst: r as u8,
+                    func_id: id as u16,
+                });
+                Ok(CompileExprRets { reg: r })
             }
             Expr::Table { loc: _, fields } => {
-                let array: Vec<_> = fields
-                    .iter()
-                    .filter(|f| match f {
-                        TableField::ArrayEntry(_) => true,
-                        _ => false,
-                    })
-                    .collect();
-                let table: Vec<_> = fields
-                    .iter()
-                    .filter(|f| match f {
-                        TableField::ArrayEntry(_) => false,
-                        _ => true,
-                    })
-                    .collect();
-                self.emit(ByteCode::Op3U8(
-                    OpCode::NewTable,
-                    [
-                        (array.len() as u32).to_le_bytes()[0],
-                        (table.len() as u32).to_le_bytes()[1],
-                        log_2(table.len()).unwrap_or(0).try_into().unwrap(),
-                    ],
-                ));
-                {
-                    self.emit(ByteCode::Op(OpCode::Dup));
-                    for (i, el) in array.iter().enumerate() {
-                        match el {
-                            TableField::ArrayEntry(v) => {
-                                self.compile_expr(
-                                    v,
-                                    CompileExprExtra {
-                                        n_expect_values: if i + 1 == array.len() {
-                                            u8::MAX
-                                        } else {
-                                            1
-                                        },
-                                    },
-                                )?;
-                            }
-                            _ => unreachable!(),
-                        }
-                    }
-                    self.emit(ByteCode::Op3U8(
-                        OpCode::StoreTableArray,
-                        get_3xu8(array.len() as u32),
-                    ));
-                }
-                for field in table {
-                    self.emit(ByteCode::Op(OpCode::Dup));
+                let r = self.alloc_reg_if_need(args);
+                self.emit(Instruction::NewTable {
+                    dst: r as u8,
+                    is_table: true,
+                });
+                for field in fields {
                     match field {
-                        TableField::ExprPair(k, v) => {
-                            self.compile_expr(v, Default::default())?;
-                            self.compile_expr(k, Default::default())?;
+                        crate::parse::TableField::ExprPair(k, v) => {
+                            let ret_k = self.compile_expr(k, Default::default())?;
+                            let ret_v = self.compile_expr(v, Default::default())?;
+                            self.emit(Instruction::StoreTable {
+                                table: r as u8,
+                                key: ret_k.reg as u8,
+                                value: ret_v.reg as u8,
+                            });
+                            self.symbols.allocator().free_one(ret_k.reg);
+                            self.symbols.allocator().free_one(ret_v.reg);
                         }
-                        TableField::NamePair(k, v) => {
-                            let name = match k {
-                                Token::Identifier { value, .. } => value,
-                                _ => unreachable!(),
-                            };
-                            self.compile_expr(v, Default::default())?;
-                            self.push_string(name);
+                        crate::parse::TableField::NamePair(k, v) => {
+                            let ret_v = self.compile_expr(v, Default::default())?;
+                            self.emit(Instruction::StoreTableStringKey {
+                                table: r as u8,
+                                value: ret_v.reg as u8,
+                            });
+                            let key = self.add_string(k.to_string());
+                            self.emit(Instruction::Byte(get_3xu8(key as u32)));
+                            self.symbols.allocator().free_one(ret_v.reg);
                         }
-                        TableField::ArrayEntry(x) => {
-                            unreachable!()
-                        }
-                    };
-                    self.emit(ByteCode::Op(OpCode::RotBCA));
-                    self.emit(ByteCode::Op(OpCode::StoreTable));
+                        crate::parse::TableField::ArrayEntry(_) => todo!(),
+                    }
                 }
+                Ok(CompileExprRets { reg: r })
+            }
+            Expr::ParenExpr { loc: _, expr } => self.compile_expr(expr, args),
+        }
+    }
+    fn resolve_lvalue(&mut self, e: &Rc<Expr>) -> Result<LValue, CompileError> {
+        match &**e {
+            Expr::IndexExpr { lhs, rhs, .. } => {
+                let ret_lhs = self.compile_expr(lhs, CompileExprArgs { result_reg: None })?;
+                let ret_rhs = self.compile_expr(rhs, CompileExprArgs { result_reg: None })?;
+                Ok(LValue::TableAssign(ret_lhs.reg as u8, ret_rhs.reg as u8))
+            }
+            Expr::DotExpr { lhs, rhs, .. } => {
+                let ret_lhs = self.compile_expr(lhs, CompileExprArgs { result_reg: None })?;
+                Ok(LValue::TableKeyAssign(ret_lhs.reg as u8, rhs.to_string()))
+            }
+            Expr::Identifier { token } => {
+                self.resolve_upvalue(&token.to_string());
+                if let Some(v) = self.symbols.get(&token.to_string()) {
+                    if v.is_upvalue.is_none() {
+                        return Ok(LValue::Local(v.location.try_into().unwrap()));
+                    } else {
+                        return Ok(LValue::UpValue(v.location));
+                    }
+                } else {
+                    return Ok(LValue::Global(token.to_string()));
+                }
+            }
+            _ => unreachable!(),
+        }
+    }
+    fn emit_store(&mut self, lvalue: LValue, rhs: &Rc<Expr>) -> Result<(), CompileError> {
+        match lvalue {
+            LValue::Local(r) => {
+                let _ = self.compile_expr(
+                    rhs,
+                    CompileExprArgs {
+                        result_reg: Some(r as usize),
+                    },
+                )?;
                 Ok(())
+            }
+            _=>{
+                let e = self.compile_expr(rhs, CompileExprArgs { result_reg: None })?;
+                self.emit_store2(lvalue, e.reg as u8)?;
+                Ok(())
+            }
+            // LValue::UpValue(_) => {
+            //     let e = self.compile_expr(rhs, CompileExprArgs { result_reg: None })?;
+            //     self.emit_store2(lvalue, e.reg as u8)?;
+            //     Ok(())
+            // }
+            // LValue::Global(_) => {
+            //     let e = self.compile_expr(rhs, CompileExprArgs { result_reg: None })?;
+            //     self.emit_store2(lvalue, e.reg as u8)?;
+            //     return Ok(());
+            // }
+            // LValue::TableAssign(_, _) => todo!(),
+            // LValue::TableKeyAssign(_, _) => todo!(),
+            // LValue::ListAssign(_, _) => todo!(),
+        }
+    }
+    fn emit_store2(&mut self, lvalue: LValue, rhs: u8) -> Result<(), CompileError> {
+        match lvalue {
+            LValue::Local(r) => {
+                self.emit(Instruction::Move { src: rhs, dst: r });
+                Ok(())
+            }
+            LValue::UpValue(r) => {
+                self.emit(Instruction::StoreUpvalue {
+                    src: rhs,
+                    dst: r as u8,
+                });
+                Ok(())
+            }
+            LValue::Global(v) => {
+                self.store_global(&v, rhs.try_into().unwrap())?;
+                return Ok(());
+            }
+            LValue::TableAssign(table, key) => {
+                self.emit(Instruction::StoreTable {
+                    table,
+                    key,
+                    value: rhs,
+                });
+                Ok(())
+            }
+            LValue::TableKeyAssign(table, key) => {
+                let i = self.add_string(key);
+                self.emit(Instruction::StoreTableStringKey { table, value: rhs });
+                self.emit(Instruction::Byte(get_3xu8(i as u32)));
+                Ok(())
+            } // LValue::ListAssign(_, _) => todo!(),
+        }
+    }
+    // fn emit_store(&mut self, lhs: &Rc<Expr>, rhs: &Rc<Expr>) -> Result<(), CompileError> {
+    //     match &**lhs {
+    //         Expr::Identifier { token } => {
+    //             self.resolve_upvalue(&token.str());
+    //             if let Some(v) = self.symbols.get(&token.str()) {
+    //                 if v.is_global {
+    //                     let e = self.compile_expr(rhs, CompileExprArgs { result_reg: None })?;
+    //                     self.store_global(&token.str(), e.reg)?;
+    //                     return Ok(());
+    //                 }
+    //                 if v.is_upvalue.is_none() {
+    //                     let _ = self.compile_expr(
+    //                         rhs,
+    //                         CompileExprArgs {
+    //                             result_reg: Some(v.location as usize),
+    //                         },
+    //                     )?;
+    //                 } else {
+    //                     let e = self.compile_expr(rhs, CompileExprArgs { result_reg: None })?;
+    //                     self.emit(Instruction::StoreUpvalue {
+    //                         src: e.reg as u8,
+    //                         dst: v.location as u8,
+    //                     });
+    //                 }
+    //             } else {
+    //                 return Err(CompileError {
+    //                     kind: ErrorKind::InternalError,
+    //                     msg: format!("identifier `{}` is not defined", token.str()),
+    //                     loc: lhs.loc().clone(),
+    //                 });
+    //             }
+    //             Ok(())
+    //         }
+    //         _ => unreachable!(),
+    //     }
+    // }
+    // fn emit_store2(&mut self, lhs: &Rc<Expr>, rhs: u8) -> Result<(), CompileError> {
+    //     match &**lhs {
+    //         Expr::Identifier { token } => {
+    //             self.resolve_upvalue(&token.str());
+    //             if let Some(v) = self.symbols.get(&token.str()) {
+    //                 if v.is_global {
+    //                     self.store_global(&token.str(), rhs as usize)?;
+    //                     return Ok(());
+    //                 }
+    //                 if v.is_upvalue.is_none() {
+    //                     self.emit(Instruction::Move {
+    //                         src: rhs,
+    //                         dst: v.location as u8,
+    //                     })
+    //                 } else {
+    //                     self.emit(Instruction::StoreUpvalue {
+    //                         src: rhs as u8,
+    //                         dst: v.location as u8,
+    //                     });
+    //                 }
+    //             } else {
+    //                 return Err(CompileError {
+    //                     kind: ErrorKind::InternalError,
+    //                     msg: format!("identifier `{}` is not defined", token.str()),
+    //                     loc: lhs.loc().clone(),
+    //                 });
+    //             }
+    //             Ok(())
+    //         }
+    //         _ => unreachable!(),
+    //     }
+    // }
+    fn close_upvalues(&mut self) {
+        let insts: Vec<_> = self
+            .symbols
+            .functions
+            .last()
+            .unwrap()
+            .scopes
+            .last()
+            .unwrap()
+            .vars
+            .iter()
+            .map(|(_, v)| match v.is_upvalue {
+                Some(info) => match info {
+                    UpValueInfo::Parent { id, .. } => {
+                        Some(Instruction::CloseUpvalue { dst: id as u8 })
+                    }
+                    UpValueInfo::Child { .. } => None,
+                },
+                _ => None,
+            })
+            .collect();
+        for i in insts {
+            if let Some(i) = i {
+                self.emit(i);
             }
         }
     }
-    fn add_var(&mut self, var: String) {
-        let uid = self.new_var_uid();
-        self.symbols.set(
-            var,
-            VarInfo {
-                func_scope: self.funcs.len(),
-                location: self.symbols.n_locals as u32,
-                is_upvalue: false,
-                uid,
-                // is_on_stack: true,
-            },
-        );
-        self.symbols.n_locals += 1;
-    }
-    fn compile_assign(
-        &mut self,
-        loc: &SourceLocation,
-        lhs: &Vec<Rc<Expr>>,
-        rhs: &Vec<Rc<Expr>>,
-        is_local_var_def: bool,
-    ) -> Result<(), CompileError> {
-        compile_assign_impl!(
-            self,
-            loc,
-            lhs,
-            rhs,
-            is_local_var_def,
-            |pself: &mut Self, var: &Rc<Expr>| {
-                match &**var {
-                    Expr::Identifier { token } => {
-                        let name = match token {
-                            Token::Identifier { value, .. } => value,
-                            _ => unreachable!(),
-                        };
-                        // if let None = self.symbols.get_cur(name) {
-                        pself.add_var(name.clone());
-                        // }
+    fn compile_assign(&mut self, lhs: &[Rc<Expr>], rhs: &[Rc<Expr>]) -> Result<(), CompileError> {
+        if lhs.len() == rhs.len() && lhs.len() == 1 {
+            let lvalue = self.resolve_lvalue(&lhs[0])?;
+            self.emit_store(lvalue, &rhs[0])
+        } else if lhs.len() == rhs.len() {
+            let mut regs: Vec<_> = vec![];
+            // rhs
+            //     .iter()
+            //     .map(|e| self.compile_expr(e, CompileExprArgs { result_reg: None }))
+            //     .collect();
+            for e in rhs {
+                regs.push(self.compile_expr(e, CompileExprArgs { result_reg: None })?);
+            }
+            let mut lvalues = vec![];
+            let mut conflicts = HashSet::new();
+            for lv in lhs {
+                let lvalue = self.resolve_lvalue(lv)?;
+                match &lvalue {
+                    LValue::Local(r) => {
+                        conflicts.insert(*r);
                     }
-                    _ => unreachable!(),
+                    _ => {}
+                }
+                lvalues.push(lvalue);
+            }
+            for (_, e) in regs.iter_mut().enumerate() {
+                if conflicts.contains(&(e.reg as u8)) {
+                    let reg = self.alloc_reg() as u8;
+                    self.emit(Instruction::Move {
+                        src: e.reg as u8,
+                        dst: reg,
+                    });
+                    e.reg = reg as usize;
+                }
+            }
+            for (i, e) in regs.iter().enumerate() {
+                let lvalue = lvalues[i].clone();
+                self.emit_store2(lvalue, e.reg as u8)?;
+            }
+            Ok(())
+        } else {
+            todo!()
+        }
+    }
+    fn compile_stmt(&mut self, stmt: &Rc<Stmt>) -> Result<(), CompileError> {
+        match &**stmt {
+            Stmt::Return { loc: _, expr } => {
+                if expr.len() == 1 {
+                    let r = self.compile_expr(&expr[0], CompileExprArgs { result_reg: None })?;
+                    self.emit(Instruction::Return { arg: r.reg as u8 });
+                } else if expr.is_empty() {
+                    let r = self.alloc_reg();
+                    self.emit(Instruction::LoadConst(LoadConst::Nil, r as u8));
+                    self.emit(Instruction::Return { arg: r as u8 });
+                } else {
+                    todo!()
                 }
                 Ok(())
-            },
-            |pself: &mut Self, var| { pself.emit_store(var) }
-        );
-        Ok(())
-    }
-    fn compile_stmt(&mut self, block: &Stmt) -> Result<(), CompileError> {
-        match &*block {
-            Stmt::Break { .. } => {
-                if self.break_labels.is_empty() {
+            }
+            Stmt::Break { loc } => {
+                if self.loop_labels.is_empty() {
                     return Err(CompileError {
+                        loc: loc.clone(),
                         kind: ErrorKind::SemanticError,
-                        loc: block.loc().clone(),
-                        msg: "break but be contained in loop!".into(),
+                        msg: "break statement must be inside a loop".into(),
                     });
                 } else {
-                    unsafe { self.close_upvalues_this_scope() };
-                    self.emit(ByteCode::Op(OpCode::Jump));
-                    self.emit(ByteCode::Label(
-                        self.break_labels.last().unwrap().to_le_bytes(),
-                    ));
+                    self.close_upvalues();
+                    self.emit(Instruction::Jump);
+                    self.emit(Instruction::Label(get_3xu8(
+                        self.loop_labels.last().unwrap().1,
+                    )));
                     Ok(())
                 }
             }
-            Stmt::Return { loc: _, expr } => {
-                if expr.len() == 1 {
-                    self.compile_expr(&expr[0], Default::default())?;
-                    match &*expr[0] {
-                        Expr::CallExpr { .. } => {
-                            let last = *self.module.code.last().unwrap();
-                            match last {
-                                ByteCode::Op3U8(OpCode::Call, operands) => {
-                                    *self.module.code.last_mut().unwrap() =
-                                        ByteCode::Op3U8(OpCode::TailCall, operands);
-                                        self.emit(ByteCode::Op3U8(OpCode::Return, [1, 0, 0]));
-                                    return Ok(());
-                                }
-                                _ => panic!("expected call instruction"),
+            Stmt::LocalVar { vars, .. } => match &**vars {
+                Stmt::Assign { lhs, .. } => {
+                    for var in lhs {
+                        match &**var {
+                            Expr::Identifier { token } => {
+                                let r = self.symbols.add_var(token.to_string());
+                                self.symbols.allocator().regs[r as usize] = Reg::Local;
                             }
-                        }
-                        _ => {}
-                    }
-                    self.emit(ByteCode::Op3U8(OpCode::Return, [1, 0, 0]));
-                } else if expr.is_empty() {
-                    self.emit(ByteCode::Op(OpCode::LoadNil));
-                    self.emit(ByteCode::Op3U8(OpCode::Return, [1, 0, 0]));
-                } else {
-                    for e in expr {
-                        self.compile_expr(e, Default::default())?;
-                    }
-                    // self.emit(ByteCode::Op3U8(OpCode::Pack, get_3xu8(expr.len() as u32)));
-                    self.emit(ByteCode::Op3U8(OpCode::Return, [expr.len() as u8, 0, 0]));
-                }
-                Ok(())
-            }
-            Stmt::LocalVar { loc, vars } => match &**vars {
-                Stmt::Assign { lhs, rhs, .. } => {
-                    // if lhs.len() >= u8::MAX as usize - 1 || rhs.len() >= u8::MAX as usize - 1 {
-                    //     return Err(CompileError {
-                    //         loc: loc.clone(),
-                    //         kind: ErrorKind::TooManyLocals,
-                    //         msg: "number of variables in assignment exceed limit (u8::MAX - 1)"
-                    //             .into(),
-                    //     });
-                    // }
-                    // assert!(lhs.len() == 1 && rhs.len() == 1);
-                    // self.compile_expr(&*rhs[0], Default::default())?;
-                    // for var in lhs {
-                    //     match &**var {
-                    //         Expr::Identifier { token } => {
-                    //             let name = match token {
-                    //                 Token::Identifier { value, .. } => value,
-                    //                 _ => unreachable!(),
-                    //             };
-                    //             // if let None = self.symbols.get_cur(name) {
-                    //             self.add_var(name.clone());
-                    //             // }
-                    //         }
-                    //         _ => unreachable!(),
-                    //     };
-                    // }
-                    // self.emit_store(&*lhs[0])
-                    // let n_vars = lhs.len();
-                    // for (i, e) in rhs.iter().enumerate() {
-                    //     if i + 1 < rhs.len() {
-                    //         self.compile_expr(e, Default::default())?;
-                    //     } else {
-                    //         if n_vars >= rhs.len() {
-                    //             self.compile_expr(
-                    //                 e,
-                    //                 CompileExprExtra {
-                    //                     n_expect_values: (n_vars + 1 - rhs.len()) as u8,
-                    //                 },
-                    //             )?;
-                    //         } else {
-                    //             self.compile_expr(e, Default::default())?;
-                    //             self.emit(ByteCode::Op(OpCode::Pop));
-                    //         }
-                    //     }
-                    // }
-                    // for var in lhs.iter().rev() {
-                    //     match &**var {
-                    //         Expr::Identifier { token } => {
-                    //             let name = match token {
-                    //                 Token::Identifier { value, .. } => value,
-                    //                 _ => unreachable!(),
-                    //             };
-                    //             self.add_var(name.clone());
-                    //         }
-                    //         _ => unreachable!(),
-                    //     };
-                    //     self.emit_store(var)?;
-                    // }
-                    // Ok(())
-                    self.compile_assign(loc, lhs, rhs, true)
-                }
-                Stmt::Expr { expr, .. } => match &**expr {
-                    Expr::Identifier { token, .. } => {
-                        let name = match token {
-                            Token::Identifier { value, .. } => value,
                             _ => unreachable!(),
-                        };
-                        if let None = self.symbols.get(name) {
-                            if self.symbols.n_locals >= MAX_LOCALS {
-                                return Err(CompileError {
-                                    loc: expr.loc().clone(),
-                                    kind: ErrorKind::TooManyLocals,
-                                    msg: format!(
-                                        "exceeds maximum number of {} local varibles",
-                                        MAX_LOCALS
-                                    ),
-                                });
-                            }
-                            self.add_var(name.clone());
                         }
-                        Ok(())
                     }
-                    _ => Err(CompileError {
-                        loc: expr.loc().clone(),
-                        kind: ErrorKind::SemanticError,
-                        msg: format!("invalid expression on lhs"),
-                    }),
-                },
+                    self.compile_stmt(vars)
+                }
                 _ => unreachable!(),
             },
-            Stmt::LocalFunction { name, args, body } => {
-                match name {
-                    Token::Identifier { value, .. } => {
-                        self.add_var(value.clone());
-                    }
-                    _ => unreachable!(),
-                }
-                self.compile_function(
-                    Some(&FunctionName::Function { name: name.clone() }),
-                    args,
-                    body,
-                    FunctionLocation::Local,
-                )
-            }
             Stmt::If {
-                loc,
+                loc: _,
                 cond,
                 then,
                 else_ifs,
                 else_,
             } => {
-                self.compile_expr(cond, Default::default())?;
-                self.emit(ByteCode::Op3U8(OpCode::TestJump, [0, 1, 1]));
+                let cond_r = self.compile_expr(cond, Default::default())?;
+                self.emit(Instruction::JumpConditional {
+                    cond: false,
+                    arg: cond_r.reg as u8,
+                });
+                self.symbols.allocator().free_all();
                 // let mut jmp_end = vec![];
                 let else_label = self.new_label();
                 let end = self.new_label();
-                self.emit(ByteCode::Label(else_label.to_le_bytes()));
+                self.emit(Instruction::Label(get_3xu8(else_label)));
                 self.compile_stmt(then)?;
-                self.emit(ByteCode::Op(OpCode::Jump));
-                self.emit(ByteCode::Label(end.to_le_bytes()));
+                self.emit(Instruction::Jump);
+                self.emit(Instruction::Label(get_3xu8(end)));
                 self.emit_label(else_label);
                 for (cond, then) in else_ifs {
-                    self.compile_expr(cond, Default::default())?;
-                    self.emit(ByteCode::Op3U8(OpCode::TestJump, [0, 1, 1]));
+                    let cond_r = self.compile_expr(cond, Default::default())?;
+                    self.emit(Instruction::JumpConditional {
+                        cond: false,
+                        arg: cond_r.reg as u8,
+                    });
+                    self.symbols.allocator().free_all();
                     let else_label = self.new_label();
-                    self.emit(ByteCode::Label(else_label.to_le_bytes()));
+                    self.emit(Instruction::Label(get_3xu8(else_label)));
                     self.compile_stmt(then)?;
-                    self.emit(ByteCode::Op(OpCode::Jump));
-                    self.emit(ByteCode::Label(end.to_le_bytes()));
+                    self.emit(Instruction::Jump);
+                    self.emit(Instruction::Label(get_3xu8(end)));
                     // jmp_end.push(end);
                     self.emit_label(else_label);
                 }
@@ -865,680 +1010,261 @@ impl Compiler {
                     self.compile_stmt(else_)?;
                 }
                 self.emit_label(end);
-                // {
-                //     for jmp in jmp_end {
-                //         self.emit_label(jmp);
-                //     }
-                // }
                 Ok(())
             }
-            Stmt::While { loc, cond, body } => {
-                // let start = self.module.code.len();
+            Stmt::While { loc: _, cond, body } => {
                 let begin = self.new_label();
                 self.emit_label(begin);
-                self.compile_expr(cond, Default::default())?;
-                self.emit(ByteCode::Op3U8(OpCode::TestJump, [0, 1, 1]));
-                let l = self.new_label();
-                self.break_labels.push(l);
-                self.emit(ByteCode::Label(l.to_le_bytes()));
-                self.compile_stmt(body)?;
-                self.emit(ByteCode::Op(OpCode::Jump));
-                self.emit(ByteCode::Label(begin.to_le_bytes()));
-                // self.emit(ByteCode::Address((start as u32).to_le_bytes()));
-                self.emit_label(l);
-                self.break_labels.pop();
-                Ok(())
-            }
-            Stmt::Repeat { loc, cond, body } => todo!(),
-            Stmt::For {
-                name,
-                init,
-                end,
-                step,
-                body,
-            } => {
-                let var = match name {
-                    Token::Identifier { value, .. } => value,
-                    _ => {
-                        return Err(CompileError {
-                            kind: ErrorKind::SemanticError,
-                            msg: "illegal induction variable".into(),
-                            loc: name.loc().clone(),
-                        })
-                    }
-                };
-                self.enter_scope(false);
-                self.add_var(var.clone());
-                self.compile_expr(init, Default::default())?;
-                self.store_variable(var)?;
-                let step_var = format!("##step{}", self.module.code.len());
-                self.add_var(step_var.clone());
-                let end_var = format!("##end{}", self.module.code.len());
-                self.add_var(end_var.clone());
-                self.compile_expr(end, Default::default())?;
-                self.store_variable(&end_var)?;
-                if let Some(step) = step {
-                    self.compile_expr(step, Default::default())?;
-                } else {
-                    self.push_number(1.0);
-                }
-                self.emit(ByteCode::Op(OpCode::Dup));
-                self.store_variable(&step_var)?;
-                macro_rules! gen_for_loop {
-                    ($op:ident) => {
-                        let begin = self.new_label();
-                        self.emit_label(begin);
-                        self.load_identifier(var)?;
-                        self.load_identifier(&end_var)?;
-                        self.emit(ByteCode::Op(OpCode::$op));
-                        self.emit(ByteCode::Op3U8(OpCode::TestJump, [0, 1, 1]));
-                        let l = self.new_label();
-                        self.emit(ByteCode::Label(l.to_le_bytes()));
-                        self.enter_scope(false);
-                        self.compile_stmt(body)?;
-                        self.leave_scope(false);
-                        self.load_identifier(var)?;
-                        self.load_identifier(&step_var)?;
-                        self.emit(ByteCode::Op(OpCode::Add));
-                        self.store_variable(var)?;
-                        self.emit(ByteCode::Op(OpCode::Jump));
-                        self.emit(ByteCode::Label(begin.to_le_bytes()));
-                        self.emit_label(l);
-                    };
-                }
-
-                self.push_number(0.0);
-                self.emit(ByteCode::Op(OpCode::GreaterThan));
-                self.emit(ByteCode::Op3U8(OpCode::TestJump, [0, 1, 1]));
+                let cond_r = self.compile_expr(cond, Default::default())?;
+                self.emit(Instruction::JumpConditional {
+                    cond: false,
+                    arg: cond_r.reg as u8,
+                });
                 let end = self.new_label();
-                self.break_labels.push(end);
-                let l = self.new_label();
-                self.emit(ByteCode::Label(l.to_le_bytes()));
-                gen_for_loop!(LessThanEqual);
-                self.emit(ByteCode::Op(OpCode::Jump));
-                self.emit(ByteCode::Label(end.to_le_bytes()));
-                self.emit_label(l);
-                gen_for_loop!(GreaterThanEqual);
+                self.loop_labels.push((begin, end));
+                self.emit(Instruction::Label(get_3xu8(end)));
+                self.compile_stmt(body)?;
+                self.emit(Instruction::Jump);
+                self.emit(Instruction::Label(get_3xu8(begin)));
                 self.emit_label(end);
-                self.leave_scope(false);
-                self.break_labels.pop();
+                self.loop_labels.pop();
                 Ok(())
             }
-            Stmt::ForIn { vars, range, body } => {
-                let f_var = format!("##_f{}", self.module.code.len());
-                let s_var = format!("##_s{}", self.module.code.len());
-                let ctrl_var = format!("##_var{}", self.module.code.len());
-                self.enter_scope(false);
-                let loc = block.loc();
-                let mut varnames = vec![];
-                let mut varnames_original = vec![];
-                for var in vars {
-                    match &**var {
-                        Expr::Identifier { token } => match token {
-                            Token::Identifier { value, .. } => {
-                                varnames_original.push(value);
-                                varnames.push(format!("##_{}_{}", value, self.module.code.len()));
-                                self.add_var(varnames.last().unwrap().clone());
-                            }
-                            _ => unreachable!(),
-                        },
-                        _ => {
-                            return Err(CompileError {
-                                loc: loc.clone(),
-                                kind: ErrorKind::SemanticError,
-                                msg: "generic for loop expect identifiers".into(),
+            // Stmt::Loop { body } => {
+            //     let begin = self.new_label();
+            //     self.emit_label(begin);
+            //     let end = self.new_label();
+            //     self.loop_labels.push((begin, end));
+            //     self.compile_stmt(body)?;
+            //     self.emit(Instruction::Jump);
+            //     self.emit(Instruction::Label(get_3xu8(begin)));
+            //     self.emit_label(end);
+            //     self.loop_labels.pop();
+            //     Ok(())
+            // }
+            // Stmt::For { vars, range, body } => todo!(),
+            Stmt::Assign { loc: _, lhs, rhs } => self.compile_assign(&lhs, &rhs),
+            Stmt::Expr { loc: _, expr } => {
+                self.compile_expr(
+                    expr,
+                    CompileExprArgs {
+                        // optional_unwrap_label: None,
+                        result_reg: None,
+                    },
+                )?;
+                self.symbols.allocator().free_all();
+                Ok(())
+            }
+            Stmt::Block { loc: _, stmts } => {
+                self.symbols.functions.last_mut().unwrap().push();
+                for s in stmts {
+                    self.compile_stmt(s)?;
+                    self.symbols.allocator().free_all();
+                }
+                self.close_upvalues();
+                self.symbols.functions.last_mut().unwrap().pop();
+                Ok(())
+            }
+            Stmt::LocalFunction { name, args, body } => {
+                let v = self.symbols.add_var(name.to_string());
+                let params: Vec<_> = args.iter().map(|x| x.to_string()).collect();
+                let id = self.compile_function(stmt.loc(), &params, body)?;
+                self.emit(Instruction::LoadClosure {
+                    func_id: id as u16,
+                    dst: v,
+                });
+                Ok(())
+            }
+            Stmt::Function {
+                name: func_name,
+                args,
+                body,
+                ..
+            } => {
+                let mut params: Vec<_> = args.iter().map(|x| x.to_string()).collect();
+                if let FunctionName::Method { method, .. } = func_name {
+                    if method.is_some() {
+                        params.insert(0, String::from("self"));
+                    }
+                }
+                let id = self.compile_function(stmt.loc(), &params, body)?;
+
+                if let FunctionName::Function { name } = func_name {
+                    assert!(!self.symbols.functions.is_empty());
+
+                    self.symbols.add_var(name.to_string());
+                    let reg = self.alloc_reg();
+                    self.emit(Instruction::LoadClosure {
+                        dst: reg as u8,
+                        func_id: id as u16,
+                    });
+                    self.store_global(name.as_identifier().unwrap(), reg)?;
+                } else if let FunctionName::Method {
+                    access_chain,
+                    method,
+                } = func_name
+                {
+                    let mut tables = access_chain
+                        .iter()
+                        .map(|x| x.to_string())
+                        .collect::<Vec<_>>();
+                    let name = if let Some(m) = method {
+                        m.to_string()
+                    } else {
+                        tables.pop().unwrap()
+                    };
+
+                    let dst = self.alloc_reg();
+                    let l = tables.len();
+                    for i in 0..l {
+                        if i == 0 {
+                            let _ = self.load_identifier(
+                                &tables[i],
+                                CompileExprArgs {
+                                    result_reg: Some(dst),
+                                },
+                            )?;
+                        } else {
+                            let sid = self.add_string(tables[i].to_string());
+                            self.emit(Instruction::LoadTableStringKey {
+                                table: dst as u8,
+                                dst: dst as u8,
                             });
+                            self.emit(Instruction::Byte(get_3xu8(sid as u32)));
                         }
                     }
+                    let f = self.alloc_reg();
+                    self.emit(Instruction::LoadClosure {
+                        dst: f as u8,
+                        func_id: id as u16,
+                    });
+                    let sid = self.add_string(name);
+                    self.emit(Instruction::StoreTableStringKey {
+                        table: dst as u8,
+                        value: f as u8,
+                    });
+                    self.emit(Instruction::Byte(get_3xu8(sid as u32)));
+                } else {
+                    unreachable!()
                 }
-                //  local _f, _s, _var = explist
-                compile_assign_impl!(
-                    self,
-                    loc,
-                    &vec![&f_var, &s_var, &ctrl_var],
-                    range,
-                    true,
-                    |pself: &mut Self, var: &String| {
-                        pself.add_var(var.clone());
-                        Ok(())
-                    },
-                    |pself: &mut Self, var| { pself.store_variable(var) }
-                );
-
-                let end = self.new_label();
-                let begin = self.new_label();
-                self.break_labels.push(end);
-                self.emit_label(begin);
-                self.load_identifier(&ctrl_var)?;
-                self.load_identifier(&s_var)?;
-                self.load_identifier(&f_var)?;
-                self.emit(ByteCode::Op3U8(OpCode::Call, [2, vars.len() as u8, 0])); // local var_1, ... , var_n = _f(_s, _var)
-                self.enter_scope(false);
-                for (i, var) in vars.iter().enumerate().rev() {
-                    self.add_var(varnames_original[i].clone());
-                    self.emit(ByteCode::Op(OpCode::Dup));
-                    self.store_variable(&varnames[i])?;
-                    self.emit_store(var)?;
-                }
-                self.compile_expr(&vars[0], Default::default())?;
-                self.emit(ByteCode::Op(OpCode::Dup));
-                self.store_variable(&ctrl_var)?;
-                self.emit(ByteCode::Op3U8(OpCode::TestJump, [0, 1, 1])); //  if _var == nil then break end
-                self.emit(ByteCode::Label(end.to_le_bytes()));
-
-                self.enter_scope(false);
-                self.compile_stmt(body)?;
-                self.leave_scope(false);
-                self.leave_scope(false);
-                self.emit(ByteCode::Op(OpCode::Jump));
-                self.emit(ByteCode::Label(begin.to_le_bytes()));
-                self.emit_label(end);
-                self.leave_scope(false);
-                self.break_labels.pop();
+                self.symbols.allocator().free_all();
                 Ok(())
             }
-            Stmt::Assign { loc, lhs, rhs } => {
-                // assert!(lhs.len() == 1 && rhs.len() == 1);
-                // self.compile_expr(&*rhs[0], Default::default())?;
-                // self.emit_store(&*lhs[0])
-                self.compile_assign(loc, lhs, rhs, false)
-            }
-            Stmt::Expr { loc, expr } => {
-                self.compile_expr(expr, Default::default())?;
-                self.emit(ByteCode::Op(OpCode::Pop));
-                Ok(())
-            }
-            Stmt::Block { loc, stmts } => {
-                self.enter_scope(false);
-                for stmt in stmts {
-                    self.compile_stmt(&**stmt)?;
-                }
-                self.leave_scope(false);
-                Ok(())
-            }
-            Stmt::Function { name, args, body } => {
-                self.compile_function(Some(name), args, body, FunctionLocation::Global)
-            }
+            _ => todo!(),
         }
     }
-    fn new_var_uid(&mut self) -> u32 {
-        let id = self.var_uid_gen;
-        self.var_uid_gen += 1;
-        id
+    fn enter_function(&mut self) {
+        self.symbols.functions.push(PerFunctionSymbolTable::new());
+    }
+    fn leave_function(&mut self) {
+        self.symbols.functions.pop().unwrap();
+        let f = self.cur_function.as_mut().unwrap();
+        for c in f.code.iter_mut() {
+            match *c {
+                Instruction::Label(l) => {
+                    *c = Instruction::JumpAddress(get_3xu8(
+                        *self.labels.get(&u32_from_3xu8(l)).unwrap(),
+                    ));
+                }
+                _ => {}
+            }
+        }
+        self.labels.clear();
+        self.loop_labels.clear();
     }
     fn compile_function(
         &mut self,
-        name: Option<&FunctionName>,
-        args: &Vec<Token>,
-        body: &Stmt,
-        location: FunctionLocation,
-    ) -> Result<(), CompileError> {
-        self.emit(ByteCode::Op(OpCode::Jump));
-        let end = self.new_label();
-        self.emit(ByteCode::Label(end.to_le_bytes()));
-        let entry = self.module.code.len() as u32;
-        self.enter_scope(true);
-        let tmp = std::mem::replace(&mut self.break_labels, vec![]);
-        if let None = self.symbols.get(&"_ENV".into()) {
-            let env_uid = self.new_var_uid();
-            self.symbols.set(
-                "_ENV".into(),
-                VarInfo {
-                    func_scope: self.funcs.len(),
-                    location: 0,
-                    uid: env_uid,
-                    is_upvalue: true,
-                },
-            );
-            let func = self.funcs.last_mut().unwrap();
-            func.upvalues.insert(
-                env_uid,
-                UpValueInfo {
-                    from_parent: true,
-                    id: 0,
-                    uid: env_uid,
-                    location: 0,
-                    is_special: false,
-                    name: "_ENV".into(),
-                },
-            );
-        } else {
-            self.resolve_upvalue(&"_ENV".into());
-            let info = self.symbols.get(&"_ENV".into()).unwrap();
-            assert!(info.is_upvalue);
-            let func = self.funcs.last().unwrap();
-            let info = func.upvalues.get(&info.uid).unwrap();
-            assert_eq!(info.location, 0);
-            assert!(info.from_parent);
-            assert!(info.id == 0);
-        }
-        let mut arg_offset = 0;
-        match location {
-            FunctionLocation::Global => match name.unwrap() {
-                FunctionName::Method {
-                    access_chain: _,
-                    method,
-                } => {
-                    if method.is_some() {
-                        arg_offset = 1;
-                        let uid = self.new_var_uid();
-                        self.symbols.set(
-                            "self".into(),
-                            VarInfo {
-                                func_scope: self.funcs.len(),
-                                location: 0,
-                                uid,
-                                is_upvalue: false,
-                            },
-                        );
-                    }
-                }
-                _ => {}
-            },
-            _ => {}
-        }
-        let mut has_varargs = false;
-        for (i, arg) in args.iter().enumerate() {
-            let name = match arg {
-                Token::Identifier { value, .. } => value,
-                Token::Symbol { value, .. } => {
-                    debug_assert!(value == "..." && i == args.len() - 1);
-                    has_varargs = true;
-                    value
-                }
-                _ => unreachable!(),
-            };
-            let uid = self.new_var_uid();
-            self.symbols.set(
-                name.clone(),
-                VarInfo {
-                    func_scope: self.funcs.len(),
-                    location: i as u32 + arg_offset,
-                    uid,
-                    is_upvalue: false,
-                },
-            );
-        }
-        self.symbols.n_locals = arg_offset as usize + args.len();
-        self.compile_stmt(body)?;
-        match location {
-            FunctionLocation::Repl => match *self.module.code.last().unwrap() {
-                ByteCode::Op(OpCode::Pop) => {
-                    self.module.code.pop().unwrap();
-                }
-                _ => {
-                    self.emit(ByteCode::Op(OpCode::LoadNil));
-                }
-            },
-            _ => {
-                self.emit(ByteCode::Op(OpCode::LoadNil));
-            }
-        }
-
-        self.emit(ByteCode::Op3U8(OpCode::Return, [1, 0, 0]));
-        let proto = ClosurePrototype {
-            n_args: if has_varargs {
-                args.len() - 1 + arg_offset as usize
-            } else {
-                args.len() + arg_offset as usize
-            },
-            has_varargs,
-            upvalues: {
-                let mut tmp: Vec<_> = self
-                    .funcs
-                    .last()
-                    .unwrap()
-                    .upvalues
-                    .iter()
-                    .map(|(_, info)| info.clone())
-                    .collect();
-                tmp.sort_by(|a, b| a.id.partial_cmp(&b.id).unwrap());
-                tmp
-            },
-            entry: entry as usize,
-        };
-        self.leave_scope(true);
-        let proto_idx = self.module.prototypes.len() as u32;
-        self.module.prototypes.push(proto);
-        self.emit_label(end);
-        self.emit(ByteCode::Op3U8(OpCode::NewClosure, get_3xu8(proto_idx)));
-        self.emit(ByteCode::Address(entry.to_le_bytes()));
-        match location {
-            FunctionLocation::Global => match name.unwrap() {
-                FunctionName::Method {
-                    access_chain,
-                    method,
-                } => {
-                    let access_chain: Vec<_> = access_chain
-                        .iter()
-                        .map(|x| match x {
-                            Token::Identifier { value, .. } => value,
-                            _ => unreachable!(),
-                        })
-                        .collect();
-                    let method = method.as_ref().map(|x| match x {
-                        Token::Identifier { value, .. } => value,
-                        _ => unreachable!(),
-                    });
-                    // if let Some(method) = method {
-                    //     self.push_string(method);
-                    // }
-                    // for (_i, acc) in access_chain.iter().enumerate().rev() {
-                    //     self.push_string(acc);
-                    // }
-                    // {
-                    //     let info = *self.symbols.get(&"_ENV".into()).unwrap();
-                    //     if info.is_upvalue {
-                    //         self.emit(ByteCode::Op3U8(
-                    //             OpCode::LoadUpvalue,
-                    //             get_3xu8(info.location),
-                    //         ));
-                    //     } else {
-                    //         self.emit(ByteCode::Op3U8(OpCode::LoadLocal, get_3xu8(info.location)));
-                    //     }
-                    // }
-                    self.load_identifier(&access_chain[0])?;
-                    if let Some(method) = method {
-                        assert!(access_chain.len() > 0);
-                        for (_i, acc) in access_chain.iter().enumerate().skip(1) {
-                            let idx = self.string_pool_index(*acc);
-                            self.emit(ByteCode::Op3U8(OpCode::LoadTableStringKey, get_3xu8(idx)));
-                        }
-                        let idx = self.string_pool_index(method);
-                        self.emit(ByteCode::Op3U8(OpCode::StoreTableStringKey, get_3xu8(idx)));
-                    } else {
-                        assert!(access_chain.len() > 1);
-                        for (i, acc) in access_chain.iter().enumerate().skip(1) {
-                            let idx = self.string_pool_index(*acc);
-                            if i != access_chain.len() - 1 {
-                                self.emit(ByteCode::Op3U8(
-                                    OpCode::LoadTableStringKey,
-                                    get_3xu8(idx),
-                                ));
-                            } else {
-                                self.emit(ByteCode::Op3U8(
-                                    OpCode::StoreTableStringKey,
-                                    get_3xu8(idx),
-                                ));
-                            }
-                        }
-                    }
-                }
-                FunctionName::Function { name } => match name {
-                    Token::Identifier { value, .. } => {
-                        self.push_string(value);
-                        let info = *self.symbols.get(&"_ENV".into()).unwrap();
-                        if info.is_upvalue {
-                            self.emit(ByteCode::Op3U8(
-                                OpCode::LoadUpvalue,
-                                get_3xu8(info.location),
-                            ));
-                        } else {
-                            self.emit(ByteCode::Op3U8(OpCode::LoadLocal, get_3xu8(info.location)));
-                        }
-                        self.emit(ByteCode::Op(OpCode::StoreTable));
-                    }
-                    _ => unreachable!(),
-                },
-            },
-            FunctionLocation::Local => match name.unwrap() {
-                FunctionName::Function {
-                    name: Token::Identifier { value, .. },
-                } => {
-                    self.resolve_upvalue(&value);
-                    let info = *self.symbols.get(value).unwrap();
-                    if info.is_upvalue {
-                        self.emit(ByteCode::Op3U8(
-                            OpCode::StoreUpvalue,
-                            get_3xu8(info.location),
-                        ));
-                    } else {
-                        self.emit(ByteCode::Op3U8(OpCode::StoreLocal, get_3xu8(info.location)));
-                    }
-                }
-                _ => unreachable!(),
-            },
-            FunctionLocation::Stack => {}
-            FunctionLocation::Repl => {}
-        };
-        self.break_labels = tmp;
-        Ok(())
-    }
-    fn store_variable(&mut self, name: &String) -> Result<(), CompileError> {
-        let info = self.symbols.get(name).map(|x| *x);
-        self.resolve_upvalue(name);
-        if let Some(info) = info {
-            if info.is_upvalue {
-                self.emit(ByteCode::Op3U8(
-                    OpCode::StoreUpvalue,
-                    get_3xu8(info.location),
-                ));
-            } else {
-                self.emit(ByteCode::Op3U8(OpCode::StoreLocal, get_3xu8(info.location)));
-            }
-        } else {
-            // self.push_string(name);
-            let info = *self.symbols.get(&"_ENV".into()).unwrap();
-            if info.is_upvalue {
-                self.emit(ByteCode::Op3U8(
-                    OpCode::LoadUpvalue,
-                    get_3xu8(info.location),
-                ));
-            } else {
-                self.emit(ByteCode::Op3U8(OpCode::LoadLocal, get_3xu8(info.location)));
-            }
-            let idx = self.string_pool_index(name);
-            self.emit(ByteCode::Op3U8(OpCode::StoreTableStringKey, get_3xu8(idx)));
-        }
-        Ok(())
-    }
-    fn emit_store(&mut self, expr: &Expr) -> Result<(), CompileError> {
-        match expr {
-            // Expr::Const { token } => todo!(),
-            // Expr::Literal { token } => todo!(),
-            Expr::Identifier { token } => {
-                let name = match token {
-                    Token::Identifier { value, .. } => value,
-                    _ => unreachable!(),
-                };
-                self.store_variable(name)
-            }
-            // Expr::BinaryExpr { op, lhs, rhs } => todo!(),
-            // Expr::UnaryExpr { op, arg } => todo!(),
-            Expr::IndexExpr { loc: _, lhs, rhs } => {
-                self.compile_expr(rhs, Default::default())?;
-                self.compile_expr(lhs, Default::default())?;
-                self.emit(ByteCode::Op(OpCode::StoreTable));
-                Ok(())
-            }
-            Expr::DotExpr {
-                loc: _,
-                lhs,
-                rhs: token,
-            } => {
-                let name = match token {
-                    Token::Identifier { value, .. } => value,
-                    _ => unreachable!(),
-                };
-                self.push_string(name);
-
-                self.compile_expr(lhs, Default::default())?;
-                self.emit(ByteCode::Op(OpCode::StoreTable));
-                Ok(())
-            }
-            // Expr::CallExpr { callee, args } => todo!(),
-            // Expr::MethodCallExpr { callee, method, args } => todo!(),
-            // Expr::FunctionExpr { loc, args, body } => ,
-            // Expr::Table { loc, fields } => todo!(),
-            _ => Err(CompileError {
-                loc: expr.loc().clone(),
-                kind: ErrorKind::SemanticError,
-                msg: format!("invalid expression on lhs"),
-            }),
-        }
-    }
-    fn resolve_labels(&mut self) {
-        for (_i, inst) in self.module.code.iter_mut().enumerate() {
-            match *inst {
-                ByteCode::Label(label) => {
-                    let level = u32::from_le_bytes(label);
-                    let addr = *self.labels.get(&level).unwrap() as u32;
-                    *inst = ByteCode::Address(addr.to_le_bytes());
-                }
-                _ => {}
-            }
-        }
-    }
-    fn run(&mut self, block: Rc<Stmt>, is_eval: bool) -> Result<ByteCodeModule, CompileError> {
-        // self.enter_scope(true);
-        // {
-        //     let env_uid = self.new_var_uid();
-        //     self.symbols.set(
-        //         "_ENV".into(),
-        //         VarInfo {
-        //             func_scope: self.funcs.len(),
-        //             location: 0,
-        //             uid: env_uid,
-        //             is_upvalue: true,
-        //         },
-        //     );
-        // }
-
-        // self.compile_stmt(&*block)?;
-        // self.leave_scope(true);
-        self.compile_function(
-            None,
-            &vec![],
-            &*block,
-            if is_eval {
-                FunctionLocation::Repl
-            } else {
-                FunctionLocation::Stack
-            },
-        )?;
-        self.emit(ByteCode::Op3U8(OpCode::Call, [0, 1, 0]));
-        self.resolve_labels();
-        let module = std::mem::replace(
-            &mut self.module,
-            ByteCodeModule {
-                // debug_info: ModuleDebugInfo::new(),
-                string_pool_cache: vec![],
-                prototypes: vec![],
+        loc: &SourceLocation,
+        params: &[String],
+        body: &Rc<Stmt>,
+    ) -> Result<u32, CompileError> {
+        let loop_labels = std::mem::replace(&mut self.loop_labels, vec![]);
+        let labels = std::mem::replace(&mut self.labels, HashMap::new());
+        let cur_function = std::mem::replace(
+            &mut self.cur_function,
+            Some(CompiledFunction {
+                n_args: 0,
                 code: vec![],
-                string_pool: vec![],
-            },
+                upvalues: vec![],
+                is_method: false,
+            }),
         );
-        Ok(module)
-    }
-    fn enter_scope(&mut self, function_scope: bool) {
-        let new = SymbolTable {
-            vars: HashMap::new(),
-            parent: std::ptr::null_mut(),
-            func_scope: if function_scope {
-                self.funcs.len() + 1
-            } else {
-                self.funcs.len()
-            },
-            n_locals: if function_scope {
-                0
-            } else {
-                self.symbols.n_locals
-            },
+        self.enter_function();
+        self.symbols.functions.last_mut().unwrap().push();
+        let mut has_self = false;
+        for (i, p) in params.iter().enumerate() {
+            if p == "self" {
+                has_self = true;
+                if i != 0 {
+                    return Err(CompileError {
+                        kind: ErrorKind::SemanticError,
+                        msg: "self must be the first parameter".into(),
+                        loc: loc.clone(),
+                    });
+                }
+            }
+            let r = self.symbols.add_var(p.clone());
+            assert!(r as usize == i);
+            self.symbols.allocator().regs[i] = Reg::Local;
+        }
+        self.cur_function.as_mut().unwrap().is_method = has_self;
+        self.symbols.functions.last_mut().unwrap().push();
+        self.compile_stmt(body)?;
+        self.symbols.functions.last_mut().unwrap().pop();
+        self.symbols.functions.last_mut().unwrap().pop();
+
+        let upvalues = self.symbols.functions.last().unwrap().upvalues.clone();
+        self.leave_function();
+        let id = {
+            let m = self.module.as_mut().unwrap();
+            let id = m.functions.len() as u32;
+            let mut f = self.cur_function.take().unwrap();
+            f.upvalues = upvalues;
+            m.functions.push(f);
+            id
         };
-        let old = std::mem::replace(&mut self.symbols, new);
-        let old = Box::into_raw(Box::new(old));
-        self.symbols.parent = old;
-        if function_scope {
-            self.funcs.push(FuncInfo {
-                upvalues: HashMap::new(),
+        self.cur_function = cur_function;
+        self.labels = labels;
+        self.loop_labels = loop_labels;
+        Ok(id)
+    }
+    fn compile_program(&mut self, program: &Vec<Rc<Stmt>>) -> Result<(), CompileError> {
+        {
+            self.cur_function = Some(CompiledFunction {
+                n_args: 0,
+                // entry:0,
+                code: vec![],
+                upvalues: vec![],
+                is_method: false,
             });
         }
+        self.enter_function();
+        for s in program {
+            self.compile_stmt(s)?;
+        }
+        let upvalues = self.symbols.functions.last().unwrap().upvalues.clone();
+        self.leave_function();
+        {
+            let m = self.module.as_mut().unwrap();
+            let mut f = self.cur_function.take().unwrap();
+            f.upvalues = upvalues;
+            m.functions.push(f);
+        }
+        Ok(())
     }
-    unsafe fn close_upvalues_this_scope(&mut self) {
-        let mut upvalues_to_close = vec![];
-        for (_var, info) in &self.symbols.vars {
-            let upvalues = &self.funcs.last().unwrap().upvalues;
-
-            if let Some(upvalue_info) = upvalues.get(&info.uid) {
-                // println!("is_upvalue {}", var);
-                // println!("from_parent {} {}", var, upvalue_info.from_parent);
-                if !upvalue_info.from_parent {
-                    // println!("fuck {}", var);
-                    upvalues_to_close.push(upvalue_info.id);
-                }
-            }
-        }
-        for v in upvalues_to_close {
-            self.emit(ByteCode::Op3U8(OpCode::CloseUpvalue, [v as u8, 0, 0]));
-        }
-    }
-
-    fn leave_scope(&mut self, function_scope: bool) {
-        unsafe {
-            let n_locals = self.symbols.n_locals;
-            if !function_scope {
-                self.close_upvalues_this_scope();
-            }
-
-            let parent = self.symbols.parent;
-            std::mem::swap(&mut self.symbols, parent.as_mut().unwrap());
-            Box::from_raw(parent);
-            if !function_scope {
-                self.symbols.n_locals = n_locals;
-            }
-        }
-        if function_scope {
-            self.funcs.pop().unwrap();
-        }
+    fn run(&mut self, program: &Vec<Rc<Stmt>>) -> Result<ByteCodeModule, CompileError> {
+        let module = ByteCodeModule {
+            string_pool: vec![],
+            string_pool_cache: vec![],
+            functions: vec![],
+        };
+        self.module = Some(module);
+        self.compile_program(program)?;
+        Ok(std::mem::replace(&mut self.module, None).unwrap())
     }
 }
 
-pub fn compile(block: Rc<Stmt>) -> Result<ByteCodeModule, CompileError> {
-    let mut compiler = Compiler {
-        funcs: vec![],
-        var_uid_gen: 0,
-        label_gen: 0,
-        labels: HashMap::new(),
-        symbols: SymbolTable {
-            vars: HashMap::new(),
-            parent: std::ptr::null_mut(),
-            func_scope: 0,
-            n_locals: 0,
-        },
-        break_labels: vec![],
-        module: ByteCodeModule {
-            // debug_info: ModuleDebugInfo::new(),
-            string_pool_cache: vec![],
-            prototypes: vec![],
-            code: vec![],
-            string_pool: vec![],
-        },
-        str_map: HashMap::new(),
-    };
-    compiler.run(block, false)
-}
-
-pub fn compile_repl(block: Rc<Stmt>) -> Result<ByteCodeModule, CompileError> {
-    let mut compiler = Compiler {
-        funcs: vec![],
-        var_uid_gen: 0,
-        label_gen: 0,
-        labels: HashMap::new(),
-        symbols: SymbolTable {
-            vars: HashMap::new(),
-            parent: std::ptr::null_mut(),
-            func_scope: 0,
-            n_locals: 0,
-        },
-        break_labels: vec![],
-        module: ByteCodeModule {
-            // debug_info: ModuleDebugInfo::new(),
-            string_pool_cache: vec![],
-            prototypes: vec![],
-            code: vec![],
-            string_pool: vec![],
-        },
-        str_map: HashMap::new(),
-    };
-    compiler.run(block, true)
+pub fn compile(program: &Vec<Rc<Stmt>>) -> Result<ByteCodeModule, CompileError> {
+    let mut compiler = Compiler::new();
+    compiler.run(program)
 }

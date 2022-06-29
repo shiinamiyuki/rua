@@ -1,20 +1,17 @@
 use std::{
-    borrow::Borrow,
-    cell::RefCell,
-    collections::{
-        hash_map::{DefaultHasher, RandomState},
-        HashMap,
-    },
+    collections::hash_map::RandomState,
     fmt,
     hash::{BuildHasher, Hash, Hasher},
 };
 
-use crate::{gc::Traceable, runtime::RuntimeError, value::RawValue};
+use parking_lot::RwLock;
+
+use crate::{error::Error, gc::Traceable, value::Value};
 
 #[derive(Clone, Copy)]
 struct Entry {
-    key: RawValue,
-    value: RawValue,
+    key: Value,
+    value: Value,
     prev: usize,
     next: usize,
 }
@@ -27,8 +24,8 @@ impl fmt::Display for Entry {
 impl Default for Entry {
     fn default() -> Self {
         Entry {
-            key: RawValue::nil(),
-            value: RawValue::nil(),
+            key: Value::nil(),
+            value: Value::nil(),
             prev: usize::MAX,
             next: usize::MAX,
         }
@@ -59,7 +56,7 @@ pub(crate) struct LinkedHashMapIter<'a> {
     i: usize,
 }
 impl<'a> Iterator for LinkedHashMapIter<'a> {
-    type Item = (RawValue, RawValue);
+    type Item = (Value, Value);
     fn next(&mut self) -> Option<Self::Item> {
         if self.i == usize::MAX {
             None
@@ -159,12 +156,12 @@ impl LinkedHashMap {
         // println!("grow");
         self.rehash(self.table.len() * 2);
     }
-    fn hash(&self, k: &RawValue) -> u64 {
+    fn hash(&self, k: &Value) -> u64 {
         let mut hasher = self.s.build_hasher();
         k.hash(&mut hasher);
         hasher.finish()
     }
-    fn get_index(&self, k: &RawValue) -> Option<usize> {
+    fn get_index(&self, k: &Value) -> Option<usize> {
         let hk = self.hash(k);
         for i in 0..self.table.len() {
             let h = (hk + i as u64 / 2 + (i * i) as u64 / 2) & self.mod_mask as u64;
@@ -176,7 +173,7 @@ impl LinkedHashMap {
         }
         None
     }
-    fn remove(&mut self, k: &RawValue) {
+    fn remove(&mut self, k: &Value) {
         let idx = self.get_index(k).unwrap();
         if self.table[idx].value.is_nil() {
             return;
@@ -197,15 +194,15 @@ impl LinkedHashMap {
         self.len -= 1;
         // debug_assert!(!self.check_cycle());
     }
-    fn get(&self, key: RawValue) -> RawValue {
+    fn get(&self, key: Value) -> Value {
         // println!("get {}", key.print());
         if let Some(idx) = self.get_index(&key) {
             self.table[idx].value
         } else {
-            RawValue::nil()
+            Value::nil()
         }
     }
-    fn insert(&mut self, k: RawValue, v: RawValue) {
+    fn insert(&mut self, k: Value, v: Value) {
         // println!("insert {} {}", k.print(), v.print());
         if self.table.is_empty() {
             self.reset(16);
@@ -253,12 +250,12 @@ impl LinkedHashMap {
 }
 
 pub struct Table {
-    pub(crate) array: Vec<RawValue>,
+    pub(crate) array: Vec<Value>,
     pub(crate) map: LinkedHashMap,
     largest_uint: u64,
     len: usize,
     need_recompute_len: bool,
-    pub(crate) metatable: RawValue,
+    pub(crate) metatable: Value,
 }
 fn is_int(x: f64) -> bool {
     x.fract() == 0.0
@@ -271,24 +268,24 @@ impl Table {
             largest_uint: 0,
             len: 0,
             need_recompute_len: false,
-            metatable: RawValue::Nil,
+            metatable: Value::Nil,
         }
     }
-    pub(crate) fn next(&self, key: RawValue) -> Result<RawValue, RuntimeError> {
+    pub(crate) fn next(&self, key: Value) -> Result<Value, Error> {
         if key.is_nil() {
             if !self.array.is_empty() {
-                return Ok(RawValue::from_number(1 as f64));
+                return Ok(Value::from(1));
             } else if !self.map.table.is_empty() {
                 return Ok(self.map.table[self.map.head].key);
             } else {
-                return Ok(RawValue::nil());
+                return Ok(Value::nil());
             }
         }
         match key {
-            RawValue::Number(x) if is_int(x.0) => {
+            Value::Number(x) if is_int(x.0) => {
                 let i = x.trunc() as i64;
                 if i >= 1 && i < self.array.len() as i64 {
-                    return Ok(RawValue::from_number((i + 1) as f64));
+                    return Ok(Value::from(i + 1));
                 }
             }
             _ => {}
@@ -296,29 +293,29 @@ impl Table {
         if let Some(i) = self.map.get_index(&key) {
             let entry = self.map.table[i];
             if entry.value.is_nil() {
-                Err(RuntimeError {
-                    kind: crate::runtime::ErrorKind::TypeError,
-                    msg: format!("invalid key to 'next', key:{}", key.print()),
+                Err(Error {
+                    kind: crate::error::ErrorKind::TypeError,
+                    msg: format!("invalid key to 'next', key:{}", key.to_debug_string()),
                 })
             } else {
                 if entry.next != usize::MAX {
                     Ok(self.map.table[entry.next].key)
                 } else {
-                    Ok(RawValue::nil())
+                    Ok(Value::nil())
                 }
             }
         } else {
-            Ok(RawValue::nil())
+            Ok(Value::nil())
         }
     }
     pub(crate) fn new_with(array_part_len: usize, hash_part_len: usize) -> Self {
         Self {
-            array: vec![RawValue::nil(); array_part_len],
+            array: vec![Value::nil(); array_part_len],
             map: LinkedHashMap::with_len(hash_part_len),
             largest_uint: array_part_len as u64,
             len: array_part_len,
             need_recompute_len: false,
-            metatable: RawValue::Nil,
+            metatable: Value::Nil,
         }
     }
     pub(crate) fn len(&mut self) -> usize {
@@ -333,7 +330,7 @@ impl Table {
                 }
             }
             for i in (self.array.len() + 1) as u64..=self.largest_uint {
-                let v = RawValue::from_number(i as f64);
+                let v = Value::from(i as i64);
                 if self.get(v).is_nil() {
                     self.len = i as usize - 1;
                     return self.len;
@@ -343,9 +340,9 @@ impl Table {
             self.len
         }
     }
-    pub(crate) fn get(&self, key: RawValue) -> RawValue {
+    pub(crate) fn get(&self, key: Value) -> Value {
         match key {
-            RawValue::Number(x) if is_int(x.0) => {
+            Value::Number(x) if is_int(x.0) => {
                 let i = x.trunc() as i64;
                 if i >= 1 && i <= self.array.len() as i64 {
                     return self.array[(i - 1) as usize];
@@ -355,9 +352,9 @@ impl Table {
         }
         self.map.get(key)
     }
-    pub(crate) fn set(&mut self, key: RawValue, value: RawValue) {
+    pub(crate) fn set(&mut self, key: Value, value: Value) {
         match key {
-            RawValue::Number(x) if is_int(x.0) => {
+            Value::Number(x) if is_int(x.0) => {
                 let i = x.trunc() as i64;
                 if !value.is_nil() {
                     self.largest_uint = self.largest_uint.max(i as u64);
@@ -382,20 +379,21 @@ impl Table {
     }
 }
 
-impl Traceable for Table {
-    fn trace(&self, gc: &crate::gc::GcState) {
+unsafe impl Traceable for Table {
+    fn trace(&self, ctx: &mut crate::gc::TraceContext) {
         for i in &self.array {
-            gc.trace(i);
+            ctx.trace(i);
         }
         for (k, v) in self.map.iter() {
-            gc.trace(&k);
-            gc.trace(&v);
+            ctx.trace(&k);
+            ctx.trace(&v);
         }
     }
 }
-impl Traceable for RefCell<Table> {
-    fn trace(&self, gc: &crate::gc::GcState) {
-        let table = self.borrow();
-        gc.trace(&*table);
+
+unsafe impl Traceable for RwLock<Table> {
+    fn trace(&self, ctx: &mut crate::gc::TraceContext) {
+        let t = self.read();
+        ctx.trace(&*t);
     }
 }
