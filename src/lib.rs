@@ -49,9 +49,9 @@ pub fn test() {
     let src = std::fs::read_to_string("test.lua").unwrap();
     let tokens = tokenize("test.lua", &src).unwrap();
     let expr = parse_impl(tokens).unwrap();
-    println!("{:#?}", expr);
+    // println!("{:#?}", expr);
     let module = crate::compile::compile(&vec![expr]).unwrap();
-    println!("{:#?}", module);
+    // println!("{:#?}", module);
     let context = context::Context::new();
     let mut thread = thread::Thread::new(context.new_module(module), &[]);
     vm::Vm::execute(&context, &mut thread).unwrap();
