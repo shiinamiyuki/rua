@@ -70,6 +70,8 @@ unop ::= ‘-’ | not | ‘#’ | ‘~’
 */
 
 use hexf_parse::parse_hexf64;
+use lazy_static::lazy_static;
+use std::collections::HashSet;
 
 use std::rc::Rc;
 #[derive(Debug, Clone)]
@@ -278,12 +280,40 @@ struct Parser {
     line: usize,
     column: usize,
 }
-
+#[derive(Debug)]
 pub struct ParsingError {
     pub message: String,
     pub span: Span,
 }
 
+lazy_static! {
+    static ref KEYWORDS: HashSet<&'static str> = {
+        let mut m = HashSet::new();
+        m.insert("and");
+        m.insert("break");
+        m.insert("do");
+        m.insert("else");
+        m.insert("elseif");
+        m.insert("end");
+        m.insert("false");
+        m.insert("for");
+        m.insert("function");
+        m.insert("goto");
+        m.insert("if");
+        m.insert("in");
+        m.insert("local");
+        m.insert("nil");
+        m.insert("not");
+        m.insert("or");
+        m.insert("repeat");
+        m.insert("return");
+        m.insert("then");
+        m.insert("true");
+        m.insert("until");
+        m.insert("while");
+        m
+    };
+}
 impl Parser {
     fn new(input: &str, file: Option<Rc<String>>) -> Self {
         Self {
@@ -591,40 +621,94 @@ impl Parser {
             };
         }
         let c = self.get_char(0).unwrap();
-        let quote = c;
-        self.advance(1);
-        let mut string_content = String::new();
-        while let Some(c) = self.get_char(0) {
-            if c == quote {
-                self.advance(1);
-                return Ok(Spanned {
-                    node: string_content,
-                    span: make_span!(self, start_line, start_column),
-                });
-            } else if c == '\\' {
-                self.advance(1);
-                if let Some(escaped_char) = self.get_char(0) {
-                    match escaped_char {
-                        'a' => string_content.push('\u{0007}'),
-                        'b' => string_content.push('\u{0008}'),
-                        'f' => string_content.push('\u{000C}'),
-                        'n' => string_content.push('\n'),
-                        'r' => string_content.push('\r'),
-                        't' => string_content.push('\t'),
-                        'v' => string_content.push('\u{000B}'),
-                        '\\' => string_content.push('\\'),
-                        '\'' => string_content.push('\''),
-                        '"' => string_content.push('"'),
-                        'u' => {
-                            let mut unicode_escape = String::new();
-                            self.advance(1); // skip '{'
-                            while let Some(c) = self.get_char(0) {
-                                if c == '}' {
-                                    self.advance(1); // skip '}'
-                                    break;
-                                } else if c.is_ascii_hexdigit() {
-                                    unicode_escape.push(c);
-                                    self.advance(1);
+        if c == '\'' || c == '\"' {
+            let quote = c;
+            self.advance(1);
+            let mut string_content = String::new();
+            while let Some(c) = self.get_char(0) {
+                if c == quote {
+                    self.advance(1);
+                    return Ok(Spanned {
+                        node: string_content,
+                        span: make_span!(self, start_line, start_column),
+                    });
+                } else if c == '\\' {
+                    self.advance(1);
+                    if let Some(escaped_char) = self.get_char(0) {
+                        match escaped_char {
+                            'a' => {
+                                string_content.push('\u{0007}');
+                                self.advance(1);
+                            }
+                            'b' => {
+                                string_content.push('\u{0008}');
+                                self.advance(1);
+                            }
+                            'f' => {
+                                string_content.push('\u{000C}');
+                                self.advance(1);
+                            }
+                            'n' => {
+                                string_content.push('\n');
+                                self.advance(1);
+                            }
+                            'r' => {
+                                string_content.push('\r');
+                                self.advance(1);
+                            }
+                            't' => {
+                                string_content.push('\t');
+                                self.advance(1);
+                            }
+                            'v' => {
+                                string_content.push('\u{000B}');
+                                self.advance(1);
+                            }
+                            '\\' => {
+                                string_content.push('\\');
+                                self.advance(1);
+                            }
+                            '\'' => {
+                                string_content.push('\'');
+                                self.advance(1);
+                            }
+                            '"' => {
+                                string_content.push('"');
+                                self.advance(1);
+                            }
+                            'u' => {
+                                self.advance(1); // skip 'u'
+                                let mut unicode_escape = String::new();
+                                self.advance(1); // skip '{'
+                                while let Some(c) = self.get_char(0) {
+                                    if c == '}' {
+                                        self.advance(1); // skip '}'
+                                        break;
+                                    } else if c.is_ascii_hexdigit() {
+                                        unicode_escape.push(c);
+                                        self.advance(1);
+                                    } else {
+                                        return Err(ParsingError {
+                                            message: format!(
+                                                "Invalid Unicode escape sequence '\\u{{{}}}'",
+                                                unicode_escape
+                                            ),
+                                            span: make_span!(self, start_line, start_column),
+                                        });
+                                    }
+                                }
+                                if let Ok(code_point) = u32::from_str_radix(&unicode_escape, 16) {
+                                    if let Some(unicode_char) = std::char::from_u32(code_point) {
+                                        string_content.push(unicode_char);
+                                    } else {
+                                        return Err(ParsingError {
+                                            message: format!(
+                                                "Invalid Unicode code point '\\u{{{}}}'",
+                                                unicode_escape
+                                            ),
+                                            span: make_span!(self, start_line, start_column),
+                                        });
+                                    }
                                 } else {
                                     return Err(ParsingError {
                                         message: format!(
@@ -635,52 +719,85 @@ impl Parser {
                                     });
                                 }
                             }
-                            if let Ok(code_point) = u32::from_str_radix(&unicode_escape, 16) {
-                                if let Some(unicode_char) = std::char::from_u32(code_point) {
-                                    string_content.push(unicode_char);
-                                } else {
-                                    return Err(ParsingError {
-                                        message: format!(
-                                            "Invalid Unicode code point '\\u{{{}}}'",
-                                            unicode_escape
-                                        ),
-                                        span: make_span!(self, start_line, start_column),
-                                    });
-                                }
-                            } else {
+
+                            _ => {
                                 return Err(ParsingError {
                                     message: format!(
-                                        "Invalid Unicode escape sequence '\\u{{{}}}'",
-                                        unicode_escape
+                                        "Invalid escape sequence '\\{}'",
+                                        escaped_char
                                     ),
                                     span: make_span!(self, start_line, start_column),
-                                });
+                                })
                             }
                         }
-
-                        _ => {
-                            return Err(ParsingError {
-                                message: format!("Invalid escape sequence '\\{}'", escaped_char),
-                                span: make_span!(self, start_line, start_column),
-                            })
-                        }
+                    } else {
+                        return Err(ParsingError {
+                            message: "Unexpected end of input in escape sequence".to_string(),
+                            span: make_span!(self, start_line, start_column),
+                        });
                     }
+                } else {
+                    string_content.push(c);
                     self.advance(1);
+                }
+            }
+            Err(ParsingError {
+                message: "Unexpected end of input in string literal".to_string(),
+                span: make_span!(self, start_line, start_column),
+            })
+        } else if c == '[' {
+            let mut level = 0;
+            self.advance(1);
+            while let Some(c) = self.get_char(0) {
+                if c == '=' {
+                    level += 1;
+                    self.advance(1);
+                } else if c == '[' {
+                    self.advance(1);
+                    break;
                 } else {
                     return Err(ParsingError {
-                        message: "Unexpected end of input in escape sequence".to_string(),
+                        message: "Invalid long string delimiter".to_string(),
                         span: make_span!(self, start_line, start_column),
                     });
                 }
-            } else {
-                string_content.push(c);
+            }
+
+            let mut string_content = String::new();
+            let mut end_sequence = String::new();
+            end_sequence.push(']');
+            for _ in 0..level {
+                end_sequence.push('=');
+            }
+            end_sequence.push(']');
+
+            if self.get_char(0) == Some('\n') {
                 self.advance(1);
             }
+
+            while let Some(c) = self.get_char(0) {
+                if self.peek_str(&end_sequence) {
+                    self.advance(end_sequence.len());
+                    return Ok(Spanned {
+                        node: string_content,
+                        span: make_span!(self, start_line, start_column),
+                    });
+                } else {
+                    string_content.push(c);
+                    self.advance(1);
+                }
+            }
+
+            Err(ParsingError {
+                message: "Unexpected end of input in long string literal".to_string(),
+                span: make_span!(self, start_line, start_column),
+            })
+        } else {
+            Err(ParsingError {
+                message: "Unexpected token".to_string(),
+                span: make_span!(self, start_line, start_column),
+            })
         }
-        Err(ParsingError {
-            message: "Unexpected end of input in string literal".to_string(),
-            span: make_span!(self, start_line, start_column),
-        })
     }
     /// first parse nil, false, true, numeral, literalstring, '...', functiondef
     fn parse_atom_exp(&mut self) -> Result<Spanned<Expression>, ParsingError> {
@@ -782,8 +899,8 @@ mod tests {
         macro_rules! test_parse_integer {
             ($input:expr, $expected:expr) => {
                 let mut parser = Parser::new($input, None);
-                let result = parser.parse_numeral().ok().map(|x| x.node);
-                assert_eq!(result, Some(Numeral::Integer($expected)));
+                let result = parser.parse_numeral().unwrap().node;
+                assert_eq!(result, Numeral::Integer($expected));
             };
         }
 
@@ -794,11 +911,12 @@ mod tests {
         macro_rules! test_parse_float {
             ($input:expr, $expected:expr) => {
                 let mut parser = Parser::new($input, None);
-                let result = parser.parse_numeral().ok().map(|x| x.node);
-                assert_eq!(result, Some(Numeral::Float($expected)));
+                let result = parser.parse_numeral().unwrap().node;
+                assert_eq!(result, Numeral::Float($expected));
             };
         }
         use hexf::hexf64;
+
         test_parse_float!("3.0", 3.0);
         test_parse_float!("3.1416", 3.1416);
         test_parse_float!("314.16e-2", 3.1416);
@@ -807,5 +925,31 @@ mod tests {
         // test_parse_float!("0x0.1E", hexf64!("0x0.1E"));
         test_parse_float!("0xA23p-4", hexf64!("0xA23p-4"));
         test_parse_float!("0X1.921FB54442D18P+1", hexf64!("0X1.921FB54442D18P+1"));
+    }
+    #[test]
+    fn test_parse_literal_string() {
+        macro_rules! test_parse_string {
+            ($input:expr, $expected:expr) => {
+                let mut parser = Parser::new($input, None);
+                let result = parser.parse_literal_string().unwrap().node;
+                assert_eq!(result, $expected.to_string());
+            };
+        }
+
+        test_parse_string!(r#""hello""#, "hello");
+        test_parse_string!(r#"'world'"#, "world");
+        test_parse_string!(r#""escaped\nnewline""#, "escaped\nnewline");
+        test_parse_string!(r#""escaped\\backslash""#, "escaped\\backslash");
+        test_parse_string!(r#""escaped\"quote""#, "escaped\"quote");
+        test_parse_string!(r#""unicode\u{1F600}""#, "unicode😀");
+        test_parse_string!(
+            r#""long string [[ with nested ]] brackets""#,
+            "long string [[ with nested ]] brackets"
+        );
+        test_parse_string!(
+            r#"[[long string with newlines
+and more newlines]]"#,
+            "long string with newlines\nand more newlines"
+        );
     }
 }
