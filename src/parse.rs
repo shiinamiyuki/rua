@@ -314,6 +314,75 @@ lazy_static! {
         m
     };
 }
+macro_rules! make_span {
+    ($self:expr, $start_line:expr, $start_column:expr) => {
+        Span {
+            start: SourceLocation {
+                file: $self.file.clone(),
+                line: $start_line,
+                column: $start_column,
+            },
+            end: SourceLocation {
+                file: $self.file.clone(),
+                line: $self.line,
+                column: $self.column,
+            },
+        }
+    };
+}
+macro_rules! parse_binary_expr_impl {
+    ($self:ident, $parse_lhs:expr, $parse_rhs:expr,$($op:literal),+) => {
+        {
+            let start_line = $self.line;
+            let start_column = $self.column;
+            let lhs = $parse_lhs?;
+            let mut expr = lhs;
+            let ops:Vec<_> = vec![$($op),+].into_iter().map(|s|String::from(s)).collect();
+            loop{
+                $self.skip_whitespace();
+                if ops.iter().any(|op| $self.peek_str(op)) {
+                    let op = ops.iter().find(|op| $self.peek_str(op)).unwrap();
+                    $self.advance(op.len());
+                    let rhs = $parse_rhs?;
+                    expr = Spanned {
+                        node: Expression::BinaryOp {
+                            left: Box::new(expr),
+                            op: match op.as_str() {
+                                "+" => BinOp::Add,
+                                "-" => BinOp::Sub,
+                                "*" => BinOp::Mul,
+                                "/" => BinOp::Div,
+                                "//" => BinOp::FloorDiv,
+                                "^" => BinOp::Pow,
+                                "%" => BinOp::Mod,
+                                "&" => BinOp::BitAnd,
+                                "~" => BinOp::BitXor,
+                                "|" => BinOp::BitOr,
+                                ">>" => BinOp::ShiftRight,
+                                "<<" => BinOp::ShiftLeft,
+                                ".." => BinOp::Concat,
+                                "<" => BinOp::Lt,
+                                "<=" => BinOp::Le,
+                                ">" => BinOp::Gt,
+                                ">=" => BinOp::Ge,
+                                "==" => BinOp::Eq,
+                                "~=" => BinOp::Ne,
+                                "and" => BinOp::And,
+                                "or" => BinOp::Or,
+                                _ => unreachable!(),
+                            },
+                            right: Box::new(rhs),
+                        },
+                        span: make_span!($self, start_line, start_column),
+                    };
+                } else {
+                    break;
+                }
+            }
+            Ok(expr)
+        }
+    }
+}
 impl Parser {
     fn new(input: &str, file: Option<Rc<String>>) -> Self {
         Self {
@@ -416,22 +485,6 @@ impl Parser {
     fn parse_numeral(&mut self) -> Result<Spanned<Numeral>, ParsingError> {
         let start_line = self.line;
         let start_column = self.column;
-        macro_rules! make_span {
-            ($self:expr, $start_line:expr, $start_column:expr) => {
-                Span {
-                    start: SourceLocation {
-                        file: $self.file.clone(),
-                        line: $start_line,
-                        column: $start_column,
-                    },
-                    end: SourceLocation {
-                        file: $self.file.clone(),
-                        line: $self.line,
-                        column: $self.column,
-                    },
-                }
-            };
-        }
 
         // first handle hexadecimals
         if self.get_char(0) == Some('0')
@@ -604,22 +657,6 @@ impl Parser {
     fn parse_literal_string(&mut self) -> Result<Spanned<String>, ParsingError> {
         let start_line = self.line;
         let start_column = self.column;
-        macro_rules! make_span {
-            ($self:expr, $start_line:expr, $start_column:expr) => {
-                Span {
-                    start: SourceLocation {
-                        file: $self.file.clone(),
-                        line: $start_line,
-                        column: $start_column,
-                    },
-                    end: SourceLocation {
-                        file: $self.file.clone(),
-                        line: $self.line,
-                        column: $self.column,
-                    },
-                }
-            };
-        }
         let c = self.get_char(0).unwrap();
         if c == '\'' || c == '\"' {
             let quote = c;
@@ -803,23 +840,6 @@ impl Parser {
     fn parse_atom_exp(&mut self) -> Result<Spanned<Expression>, ParsingError> {
         let start_line = self.line;
         let start_column = self.column;
-        macro_rules! make_span {
-            ($self:expr, $start_line:expr, $start_column:expr) => {
-                Span {
-                    start: SourceLocation {
-                        file: $self.file.clone(),
-                        line: $start_line,
-                        column: $start_column,
-                    },
-                    end: SourceLocation {
-                        file: $self.file.clone(),
-                        line: $self.line,
-                        column: $self.column,
-                    },
-                }
-            };
-        }
-
         if self.peek_str("nil") {
             self.advance(3);
             return Ok(Spanned {
@@ -879,8 +899,197 @@ impl Parser {
             span: make_span!(self, start_line, start_column),
         })
     }
-    fn parse_exp(&mut self) -> Result<Spanned<Expression>, ParsingError> {
-        todo!()
+
+    fn skip_whitespace(&mut self) {
+        while let Some(c) = self.get_char(0) {
+            match c {
+                ' ' | '\t' | '\n' | '\r' => self.advance(1),
+                '-' if self.get_char(1) == Some('-') => {
+                    self.advance(2);
+                    if self.get_char(0) == Some('[') && self.get_char(1) == Some('[') {
+                        self.advance(2);
+                        while let Some(c) = self.get_char(0) {
+                            if c == ']' && self.get_char(1) == Some(']') {
+                                self.advance(2);
+                                break;
+                            } else {
+                                self.advance(1);
+                            }
+                        }
+                    } else {
+                        while let Some(c) = self.get_char(0) {
+                            if c == '\n' || c == '\r' {
+                                break;
+                            } else {
+                                self.advance(1);
+                            }
+                        }
+                    }
+                }
+                _ => break,
+            }
+        }
+    }
+    fn parse_unary_expr(&mut self) -> Result<Spanned<Expression>, ParsingError> {
+        let start_line = self.line;
+        let start_column = self.column;
+
+        if let Some(c) = self.get_char(0) {
+            match c {
+                '-' => {
+                    self.advance(1);
+                    let expr = self.parse_atom_exp()?;
+                    return Ok(Spanned {
+                        node: Expression::UnaryOp {
+                            op: UnOp::Neg,
+                            expr: Box::new(expr),
+                        },
+                        span: make_span!(self, start_line, start_column),
+                    });
+                }
+                'n' if self.peek_str("not") => {
+                    self.advance(3);
+                    let expr = self.parse_atom_exp()?;
+                    return Ok(Spanned {
+                        node: Expression::UnaryOp {
+                            op: UnOp::Not,
+                            expr: Box::new(expr),
+                        },
+                        span: make_span!(self, start_line, start_column),
+                    });
+                }
+                '#' => {
+                    self.advance(1);
+                    let expr = self.parse_atom_exp()?;
+                    return Ok(Spanned {
+                        node: Expression::UnaryOp {
+                            op: UnOp::Len,
+                            expr: Box::new(expr),
+                        },
+                        span: make_span!(self, start_line, start_column),
+                    });
+                }
+                '~' => {
+                    self.advance(1);
+                    let expr = self.parse_atom_exp()?;
+                    return Ok(Spanned {
+                        node: Expression::UnaryOp {
+                            op: UnOp::BitNot,
+                            expr: Box::new(expr),
+                        },
+                        span: make_span!(self, start_line, start_column),
+                    });
+                }
+                _ => {}
+            }
+        }
+
+        self.parse_expr()
+    }
+    fn parse_prefix_expr(&mut self) -> Result<Spanned<Expression>, ParsingError> {
+        
+    }
+    fn parse_expr(&mut self) -> Result<Spanned<Expression>, ParsingError> {
+        let start_line = self.line;
+        let start_column = self.column;
+        // check '(
+        if let Some(c) = self.get_char(0) {
+            if c == '(' {
+                self.advance(1);
+                let expr = self.parse_expr()?;
+                self.expect_char(0, ')')?;
+                self.advance(1);
+                return Ok(Spanned {
+                    node: Expression::PrefixExp(Box::new(expr)),
+                    span: make_span!(self, start_line, start_column),
+                });
+            }
+        }
+    }
+    /*
+    Precedence of binary operators
+
+     or
+     and
+     <     >     <=    >=    ~=    ==
+     |
+     ~
+     &
+     <<    >>
+     ..
+     +     -
+     *     /     //    %
+     unary operators (not   #     -     ~)
+     ^
+
+     */
+    fn parse_pow_expr(&mut self) -> Result<Spanned<Expression>, ParsingError> {
+        parse_binary_expr_impl!(self, self.parse_unary_expr(), self.parse_unary_expr(), "^")
+    }
+    fn parse_mul_expr(&mut self) -> Result<Spanned<Expression>, ParsingError> {
+        parse_binary_expr_impl!(
+            self,
+            self.parse_pow_expr(),
+            self.parse_pow_expr(),
+            "*",
+            "/",
+            "//",
+            "%"
+        )
+    }
+    fn parse_add_expr(&mut self) -> Result<Spanned<Expression>, ParsingError> {
+        parse_binary_expr_impl!(self, self.parse_mul_expr(), self.parse_mul_expr(), "+", "-")
+    }
+    fn parse_concat_expr(&mut self) -> Result<Spanned<Expression>, ParsingError> {
+        parse_binary_expr_impl!(self, self.parse_add_expr(), self.parse_add_expr(), "..")
+    }
+    fn parse_cmp_expr(&mut self) -> Result<Spanned<Expression>, ParsingError> {
+        parse_binary_expr_impl!(
+            self,
+            self.parse_bitor_expr(),
+            self.parse_bitor_expr(),
+            "<",
+            "<=",
+            ">",
+            ">=",
+            "==",
+            "~="
+        )
+    }
+    fn parse_bitxor_expr(&mut self) -> Result<Spanned<Expression>, ParsingError> {
+        parse_binary_expr_impl!(
+            self,
+            self.parse_bitand_expr(),
+            self.parse_bitand_expr(),
+            "~"
+        )
+    }
+    fn parse_bitand_expr(&mut self) -> Result<Spanned<Expression>, ParsingError> {
+        parse_binary_expr_impl!(self, self.parse_shift_expr(), self.parse_shift_expr(), "&")
+    }
+    fn parse_shift_expr(&mut self) -> Result<Spanned<Expression>, ParsingError> {
+        parse_binary_expr_impl!(
+            self,
+            self.parse_concat_expr(),
+            self.parse_concat_expr(),
+            ">>",
+            "<<"
+        )
+    }
+    fn parse_bitor_expr(&mut self) -> Result<Spanned<Expression>, ParsingError> {
+        parse_binary_expr_impl!(
+            self,
+            self.parse_bitxor_expr(),
+            self.parse_bitxor_expr(),
+            "|"
+        )
+    }
+    fn parse_and_expr(&mut self) -> Result<Spanned<Expression>, ParsingError> {
+        parse_binary_expr_impl!(self, self.parse_cmp_expr(), self.parse_cmp_expr(), "and")
+    }
+
+    fn parse_or_expr(&mut self) -> Result<Spanned<Expression>, ParsingError> {
+        parse_binary_expr_impl!(self, self.parse_and_expr(), self.parse_and_expr(), "or")
     }
 }
 
@@ -950,6 +1159,14 @@ mod tests {
             r#"[[long string with newlines
 and more newlines]]"#,
             "long string with newlines\nand more newlines"
+        );
+        test_parse_string!(
+            r#"[=[nested long string with level 1 [==[ and level 2 ]==] and back to level 1]=]"#,
+            "nested long string with level 1 [==[ and level 2 ]==] and back to level 1"
+        );
+        test_parse_string!(
+            r#"[==[nested long string with level 2 [=[ and level 1 ]=] and back to level 2]==]"#,
+            "nested long string with level 2 [=[ and level 1 ]=] and back to level 2"
         );
     }
 }
