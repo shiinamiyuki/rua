@@ -26,16 +26,16 @@ Goal: Run simple Lua programs — arithmetic, control flow, functions, tables, r
 - [x] Unit tests: token stream for representative inputs
 
 ### M1.3 — Parser
-- [ ] Recursive descent parser producing AST
-- [ ] AST node types (`ast.rs`): `Block`, `Stat`, `Expr`, `Var`, `FuncBody`, etc.
-- [ ] Statement parsing: assignment, `do..end`, `while`, `repeat..until`, `if..elseif..else`, `for` (numeric + generic), `return`, `break`, `goto`, label, function call as statement
-- [ ] Expression parsing: Pratt parser with correct precedence & associativity
+- [x] Recursive descent parser producing AST
+- [x] AST node types (`ast.rs`): `Block`, `Stat`, `Expr`, `Var`, `FuncBody`, etc.
+- [x] Statement parsing: assignment, `do..end`, `while`, `repeat..until`, `if..elseif..else`, `for` (numeric + generic), `return`, `break`, `goto`, label, function call as statement
+- [x] Expression parsing: Pratt parser with correct precedence & associativity
   - 12 precedence levels, right-assoc for `^` and `..`
-- [ ] Function definitions: `function f()`, `local function`, `global function`, method syntax `:`
-- [ ] Table constructors: `[exp]=exp`, `name=exp`, positional
-- [ ] Variable declarations: `local`, `global`, `global *`, attributes `<const>`, `<close>`
-- [ ] Vararg param (`...`, `... name`)
-- [ ] Unit tests: parse + round-trip for all statement/expression types
+- [x] Function definitions: `function f()`, `local function`, `global function`, method syntax `:`
+- [x] Table constructors: `[exp]=exp`, `name=exp`, positional
+- [x] Variable declarations: `local`, `global`, `global *`, attributes `<const>`, `<close>`
+- [x] Vararg param (`...`, `... name`)
+- [x] Unit tests: parse + round-trip for all statement/expression types
 
 ### M1.4 — Bytecode Compiler
 - [ ] `Proto` struct: code, constants, upvalue descriptors, nested protos, debug info

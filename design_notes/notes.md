@@ -46,7 +46,6 @@
   - Value::PartialEq handles integer↔float comparison and string content comparison for non-interned strings
   - Hash seed is fixed constant for now; randomization deferred to Phase 4
 
-## APPEND HERE
 
 ## Session: M1.2 Lexer Implementation (2026-04-11)
 
@@ -71,3 +70,23 @@
 - `TokenKind::describe()` for human-readable token descriptions in error messages
 - `LexError` separate from `LuaError` — may unify later
 - Numeral underscores supported (Lua 5.5 may allow them in implementation)
+
+## M1.3 — Parser (April 2026)
+
+### What was done
+- Implemented complete AST in `src/ast.rs`: `Block`, `Stat` (14 variants), `Expr` (11 variants), `Var`, `FuncBody`, `FuncName`, `AttName`, `Field`, `FunctionCall`, `CallArgs`, `BinOp`/`UnOp` with binding power for Pratt parsing.
+- Implemented recursive descent parser in `src/parser.rs` (~600 lines):
+  - Pratt parsing for expressions with 12 precedence levels
+  - Right-associative `^` and `..` operators
+  - All statement types: assignment, function call, do/while/repeat/if/for blocks, function defs, local/global declarations, goto/label/break/return
+  - Lua 5.5 features: `global *`, `global <const> *`, `global function`, `... name` vararg syntax, attribute lists `<const>`/`<close>`
+  - Suffix expression chain: `.field`, `[index]`, `:method(args)`, `(args)`, `{table}`, `"string"`
+  - Table constructors with indexed, named, and positional fields, trailing separators
+- Added 30 unit tests covering all statement/expression types, operator precedence, right-associativity, chained calls, etc.
+- Created `tests/parse_upstream.rs` integration test that parses all 34 upstream Lua test files without error.
+
+### Test results
+- 116 unit tests passing (86 lexer/value/string/gc + 30 parser)
+- 2 integration tests passing (lex_upstream + parse_upstream on 34 files)
+
+## APPEND HERE

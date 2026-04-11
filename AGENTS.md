@@ -6,6 +6,8 @@ Check `ROADMAP.md` and `rua-design.md` for the overall design and implementation
 
 `lua5.5.txt` contains the complete Lua 5.5 reference manual. It's very big. To prevent polluting your context, only read the relevant sections that you need.
 
+`tests/lua-upstream-tests` contains the official Lua test suite. You should use these tests to verify your implementation. 
+
 After each session, summarize your work and append them to `design_notes/notes.md`. There is an anchor `## APPEND HERE` at the end of file. You can use replace tool to append your summary without reading the file.
 
 
