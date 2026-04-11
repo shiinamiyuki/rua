@@ -1,14 +1,17 @@
-pub fn add(left: u64, right: u64) -> u64 {
-    left + right
-}
+//! Rua: A Lua 5.5 interpreter written in Rust.
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn it_works() {
-        let result = add(2, 2);
-        assert_eq!(result, 4);
-    }
-}
+pub mod ast;
+pub mod bytecode;
+pub mod closure;
+pub mod compiler;
+pub mod coroutine;
+pub mod error;
+pub mod gc;
+pub mod lexer;
+pub mod parser;
+pub mod stdlib;
+pub mod string;
+pub mod table;
+pub mod token;
+pub mod value;
+pub mod vm;

@@ -4,6 +4,8 @@
 ## Instruction
 Check `ROADMAP.md` and `rua-design.md` for the overall design and implementation plan. You can also check `notes.md` for the development notes and progress updates.
 
+`lua5.5.txt` contains the complete Lua 5.5 reference manual. It's very big. To prevent polluting your context, only read the relevant sections that you need.
+
 After each session, summarize your work and append them to `design_notes/notes.md`. There is an anchor `## APPEND HERE` at the end of file. You can use replace tool to append your summary without reading the file.
 
 

@@ -9,21 +9,21 @@
 Goal: Run simple Lua programs — arithmetic, control flow, functions, tables, recursion.
 
 ### M1.1 — Foundation & Value System
-- [ ] Crate skeleton: `lib.rs`, module stubs, `main.rs` (CLI entry)
-- [ ] `Value` enum: `Nil`, `Boolean(bool)`, `Integer(i64)`, `Float(f64)`, `Object(GcRef)`
-- [ ] `GcRef` / `GcObject` basics: `String`, `Table`, `Closure`
-- [ ] `LuaString`: byte-buffer backed, precomputed hash, `PartialEq` by content
-- [ ] String interning pool (short strings ≤40 bytes)
+- [x] Crate skeleton: `lib.rs`, module stubs, `main.rs` (CLI entry)
+- [x] `Value` enum: `Nil`, `Boolean(bool)`, `Integer(i64)`, `Float(f64)`, `Object(GcRef)`
+- [x] `GcRef` / `GcObject` basics: `String`, `Table`, `Closure`
+- [x] `LuaString`: byte-buffer backed, precomputed hash, `PartialEq` by content
+- [x] String interning pool (short strings ≤40 bytes)
 
 ### M1.2 — Lexer
-- [ ] Hand-written lexer on `&[u8]`
-- [ ] All tokens: keywords (incl. `global`), operators, punctuation
-- [ ] Numerals: decimal int, hex int, float, hex float
-- [ ] Short strings with all escape sequences (`\n`, `\xXX`, `\u{XXX}`, `\z`, etc.)
-- [ ] Long strings (`[[...]]`, `[=[...]=]`)
-- [ ] Comments: short (`--`) and long (`--[[...]]`)
-- [ ] Source location tracking (line, column)
-- [ ] Unit tests: token stream for representative inputs
+- [x] Hand-written lexer on `&[u8]`
+- [x] All tokens: keywords (incl. `global`), operators, punctuation
+- [x] Numerals: decimal int, hex int, float, hex float
+- [x] Short strings with all escape sequences (`\n`, `\xXX`, `\u{XXX}`, `\z`, etc.)
+- [x] Long strings (`[[...]]`, `[=[...]=]`)
+- [x] Comments: short (`--`) and long (`--[[...]]`)
+- [x] Source location tracking (line, column)
+- [x] Unit tests: token stream for representative inputs
 
 ### M1.3 — Parser
 - [ ] Recursive descent parser producing AST
