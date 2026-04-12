@@ -459,6 +459,59 @@ impl Vm {
         }
     }
 
+    // ── Garbage collection ───────────────────────────────────────────
+
+    /// Gather all GC roots from the VM state and run a collection cycle.
+    fn collect_garbage(&mut self) {
+        let mut roots = Vec::new();
+
+        // Root: stack values (only up to the active region)
+        let stack_limit = if self.frames.is_empty() {
+            self.top
+        } else {
+            let last = &self.frames[self.frames.len() - 1];
+            let frame_top = last.base + last.proto.max_stack_size as usize;
+            self.top.max(frame_top)
+        };
+        for val in &self.stack[..stack_limit.min(self.stack.len())] {
+            if let Value::Object(r) = val {
+                roots.push(*r);
+            }
+        }
+
+        // Root: each call frame's closure, varargs, and closed upvalues
+        for frame in &self.frames {
+            roots.push(frame.closure);
+            for val in &frame.varargs {
+                if let Value::Object(r) = val {
+                    roots.push(*r);
+                }
+            }
+            for uv in &frame.upvalues {
+                if let Upvalue::Closed(Value::Object(r)) = &*uv.borrow() {
+                    roots.push(*r);
+                }
+            }
+        }
+
+        // Root: closed values in open_upvalues (open ones point into stack, already covered)
+        for uv in &self.open_upvalues {
+            if let Upvalue::Closed(Value::Object(r)) = &*uv.borrow() {
+                roots.push(*r);
+            }
+        }
+
+        self.gc.collect(&roots);
+    }
+
+    /// Check if GC should run and trigger it if so.
+    #[inline]
+    fn maybe_collect(&mut self) {
+        if self.gc.should_collect() {
+            self.collect_garbage();
+        }
+    }
+
     // ── Main dispatch loop ─────────────────────────────────────────
 
     fn execute(&mut self) -> Result<(), LuaError> {
@@ -552,6 +605,7 @@ impl Vm {
 
                 // ── Tables ─────────────────────────────────────────
                 OpCode::NewTable => {
+                    self.maybe_collect();
                     let table = Table::with_capacity(b, c);
                     let gc_ref = self.gc.new_table(table);
                     self.set_reg(base, a, Value::Object(gc_ref));
@@ -687,6 +741,7 @@ impl Vm {
 
                 // ── String / Length ────────────────────────────────
                 OpCode::Concat => {
+                    self.maybe_collect();
                     let result = self.concat_values(base, b, c)?;
                     self.set_reg(base, a, result);
                 }
@@ -831,6 +886,7 @@ impl Vm {
 
                 // ── Functions ──────────────────────────────────────
                 OpCode::Closure => {
+                    self.maybe_collect();
                     let child_proto = {
                         let parent_proto = &self.frames[fi].proto;
                         Rc::new(parent_proto.protos[bx].clone())

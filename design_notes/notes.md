@@ -141,4 +141,23 @@ All 138 tests pass (136 unit + 1 lex upstream + 1 parse upstream). No regression
 - All 152 tests pass (150 unit + 2 integration)
 - `test_basic.lua` runs end-to-end correctly: arithmetic, variables, control flow, while loops, numeric for (1..5), functions (factorial, fibonacci), closures, tables, type checking, multi-return, boolean logic
 
+## Session – M1.6 GC Implementation (Mark-and-Sweep)
+
+### Design Decisions
+- **Intrusive linked list** instead of `Vec<Box<GcObject>>`: O(1) allocation (prepend to head), O(1) unlinking during sweep (pointer surgery), no Vec realloc spikes, one fewer indirection level. Same approach as PUC-Rio Lua.
+- **Stop-the-world mark-and-sweep** with gray worklist (iterative, no recursion) to avoid stack overflow on deep object graphs.
+- **String pool swept** after mark phase: `HashMap::retain` removes dead interned strings, so short strings can be collected.
+- **GC trigger**: checked before NEWTABLE, CLOSURE, and CONCAT instructions. Fires when `bytes_allocated > gc_threshold`. Threshold = `max(32KB, 2 * bytes_after_last_collection)`.
+- **Root gathering**: VM builds root list from stack values, call frame closures/varargs/upvalues, and open upvalues.
+- **Ownership**: `Box::new` + `mem::forget` transfers ownership to the intrusive list. Sweep recovers via `Box::from_raw`. `Drop` impl frees all objects on Gc teardown.
+
+### Changes
+- `gc.rs`: Complete rewrite — `GcHeader` now has `next: Option<NonNull<GcObject>>`, `Gc` stores `all_objects` head pointer instead of `Vec<Box<GcObject>>`. Added `collect()`, `mark_object()`, `trace_object()`, `sweep()`, `should_collect()`, `object_size()`, `Drop` impl. 6 new GC-specific unit tests.
+- `vm.rs`: Added `collect_garbage()` (root gathering), `maybe_collect()` (threshold check), GC trigger points at NEWTABLE, CLOSURE, CONCAT opcodes.
+- `tests/test_gc_stress.lua`: Stress test with 10K table allocs, 100 string concats, 1K closure allocs, nested table chains.
+
+### Test Results
+- All 158 tests pass (156 unit + 2 integration)
+- `test_basic.lua` and `test_gc_stress.lua` both pass end-to-end
+
 ## APPEND HERE

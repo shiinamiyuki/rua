@@ -1,18 +1,32 @@
-//! Garbage collector: object allocation and management.
+//! Garbage collector: object allocation and mark-and-sweep collection.
 //!
-//! M1.1: Basic allocation, GcRef, and string interning.
-//! Mark-and-sweep collection will be added in M1.6.
+//! Objects are stored in an intrusive singly-linked list for O(1) allocation
+//! and O(1) unlinking during sweep. Mark-and-sweep uses a gray worklist to
+//! avoid recursion.
 
 use std::collections::HashMap;
 use std::ptr::NonNull;
 
-use crate::closure::Closure;
+use crate::closure::{Closure, LuaClosure, Upvalue};
 use crate::string::LuaString;
 use crate::table::Table;
+use crate::value::Value;
 
-/// Header for all GC-managed objects.
+// ── GC tuning constants ────────────────────────────────────────────
+
+/// Initial GC threshold (bytes). First collection triggers after this much allocation.
+const GC_INITIAL_THRESHOLD: usize = 32 * 1024; // 32 KB
+
+/// After each collection, next threshold = live_bytes * GC_GROW_FACTOR.
+const GC_GROW_FACTOR: usize = 2;
+
+// ── GC object header and types ─────────────────────────────────────
+
+/// Header for all GC-managed objects (intrusive linked list + mark bit).
 pub struct GcHeader {
-    /// Marked flag for mark-and-sweep GC (M1.6).
+    /// Next object in the all-objects linked list.
+    next: Option<NonNull<GcObject>>,
+    /// Marked flag for mark-and-sweep.
     pub marked: bool,
 }
 
@@ -30,7 +44,6 @@ pub struct GcObject {
 }
 
 impl GcObject {
-    /// Get a reference to the string data, if this is a string object.
     pub fn as_string(&self) -> Option<&LuaString> {
         match &self.kind {
             GcObjectKind::String(s) => Some(s),
@@ -38,7 +51,6 @@ impl GcObject {
         }
     }
 
-    /// Get a reference to the table data, if this is a table object.
     pub fn as_table(&self) -> Option<&Table> {
         match &self.kind {
             GcObjectKind::Table(t) => Some(t),
@@ -46,7 +58,6 @@ impl GcObject {
         }
     }
 
-    /// Get a mutable reference to the table data, if this is a table object.
     pub fn as_table_mut(&mut self) -> Option<&mut Table> {
         match &mut self.kind {
             GcObjectKind::Table(t) => Some(t),
@@ -54,7 +65,6 @@ impl GcObject {
         }
     }
 
-    /// Get a reference to the closure data, if this is a closure object.
     pub fn as_closure(&self) -> Option<&Closure> {
         match &self.kind {
             GcObjectKind::Closure(c) => Some(c),
@@ -62,7 +72,6 @@ impl GcObject {
         }
     }
 
-    /// Get a mutable reference to the closure data, if this is a closure object.
     pub fn as_closure_mut(&mut self) -> Option<&mut Closure> {
         match &mut self.kind {
             GcObjectKind::Closure(c) => Some(c),
@@ -71,11 +80,9 @@ impl GcObject {
     }
 }
 
-/// A reference to a GC-managed object.
-///
-/// This is a raw pointer to a heap-allocated `GcObject`. The `Gc` allocator
-/// owns the objects and guarantees they remain alive as long as they are
-/// reachable (once collection is implemented in M1.6).
+// ── GcRef ──────────────────────────────────────────────────────────
+
+/// A reference to a GC-managed object (raw pointer, Copy).
 #[derive(Clone, Copy, Debug)]
 pub struct GcRef {
     ptr: NonNull<GcObject>,
@@ -86,11 +93,10 @@ impl GcRef {
     ///
     /// # Safety invariant
     /// The GcRef must point to a live object (not yet freed by GC).
-    /// This is guaranteed as long as the owning `Gc` is alive.
     #[inline]
     pub fn as_object(&self) -> &GcObject {
-        // SAFETY: GcRef is only created by Gc::alloc which Box-allocates the object.
-        // The Box is stored in Gc::objects, keeping the heap allocation alive.
+        // SAFETY: GcRef is only created by Gc::alloc which heap-allocates the object.
+        // The object remains alive as long as it's reachable (GC won't sweep marked objects).
         unsafe { self.ptr.as_ref() }
     }
 
@@ -100,7 +106,6 @@ impl GcRef {
     /// The caller must ensure no other references to this object exist.
     #[inline]
     pub fn as_object_mut(&mut self) -> &mut GcObject {
-        // SAFETY: Same as as_object, plus exclusive access required by caller.
         unsafe { self.ptr.as_mut() }
     }
 
@@ -112,7 +117,6 @@ impl GcRef {
 }
 
 impl PartialEq for GcRef {
-    /// Pointer equality: two GcRefs are equal iff they point to the same object.
     fn eq(&self, other: &Self) -> bool {
         self.ptr == other.ptr
     }
@@ -126,35 +130,36 @@ impl std::hash::Hash for GcRef {
     }
 }
 
-/// The garbage collector / object allocator.
-///
-/// Owns all GC-managed objects. In M1.1, only allocation is implemented.
-/// Mark-and-sweep collection will be added in M1.6.
+// ── Gc allocator / collector ───────────────────────────────────────
+
+/// The garbage collector: intrusive linked list of objects + mark-and-sweep.
 pub struct Gc {
-    /// All allocated objects. Each Box provides a stable heap address.
-    objects: Vec<Box<GcObject>>,
+    /// Head of the all-objects intrusive linked list.
+    all_objects: Option<NonNull<GcObject>>,
+    /// Number of live objects.
+    num_objects: usize,
     /// String interning pool: maps byte content → GcRef for short strings.
     string_pool: HashMap<Vec<u8>, GcRef>,
     /// Approximate total bytes allocated by GC objects.
     bytes_allocated: usize,
+    /// Next collection triggers when bytes_allocated exceeds this.
+    pub gc_threshold: usize,
 }
 
 impl Gc {
     /// Create a new GC allocator.
     pub fn new() -> Self {
         Gc {
-            objects: Vec::new(),
+            all_objects: None,
+            num_objects: 0,
             string_pool: HashMap::new(),
             bytes_allocated: 0,
+            gc_threshold: GC_INITIAL_THRESHOLD,
         }
     }
 
     /// Allocate a new string. Short strings (≤40 bytes) are automatically interned.
-    ///
-    /// If a short string with the same content already exists in the intern pool,
-    /// the existing GcRef is returned (enabling pointer-equality comparison).
     pub fn new_string(&mut self, data: &[u8]) -> GcRef {
-        // Check interning pool for short strings
         if data.len() <= crate::string::SHORT_STRING_MAX {
             if let Some(&existing) = self.string_pool.get(data) {
                 return existing;
@@ -165,7 +170,6 @@ impl Gc {
         let is_short = lua_string.is_short();
         let gc_ref = self.alloc(GcObjectKind::String(lua_string));
 
-        // Intern short strings
         if is_short {
             self.string_pool.insert(data.to_vec(), gc_ref);
         }
@@ -183,22 +187,148 @@ impl Gc {
         self.alloc(GcObjectKind::Closure(closure))
     }
 
-    /// Internal: allocate a GcObject on the heap and return a GcRef.
-    fn alloc(&mut self, kind: GcObjectKind) -> GcRef {
-        let size = std::mem::size_of::<GcObject>();
-        self.bytes_allocated += size;
+    /// Returns true if bytes_allocated has exceeded the GC threshold.
+    pub fn should_collect(&self) -> bool {
+        self.bytes_allocated > self.gc_threshold
+    }
 
-        let object = Box::new(GcObject {
-            header: GcHeader { marked: false },
+    /// Internal: allocate a GcObject, prepend to intrusive linked list.
+    fn alloc(&mut self, kind: GcObjectKind) -> GcRef {
+        let size = Self::object_size(&kind);
+        self.bytes_allocated += size;
+        self.num_objects += 1;
+
+        let mut boxed = Box::new(GcObject {
+            header: GcHeader {
+                next: self.all_objects,
+                marked: false,
+            },
             kind,
         });
 
-        // Get a stable pointer to the heap allocation before storing the Box
-        let ptr = NonNull::from(object.as_ref());
-        self.objects.push(object);
+        let ptr = NonNull::from(boxed.as_mut());
+        // Leak the Box: ownership transfers to the intrusive list.
+        // We recover it in sweep or drop via Box::from_raw.
+        std::mem::forget(boxed);
 
+        self.all_objects = Some(ptr);
         GcRef { ptr }
     }
+
+    /// Estimate the size of a GcObject for bookkeeping.
+    fn object_size(kind: &GcObjectKind) -> usize {
+        let base = std::mem::size_of::<GcObject>();
+        match kind {
+            GcObjectKind::String(s) => base + s.as_bytes().len(),
+            GcObjectKind::Table(t) => {
+                base + t.array.capacity() * std::mem::size_of::<Value>()
+                    + t.hash.capacity() * std::mem::size_of::<(Value, Value)>()
+            }
+            GcObjectKind::Closure(_) => base,
+        }
+    }
+
+    // ── Mark-and-sweep collection ──────────────────────────────────
+
+    /// Run a full mark-and-sweep GC cycle.
+    /// `roots` are the GcRefs directly reachable from the VM (stack, frames, etc.).
+    pub fn collect(&mut self, roots: &[GcRef]) {
+        // Mark phase: trace from roots using a gray worklist
+        let mut gray: Vec<GcRef> = Vec::with_capacity(roots.len());
+        for &root in roots {
+            self.mark_object(root, &mut gray);
+        }
+        while let Some(obj_ref) = gray.pop() {
+            self.trace_object(obj_ref, &mut gray);
+        }
+
+        // Sweep string interning pool: remove dead entries
+        self.string_pool
+            .retain(|_, gc_ref| unsafe { gc_ref.ptr.as_ref().header.marked });
+
+        // Sweep phase: walk the intrusive list, free unmarked objects
+        self.sweep();
+    }
+
+    /// Mark a single GcRef as reachable and push it to the gray worklist.
+    fn mark_object(&self, gc_ref: GcRef, gray: &mut Vec<GcRef>) {
+        let obj = unsafe { gc_ref.ptr.as_ref() };
+        if !obj.header.marked {
+            // SAFETY: We are the only mutator during stop-the-world collection.
+            // We only set marked=true here, which is safe because no other code
+            // reads/writes marked during collection.
+            let obj_mut = unsafe { &mut *gc_ref.ptr.as_ptr() };
+            obj_mut.header.marked = true;
+            gray.push(gc_ref);
+        }
+    }
+
+    /// Trace outgoing references from a marked object.
+    fn trace_object(&mut self, gc_ref: GcRef, gray: &mut Vec<GcRef>) {
+        let obj = unsafe { gc_ref.ptr.as_ref() };
+        match &obj.kind {
+            GcObjectKind::String(_) => {
+                // Strings are leaf objects — no outgoing references
+            }
+            GcObjectKind::Table(t) => {
+                // Trace array values
+                for val in &t.array {
+                    if let Value::Object(r) = val {
+                        self.mark_object(*r, gray);
+                    }
+                }
+                // Trace hash keys and values
+                for (k, v) in &t.hash {
+                    if let Value::Object(r) = k {
+                        self.mark_object(*r, gray);
+                    }
+                    if let Value::Object(r) = v {
+                        self.mark_object(*r, gray);
+                    }
+                }
+                // Trace metatable
+                if let Some(mt) = t.metatable {
+                    self.mark_object(mt, gray);
+                }
+            }
+            GcObjectKind::Closure(c) => {
+                if let Closure::Lua(LuaClosure { upvalues, .. }) = c {
+                    for uv_ref in upvalues {
+                        if let Upvalue::Closed(Value::Object(r)) = &*uv_ref.borrow() {
+                            self.mark_object(*r, gray);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Sweep: walk the intrusive list, free unmarked objects, reset marks on survivors.
+    fn sweep(&mut self) {
+        let mut prev: *mut Option<NonNull<GcObject>> = &mut self.all_objects;
+        unsafe {
+            while let Some(ptr) = *prev {
+                let obj = &mut *ptr.as_ptr();
+                if obj.header.marked {
+                    // Survivor: clear mark for next cycle, advance
+                    obj.header.marked = false;
+                    prev = &mut obj.header.next;
+                } else {
+                    // Dead: unlink and free
+                    *prev = obj.header.next;
+                    let size = Self::object_size(&obj.kind);
+                    self.bytes_allocated = self.bytes_allocated.saturating_sub(size);
+                    self.num_objects -= 1;
+                    drop(Box::from_raw(ptr.as_ptr()));
+                }
+            }
+        }
+
+        // Adjust threshold for next cycle
+        self.gc_threshold = (self.bytes_allocated * GC_GROW_FACTOR).max(GC_INITIAL_THRESHOLD);
+    }
+
+    // ── Accessors ──────────────────────────────────────────────────
 
     /// Get the approximate number of bytes allocated.
     pub fn bytes_allocated(&self) -> usize {
@@ -207,7 +337,7 @@ impl Gc {
 
     /// Get the number of live objects.
     pub fn object_count(&self) -> usize {
-        self.objects.len()
+        self.num_objects
     }
 
     /// Get the number of interned strings.
@@ -219,6 +349,21 @@ impl Gc {
 impl Default for Gc {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl Drop for Gc {
+    fn drop(&mut self) {
+        // Free all objects in the intrusive list
+        let mut cur = self.all_objects;
+        while let Some(ptr) = cur {
+            unsafe {
+                let obj = &*ptr.as_ptr();
+                cur = obj.header.next;
+                drop(Box::from_raw(ptr.as_ptr()));
+            }
+        }
+        self.all_objects = None;
     }
 }
 
@@ -249,7 +394,6 @@ mod tests {
         let mut gc = Gc::new();
         let r1 = gc.new_string(b"hello");
         let r2 = gc.new_string(b"hello");
-        // Same short string returns the same GcRef (interned)
         assert_eq!(r1, r2);
         assert_eq!(gc.object_count(), 1);
         assert_eq!(gc.interned_string_count(), 1);
@@ -258,10 +402,9 @@ mod tests {
     #[test]
     fn test_no_interning_for_long_strings() {
         let mut gc = Gc::new();
-        let long = vec![b'x'; 41]; // > SHORT_STRING_MAX
+        let long = vec![b'x'; 41];
         let r1 = gc.new_string(&long);
         let r2 = gc.new_string(&long);
-        // Long strings are not interned: different GcRefs
         assert_ne!(r1, r2);
         assert_eq!(gc.object_count(), 2);
         assert_eq!(gc.interned_string_count(), 0);
@@ -305,7 +448,6 @@ mod tests {
         assert!(t.as_object().as_table().is_some());
         assert!(c.as_object().as_closure().is_some());
 
-        // Cross-type checks return None
         assert!(s.as_object().as_table().is_none());
         assert!(t.as_object().as_string().is_none());
     }
@@ -324,9 +466,7 @@ mod tests {
         let mut gc = Gc::new();
         let r1 = gc.new_table(Table::new());
         let r2 = gc.new_table(Table::new());
-        // Different table allocations have different GcRefs
         assert_ne!(r1, r2);
-        // Same value copies compare equal
         let r1_copy = r1;
         assert_eq!(r1, r1_copy);
     }
@@ -340,5 +480,100 @@ mod tests {
         assert!(after_one > 0);
         gc.new_string(b"world");
         assert!(gc.bytes_allocated() > after_one);
+    }
+
+    // ── Mark-and-sweep tests ───────────────────────────────────────
+
+    #[test]
+    fn test_collect_unreachable_freed() {
+        let mut gc = Gc::new();
+        let alive = gc.new_string(b"alive");
+        let _dead = gc.new_string(b"this is a long dead string that won't be interned!!");
+        assert_eq!(gc.object_count(), 2);
+
+        gc.collect(&[alive]);
+        assert_eq!(gc.object_count(), 1);
+        // alive is still accessible
+        assert_eq!(alive.as_object().as_string().unwrap().as_bytes(), b"alive");
+    }
+
+    #[test]
+    fn test_collect_all_unreachable() {
+        let mut gc = Gc::new();
+        gc.new_table(Table::new());
+        gc.new_closure(Closure::new());
+        gc.new_string(b"this is a long dead string that won't be interned!!");
+        assert_eq!(gc.object_count(), 3);
+
+        gc.collect(&[]);
+        // Interned strings survive (string pool is a strong root kept by retain)
+        // but the long string + table + closure are freed
+        assert_eq!(gc.object_count(), 0);
+    }
+
+    #[test]
+    fn test_collect_traces_table_contents() {
+        let mut gc = Gc::new();
+        let inner_str = gc.new_string(b"inner_value_string_long_enough!!");
+        let mut t = Table::new();
+        t.raw_set(Value::Integer(1), Value::Object(inner_str));
+        let table_ref = gc.new_table(t);
+
+        // Also allocate a dead object
+        gc.new_closure(Closure::new());
+        assert_eq!(gc.object_count(), 3);
+
+        // Only root is the table; inner_str should survive through tracing
+        gc.collect(&[table_ref]);
+        assert_eq!(gc.object_count(), 2); // table + inner_str
+        assert_eq!(
+            inner_str.as_object().as_string().unwrap().as_bytes(),
+            b"inner_value_string_long_enough!!"
+        );
+    }
+
+    #[test]
+    fn test_collect_dead_interned_string_removed() {
+        let mut gc = Gc::new();
+        gc.new_string(b"temp");
+        assert_eq!(gc.interned_string_count(), 1);
+        assert_eq!(gc.object_count(), 1);
+
+        // Collect with no roots: the interned string is dead
+        gc.collect(&[]);
+        assert_eq!(gc.object_count(), 0);
+        assert_eq!(gc.interned_string_count(), 0);
+    }
+
+    #[test]
+    fn test_collect_threshold_adjusts() {
+        let mut gc = Gc::new();
+        let s = gc.new_string(b"keep");
+        gc.collect(&[s]);
+
+        // Threshold should be at least GC_INITIAL_THRESHOLD
+        assert!(gc.gc_threshold >= GC_INITIAL_THRESHOLD);
+    }
+
+    #[test]
+    fn test_collect_preserves_linked_list() {
+        let mut gc = Gc::new();
+        let a = gc.new_string(b"alpha_long_string_for_no_intern!!");
+        let _b = gc.new_string(b"bravo_long_string_for_no_intern!!");
+        let c = gc.new_string(b"charlie_long_string_not_interned!!");
+        let _d = gc.new_string(b"delta_long_string_for_no_intern!!");
+        assert_eq!(gc.object_count(), 4);
+
+        // Keep a and c, free b and d
+        gc.collect(&[a, c]);
+        assert_eq!(gc.object_count(), 2);
+
+        // Allocate more after sweep — list should still work
+        let e = gc.new_string(b"echo_long_string_for_no_intern!!!");
+        assert_eq!(gc.object_count(), 3);
+        assert_eq!(
+            e.as_object().as_string().unwrap().as_bytes(),
+            b"echo_long_string_for_no_intern!!!"
+        );
     }
 }

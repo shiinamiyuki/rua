@@ -65,14 +65,14 @@ Goal: Run simple Lua programs — arithmetic, control flow, functions, tables, r
 - [x] Unit tests: compile simple programs, verify instruction sequences
 
 ### M1.5 — Virtual Machine
-- [ ] VM state: register stack (`Vec<Value>`), call stack (`Vec<CallFrame>`)
-- [ ] Main dispatch loop (`match` on opcode)
-- [ ] Implement all Phase 1 opcodes (no metamethod fallback yet)
-- [ ] Function calls: push `CallFrame`, argument adjustment, result adjustment
-- [ ] Upvalue open/close mechanics
-- [ ] Numeric for loop
-- [ ] Generic for loop
-- [ ] Multiple return values
+- [x] VM state: register stack (`Vec<Value>`), call stack (`Vec<CallFrame>`)
+- [x] Main dispatch loop (`match` on opcode)
+- [x] Implement all Phase 1 opcodes (no metamethod fallback yet)
+- [x] Function calls: push `CallFrame`, argument adjustment, result adjustment
+- [x] Upvalue open/close mechanics
+- [x] Numeric for loop
+- [x] Generic for loop
+- [x] Multiple return values
 - [ ] Error handling: `LuaError`, `pcall` (basic)
 
 ### M1.6 — Basic GC
@@ -85,18 +85,18 @@ Goal: Run simple Lua programs — arithmetic, control flow, functions, tables, r
 - [ ] Trigger: allocate N bytes → run GC cycle
 
 ### M1.7 — Table
-- [ ] Hybrid array + hash map
-- [ ] Array part: `Vec<Value>`, integer keys `[1..n]`
-- [ ] Hash part: open-addressing, power-of-2 sizing
-- [ ] `rawget`, `rawset`, `next` traversal
-- [ ] Length operator (binary search for border)
-- [ ] Float-key-to-integer canonicalization, NaN rejection
+- [x] Hybrid array + hash map (array + linear-scan hash; open-addressing deferred to M4)
+- [x] Array part: `Vec<Value>`, integer keys `[1..n]`
+- [ ] Hash part: open-addressing, power-of-2 sizing (currently linear-scan `Vec<(Value, Value)>`)
+- [x] `rawget`, `rawset`, `next` traversal
+- [x] Length operator (array part length)
+- [x] Float-key-to-integer canonicalization, NaN rejection
 
 ### M1.8 — Minimal Stdlib & CLI
-- [ ] Basic library: `print`, `type`, `tostring`, `tonumber`, `error`, `pcall`, `assert`, `ipairs`, `pairs`, `next`, `select`, `rawget`, `rawset`, `rawequal`, `rawlen`, `setmetatable`, `getmetatable`
+- [x] Basic library: `print`, `type`, `tostring`, `tonumber`, `error`, `pcall`, `assert`, `ipairs`, `pairs`, `next`, `select`, `rawget`, `rawset`, `rawequal`, `rawlen`, `setmetatable`, `getmetatable`
 - [ ] `_VERSION` = `"Lua 5.5"`
-- [ ] CLI (`main.rs`): `rua script.lua`, `rua -e "code"`, basic REPL
-- [ ] Integration tests: fibonacci, factorial, table ops, closures, scoping
+- [x] CLI (`main.rs`): `rua script.lua`, `rua -e "code"`, basic REPL
+- [x] Integration tests: fibonacci, factorial, table ops, closures, scoping
 
 **Milestone check:** `rua tests/fib.lua` prints correct output.
 
