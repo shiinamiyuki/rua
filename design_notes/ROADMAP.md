@@ -38,12 +38,12 @@ Goal: Run simple Lua programs — arithmetic, control flow, functions, tables, r
 - [x] Unit tests: parse + round-trip for all statement/expression types
 
 ### M1.4 — Bytecode Compiler
-- [ ] `Proto` struct: code, constants, upvalue descriptors, nested protos, debug info
-- [ ] 32-bit instruction encoding/decoding (3 formats: ABC, ABx, AsBx) — see [`bytecode.md`](bytecode.md)
-- [ ] 50 generic opcodes (no specialized variants — deferred to M4.3)
-- [ ] Scope / local variable tracking, register allocation
-- [ ] Upvalue resolution (in_stack vs. parent upvalue chain)
-- [ ] Compile expressions → register-targeted code
+- [x] `Proto` struct: code, constants, upvalue descriptors, nested protos, debug info
+- [x] 32-bit instruction encoding/decoding (3 formats: ABC, ABx, AsBx) — see [`bytecode.md`](bytecode.md)
+- [x] 50 generic opcodes (no specialized variants — deferred to M4.3)
+- [x] Scope / local variable tracking, register allocation
+- [x] Upvalue resolution (in_stack vs. parent upvalue chain)
+- [x] Compile expressions → register-targeted code
   - Constants: `LOADNIL`, `LOADBOOL`, `LOADI`, `LOADK`
   - Arithmetic: `ADD`, `SUB`, `MUL`, `DIV`, `IDIV`, `MOD`, `POW`, `UNM`
   - Bitwise: `BAND`, `BOR`, `BXOR`, `BNOT`, `SHL`, `SHR`
@@ -51,7 +51,7 @@ Goal: Run simple Lua programs — arithmetic, control flow, functions, tables, r
   - Concatenation: `CONCAT`
   - Length: `LEN`
   - Logic: short-circuit `and`/`or`, `NOT`
-- [ ] Compile statements → bytecode
+- [x] Compile statements → bytecode
   - Assignment (local, global via `GETTABUP`/`SETTABUP` on `_ENV`)
   - Control flow: `JMP`, `FORLOOP`, `FORPREP`, `TFORPREP`, `TFORLOOP`
   - Function call: `CALL`, `TAILCALL`, `RETURN`
@@ -60,9 +60,9 @@ Goal: Run simple Lua programs — arithmetic, control flow, functions, tables, r
   - Closures: `CLOSURE`
   - Vararg: `VARARG`, `VARARGPREP`
   - Misc: `MOVE`, `CLOSE`, `TBC`
-- [ ] `_ENV` as upvalue[0] of every chunk
-- [ ] Bytecode disassembler (for debugging)
-- [ ] Unit tests: compile simple programs, verify instruction sequences
+- [x] `_ENV` as upvalue[0] of every chunk
+- [x] Bytecode disassembler (for debugging)
+- [x] Unit tests: compile simple programs, verify instruction sequences
 
 ### M1.5 — Virtual Machine
 - [ ] VM state: register stack (`Vec<Value>`), call stack (`Vec<CallFrame>`)

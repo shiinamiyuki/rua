@@ -107,3 +107,24 @@ Files created/updated:
 - `design_notes/ROADMAP.md`: M1.4 updated (3 formats, 50 opcodes, no TFORCALL/RETURN0/RETURN1). M4.3 updated (benchmark-guided specialization).
 
 ## APPEND HERE
+
+## M1.4 — Bytecode Compiler (completed)
+
+### Summary
+Implemented the full bytecode compiler for M1.4, transforming AST → bytecode `Proto` structs.
+
+### What was built
+- **`src/bytecode.rs`** (~400 lines): `OpCode` enum with 50 opcodes, 3 instruction formats (ABC/ABx/AsBx), encoding/decoding functions, `Proto`/`Constant`/`UpvalueDesc`/`LocalVarInfo` structs, bytecode disassembler, 5 unit tests.
+- **`src/compiler.rs`** (~2000 lines): Full compiler with `FuncState` per-function state, scope/local tracking, register allocation (locals map 1:1 to registers, temporaries above), constant pool management, upvalue resolution (in_stack + parent chain), `_ENV` as upvalue[0]. Compiles all statement types (assignment, if/while/repeat/for/goto/label/break/return/function-def/local-decl) and all expression types (constants, arithmetic, bitwise, comparison, concatenation, length, logic with short-circuit, unary ops, table constructors, function calls, closures, vararg). 16 unit tests.
+
+### Key design decisions
+- Register allocation: locals start at R[0], temporaries allocated above via `free_reg` bump pointer, max 250 per function.
+- Comparisons compile to: `CMP invert left right; LOADBOOL dest 1 1; LOADBOOL dest 0 0` (3-instruction boolean materialization).
+- Short-circuit `and`/`or` use `TESTSET` with jump to skip the second operand.
+- Concat flattening: `a..b..c` compiles all operands contiguously then one `CONCAT` instruction.
+- Generic for uses `TFORPREP`/`TFORLOOP` pair with iterator state in 3 hidden registers.
+- `SETLIST` uses `FIELDS_PER_FLUSH=50` for large table constructors, with `EXTRAARG` for flush counts > 511.
+- Nested function compilation temporarily detaches parent state to resolve upvalues across nesting levels.
+
+### Test results
+All 138 tests pass (136 unit + 1 lex upstream + 1 parse upstream). No regressions.
