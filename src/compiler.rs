@@ -254,8 +254,13 @@ impl FuncState {
     fn leave_scope(&mut self, line: u32) -> Result<(), LuaError> {
         let scope = self.scopes.pop().expect("unbalanced scopes");
 
-        // Emit CLOSE if there are upvalues referencing locals in this scope
-        if scope.has_upvalues {
+        // Check if any locals in this scope are <close> or capture upvalues
+        let has_close = self.locals[scope.first_local..]
+            .iter()
+            .any(|l| l.is_close);
+
+        // Emit CLOSE if there are upvalues or to-be-closed vars in this scope
+        if scope.has_upvalues || has_close {
             let first_reg = if scope.first_local < self.locals.len() {
                 self.locals[scope.first_local].reg
             } else {
@@ -401,6 +406,16 @@ impl FuncState {
             }
         }
         None
+    }
+
+    /// Check if there are any `<close>` locals in any active scope.
+    fn has_close_vars_in_scope(&self) -> bool {
+        for local in &self.locals {
+            if local.is_close {
+                return true;
+            }
+        }
+        false
     }
 }
 
@@ -625,7 +640,7 @@ fn compile_funcall_stat(
 ) -> Result<(), LuaError> {
     let base = fs.free_reg;
     let func_reg = fs.alloc_reg()?;
-    compile_funcall(fs, call, func_reg, 1, line)?; // C=1 means discard results
+    compile_funcall(fs, call, func_reg, 1, false, line)?; // C=1 means discard results
     fs.free_reg_to(base);
     Ok(())
 }
@@ -1167,6 +1182,19 @@ fn compile_func_body_with_parent(
         child_fs.add_local(param.clone())?;
     }
 
+    // Pre-resolve: collect all variable names referenced in the body (including
+    // nested functions) and ensure the parent resolves any that would become
+    // upvalues. This is necessary because the dummy enclosing FuncState only
+    // has one level of context, so deeply-nested references would otherwise
+    // fail to resolve through the grandparent chain.
+    let free_names = collect_free_names(&body.body, &body.params);
+    for name in &free_names {
+        // Only resolve if the parent doesn't already have it as a local or upvalue
+        if parent_fs.find_local(name).is_none() {
+            parent_fs.find_upvalue(name);
+        }
+    }
+
     // Stash parent local info so the child can resolve upvalues.
     // Name resolution: child local → parent local (upvalue in_stack) →
     // parent upvalue → _ENV global.
@@ -1213,6 +1241,210 @@ fn compile_func_body_with_parent(
     }
 
     Ok(child_fs.finish())
+}
+
+/// Collect all variable names referenced (potentially as upvalues) in a function
+/// body, excluding names that are locally bound (params, locals defined inside).
+/// This is used to pre-resolve upvalues in the parent before snapshotting.
+fn collect_free_names(block: &Block, params: &[String]) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut locals: Vec<String> = params.to_vec();
+    collect_free_names_block(block, &mut locals, &mut names);
+    // Deduplicate
+    names.sort();
+    names.dedup();
+    names
+}
+
+fn collect_free_names_block(block: &Block, locals: &mut Vec<String>, names: &mut Vec<String>) {
+    let saved_locals = locals.len();
+    for stat in &block.stmts {
+        collect_free_names_stat(&stat.node, locals, names);
+    }
+    if let Some(ref ret) = block.ret {
+        for expr in &ret.values {
+            collect_free_names_expr(&expr.node, locals, names);
+        }
+    }
+    locals.truncate(saved_locals);
+}
+
+fn collect_free_names_stat(stat: &StatKind, locals: &mut Vec<String>, names: &mut Vec<String>) {
+    match stat {
+        StatKind::Assign { targets, values } => {
+            for v in values {
+                collect_free_names_expr(&v.node, locals, names);
+            }
+            for t in targets {
+                collect_free_names_var(t, locals, names);
+            }
+        }
+        StatKind::FunctionCall(call) => {
+            collect_free_names_call(call, locals, names);
+        }
+        StatKind::DoBlock(block) => {
+            collect_free_names_block(block, locals, names);
+        }
+        StatKind::While { cond, body } => {
+            collect_free_names_expr(&cond.node, locals, names);
+            collect_free_names_block(body, locals, names);
+        }
+        StatKind::Repeat { body, cond } => {
+            collect_free_names_block(body, locals, names);
+            collect_free_names_expr(&cond.node, locals, names);
+        }
+        StatKind::If { cond, then_block, elseif_clauses, else_block } => {
+            collect_free_names_expr(&cond.node, locals, names);
+            collect_free_names_block(then_block, locals, names);
+            for (c, b) in elseif_clauses {
+                collect_free_names_expr(&c.node, locals, names);
+                collect_free_names_block(b, locals, names);
+            }
+            if let Some(b) = else_block {
+                collect_free_names_block(b, locals, names);
+            }
+        }
+        StatKind::NumericFor { name, init, limit, step, body } => {
+            collect_free_names_expr(&init.node, locals, names);
+            collect_free_names_expr(&limit.node, locals, names);
+            if let Some(s) = step {
+                collect_free_names_expr(&s.node, locals, names);
+            }
+            locals.push(name.clone());
+            collect_free_names_block(body, locals, names);
+            locals.pop();
+        }
+        StatKind::GenericFor { names: for_names, iterators, body } => {
+            for iter in iterators {
+                collect_free_names_expr(&iter.node, locals, names);
+            }
+            let saved = locals.len();
+            for n in for_names {
+                locals.push(n.clone());
+            }
+            collect_free_names_block(body, locals, names);
+            locals.truncate(saved);
+        }
+        StatKind::LocalDecl { names: decl_names, values } => {
+            for v in values {
+                collect_free_names_expr(&v.node, locals, names);
+            }
+            for n in decl_names {
+                locals.push(n.name.clone());
+            }
+        }
+        StatKind::GlobalDecl { names: _, values } => {
+            for v in values {
+                collect_free_names_expr(&v.node, locals, names);
+            }
+        }
+        StatKind::FuncDef { body, .. } | StatKind::GlobalFuncDef { body, .. } => {
+            // Recurse into the body — free vars there might reference our scope
+            collect_free_names_funcbody(body, locals, names);
+        }
+        StatKind::LocalFuncDef { name, body } => {
+            locals.push(name.clone());
+            collect_free_names_funcbody(body, locals, names);
+        }
+        StatKind::Empty | StatKind::Goto(_) | StatKind::Label(_)
+        | StatKind::Break | StatKind::GlobalStar { .. } => {}
+    }
+}
+
+fn collect_free_names_expr(expr: &ExprKind, locals: &mut Vec<String>, names: &mut Vec<String>) {
+    match expr {
+        ExprKind::Var(var) => {
+            collect_free_names_var(var, locals, names);
+        }
+        ExprKind::FunctionCall(call) => {
+            collect_free_names_call(call, locals, names);
+        }
+        ExprKind::FunctionDef(body) => {
+            collect_free_names_funcbody(body, locals, names);
+        }
+        ExprKind::TableConstructor(fields) => {
+            for f in fields {
+                match &f.kind {
+                    FieldKind::IndexedAssign { key, value } => {
+                        collect_free_names_expr(&key.node, locals, names);
+                        collect_free_names_expr(&value.node, locals, names);
+                    }
+                    FieldKind::NameAssign { value, .. } => {
+                        collect_free_names_expr(&value.node, locals, names);
+                    }
+                    FieldKind::Positional(v) => {
+                        collect_free_names_expr(&v.node, locals, names);
+                    }
+                }
+            }
+        }
+        ExprKind::BinOp { lhs, rhs, .. } => {
+            collect_free_names_expr(&lhs.node, locals, names);
+            collect_free_names_expr(&rhs.node, locals, names);
+        }
+        ExprKind::UnOp { operand, .. } => {
+            collect_free_names_expr(&operand.node, locals, names);
+        }
+        ExprKind::Nil | ExprKind::True | ExprKind::False
+        | ExprKind::Integer(_) | ExprKind::Float(_)
+        | ExprKind::String(_) | ExprKind::VarArg => {}
+    }
+}
+
+fn collect_free_names_var(var: &Var, locals: &mut Vec<String>, names: &mut Vec<String>) {
+    match var {
+        Var::Name(n) => {
+            if !locals.contains(n) {
+                names.push(n.clone());
+            }
+        }
+        Var::Index { table, key } => {
+            collect_free_names_expr(&table.node, locals, names);
+            collect_free_names_expr(&key.node, locals, names);
+        }
+        Var::Field { table, .. } => {
+            collect_free_names_expr(&table.node, locals, names);
+        }
+    }
+}
+
+fn collect_free_names_call(call: &FunctionCall, locals: &mut Vec<String>, names: &mut Vec<String>) {
+    collect_free_names_expr(&call.callee.node, locals, names);
+    match &call.args {
+        CallArgs::Exprs(exprs) => {
+            for e in exprs {
+                collect_free_names_expr(&e.node, locals, names);
+            }
+        }
+        CallArgs::Table(fields) => {
+            for f in fields {
+                match &f.kind {
+                    FieldKind::IndexedAssign { key, value } => {
+                        collect_free_names_expr(&key.node, locals, names);
+                        collect_free_names_expr(&value.node, locals, names);
+                    }
+                    FieldKind::NameAssign { value, .. } => {
+                        collect_free_names_expr(&value.node, locals, names);
+                    }
+                    FieldKind::Positional(v) => {
+                        collect_free_names_expr(&v.node, locals, names);
+                    }
+                }
+            }
+        }
+        CallArgs::String(_) => {}
+    }
+}
+
+fn collect_free_names_funcbody(body: &FuncBody, locals: &mut Vec<String>, names: &mut Vec<String>) {
+    // For nested functions, collect free names from their body too.
+    // The nested function's params are local to it, not to us.
+    let saved = locals.len();
+    for p in &body.params {
+        locals.push(p.clone());
+    }
+    collect_free_names_block(&body.body, locals, names);
+    locals.truncate(saved);
 }
 
 /// Resolve an upvalue name against the parent FuncState.
@@ -1375,6 +1607,20 @@ fn compile_return(fs: &mut FuncState, ret: &RetStat) -> Result<(), LuaError> {
     if nvals == 0 {
         fs.emit_abc(OpCode::Return, 0, 1, 0, line);
     } else {
+        // Tail call detection: return f(...) with exactly one function call
+        // and no to-be-closed variables in scope
+        if nvals == 1 {
+            if let ExprKind::FunctionCall(ref call) = ret.values[0].node {
+                if !fs.has_close_vars_in_scope() {
+                    let base = fs.free_reg;
+                    let func_reg = fs.alloc_reg()?;
+                    compile_funcall(fs, call, func_reg, 0, true, line)?;
+                    fs.free_reg_to(base);
+                    return Ok(());
+                }
+            }
+        }
+
         let base = fs.free_reg;
         for (i, val) in ret.values.iter().enumerate() {
             let is_last = i == nvals - 1;
@@ -1444,7 +1690,7 @@ fn compile_expr_to_reg(fs: &mut FuncState, expr: &Expr, dest: u8) -> Result<(), 
             compile_var_read(fs, var, dest, line)?;
         }
         ExprKind::FunctionCall(call) => {
-            compile_funcall(fs, call, dest, 2, line)?; // C=2: one result
+            compile_funcall(fs, call, dest, 2, false, line)?; // C=2: one result
         }
         ExprKind::FunctionDef(body) => {
             let proto = compile_func_body_with_parent(fs, body, line)?;
@@ -1478,7 +1724,7 @@ fn compile_expr_multi(
         ExprKind::FunctionCall(call) => {
             // C=0 means results go to top of stack; C=wanted+1 means wanted results
             let c = if wanted == 0 { 0 } else { wanted + 1 };
-            compile_funcall(fs, call, dest, c, line)?;
+            compile_funcall(fs, call, dest, c, false, line)?;
         }
         ExprKind::VarArg => {
             let c = if wanted == 0 { 0 } else { wanted + 1 };
@@ -1548,6 +1794,7 @@ fn compile_funcall(
     call: &FunctionCall,
     base: u8,
     c: u8,
+    is_tailcall: bool,
     line: u32,
 ) -> Result<(), LuaError> {
     // Compile callee into base register
@@ -1616,7 +1863,8 @@ fn compile_funcall(
         if is_last && is_multi_value_expr(arg) {
             compile_expr_multi(fs, arg, arg_reg, 0)?; // 0 = pass all
             // B=0: args extend to top
-            fs.emit_abc(OpCode::Call, base, 0, c, line);
+            let opcode = if is_tailcall { OpCode::TailCall } else { OpCode::Call };
+            fs.emit_abc(opcode, base, 0, c, line);
             fs.free_reg_to(saved_free.max(base + 1));
             return Ok(());
         }
@@ -1625,7 +1873,8 @@ fn compile_funcall(
 
     // B = nargs + 1 (plus self if method call)
     let b = (nargs as u8) + self_extra + 1;
-    fs.emit_abc(OpCode::Call, base, b, c, line);
+    let opcode = if is_tailcall { OpCode::TailCall } else { OpCode::Call };
+    fs.emit_abc(opcode, base, b, c, line);
     fs.free_reg_to(saved_free.max(base + 1));
 
     Ok(())

@@ -126,11 +126,11 @@ Goal: Pass the majority of the Lua test suite (non-coroutine, non-IO parts).
 - [x] Exponentiation always returns float
 
 ### M2.3 — Variable Declarations (Lua 5.5)
-- [ ] `global` name declarations (compiler-level name resolution)
-- [ ] `global *` / `global<const> *` (implicit global mode tracking per scope)
-- [ ] `local <const>` (compile-time assignment check)
-- [ ] `local <close>` → `TBC` instruction, `__close` metamethod on scope exit
-- [ ] To-be-closed: reverse-order close, error handling during close, interaction with `break`/`goto`/`return`
+- [x] `global` name declarations (compiler-level name resolution)
+- [x] `global *` / `global<const> *` (implicit global mode tracking per scope)
+- [x] `local <const>` (compile-time assignment check)
+- [x] `local <close>` → `TBC` instruction, `__close` metamethod on scope exit
+- [x] To-be-closed: reverse-order close, error handling during close, interaction with `break`/`goto`/`return`
 
 ### M2.4 — Vararg & Multi-return
 - [ ] `VARARGPREP` / `VARARG` opcodes
@@ -140,10 +140,10 @@ Goal: Pass the majority of the Lua test suite (non-coroutine, non-IO parts).
 - [ ] `select('#', ...)` and `select(n, ...)`
 
 ### M2.5 — Tail Calls & Goto
-- [ ] `TAILCALL`: reuse current frame, move args
-- [ ] Proper tail recursion (no stack growth)
-- [ ] `goto` / labels: compile to `JMP`
-- [ ] Scope validation: can't jump into a local's scope, can't shadow label in same block
+- [x] `TAILCALL`: reuse current frame, move args
+- [x] Proper tail recursion (no stack growth)
+- [x] `goto` / labels: compile to `JMP`
+- [x] Scope validation: can't jump into a local's scope, can't shadow label in same block
 
 ### M2.6 — String Library
 - [ ] `string.byte`, `string.char`, `string.len`, `string.sub`, `string.rep`, `string.reverse`

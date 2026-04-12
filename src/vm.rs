@@ -36,6 +36,7 @@ const MM_NEWINDEX: &[u8] = b"__newindex";
 const MM_CALL: &[u8] = b"__call";
 const MM_TOSTRING: &[u8] = b"__tostring";
 const MM_METATABLE: &[u8] = b"__metatable";
+const MM_CLOSE: &[u8] = b"__close";
 
 // ── Call frame ─────────────────────────────────────────────────────
 
@@ -75,6 +76,8 @@ pub struct Vm {
     top: usize,
     /// GcRef to the pcall closure (for special-case detection in CALL).
     pcall_ref: Option<GcRef>,
+    /// Stack indices of to-be-closed variables (sorted ascending).
+    tbc_slots: Vec<usize>,
 }
 
 impl Vm {
@@ -87,6 +90,7 @@ impl Vm {
             open_upvalues: Vec::new(),
             top: 0,
             pcall_ref: None,
+            tbc_slots: Vec::new(),
         }
     }
 
@@ -129,6 +133,7 @@ impl Vm {
             MM_BAND, MM_BOR, MM_BXOR, MM_BNOT, MM_SHL, MM_SHR,
             MM_CONCAT, MM_LEN, MM_EQ, MM_LT, MM_LE,
             MM_INDEX, MM_NEWINDEX, MM_CALL, MM_TOSTRING, MM_METATABLE,
+            MM_CLOSE,
         ] {
             self.gc.new_string(name);
         }
@@ -235,6 +240,47 @@ impl Vm {
         }
         self.open_upvalues
             .retain(|uv| matches!(*uv.borrow(), Upvalue::Open(_)));
+    }
+
+    /// Close all to-be-closed variables with stack index >= `from`.
+    /// Calls `__close` metamethod in reverse order. `err_obj` is the error
+    /// object (if any) that caused the scope exit.
+    fn close_tbc_vars(&mut self, from: usize, err_obj: Option<Value>) -> Result<(), LuaError> {
+        // Collect TBC slots at or above `from` in reverse order
+        let mut to_close: Vec<usize> = Vec::new();
+        while let Some(&slot) = self.tbc_slots.last() {
+            if slot >= from {
+                self.tbc_slots.pop();
+                to_close.push(slot);
+            } else {
+                break;
+            }
+        }
+
+        let mut first_err: Option<LuaError> = None;
+        for slot in to_close {
+            let val = self.stack[slot];
+            // nil and false are silently ignored
+            if val == Value::Nil || val == Value::Boolean(false) {
+                continue;
+            }
+            if let Some(mm) = self.get_metamethod(val, MM_CLOSE) {
+                let err_arg = err_obj.unwrap_or(Value::Nil);
+                let result = self.call_value(mm, &[val, err_arg]);
+                if let Err(e) = result {
+                    if first_err.is_none() {
+                        first_err = Some(e);
+                    }
+                }
+            }
+            // Per spec: value must have __close or be nil/false
+            // If it has neither, that's an error (already validated at TBC time)
+        }
+
+        if let Some(e) = first_err {
+            return Err(e);
+        }
+        Ok(())
     }
 
     // ── Metamethod infrastructure ─────────────────────────────────
@@ -994,7 +1040,7 @@ impl Vm {
         self.execute_to_depth(0)
     }
 
-    fn execute_to_depth(&mut self, min_depth: usize) -> Result<(), LuaError> {
+    fn  execute_to_depth(&mut self, min_depth: usize) -> Result<(), LuaError> {
         loop {
             if self.frames.len() <= min_depth {
                 return Ok(());
@@ -1443,6 +1489,7 @@ impl Vm {
                         .map(|i| self.stack[base + a + 1 + i])
                         .collect();
 
+                    self.close_tbc_vars(base, None)?;
                     self.close_upvalues(base);
 
                     let result_base = self.frames[fi].result_base;
@@ -1467,6 +1514,7 @@ impl Vm {
                     let results: Vec<Value> =
                         (0..num_ret).map(|i| self.stack[base + a + i]).collect();
 
+                    self.close_tbc_vars(base, None)?;
                     self.close_upvalues(base);
 
                     let result_base = self.frames[fi].result_base;
@@ -1504,11 +1552,21 @@ impl Vm {
 
                 // ── Scope & cleanup ────────────────────────────────
                 OpCode::Close => {
+                    self.close_tbc_vars(base + a, None)?;
                     self.close_upvalues(base + a);
                 }
 
                 OpCode::Tbc => {
-                    // To-be-closed: tracked but __close not called yet (Phase 2)
+                    // Validate: value must have __close or be nil/false
+                    let val = self.reg(base, a);
+                    if val != Value::Nil && val != Value::Boolean(false) {
+                        if self.get_metamethod(val, MM_CLOSE).is_none() {
+                            return Err(LuaError::new(
+                                "variable is not closable (no __close metamethod)",
+                            ));
+                        }
+                    }
+                    self.tbc_slots.push(base + a);
                 }
 
                 OpCode::ExtraArg => {
@@ -1717,8 +1775,8 @@ impl Vm {
                             }
                         }
                         Err(e) => {
-                            self.recover_from_error(saved_depth, saved_open_uv_len);
                             let err_val = e.to_value(&mut self.gc);
+                            self.recover_from_error(saved_depth, saved_open_uv_len, Some(err_val));
                             self.place_results(
                                 result_base,
                                 num_results,
@@ -1738,8 +1796,8 @@ impl Vm {
             }
             Err(e) => {
                 // The call itself failed (e.g. calling a non-function)
-                self.recover_from_error(saved_depth, saved_open_uv_len);
                 let err_val = e.to_value(&mut self.gc);
+                self.recover_from_error(saved_depth, saved_open_uv_len, Some(err_val));
                 self.place_results(
                     result_base,
                     num_results,
@@ -1751,7 +1809,12 @@ impl Vm {
     }
 
     /// Unwind frames and upvalues back to a saved checkpoint after an error.
-    fn recover_from_error(&mut self, saved_depth: usize, saved_open_uv_len: usize) {
+    fn recover_from_error(&mut self, saved_depth: usize, saved_open_uv_len: usize, err_obj: Option<Value>) {
+        // Close TBC vars for all frames being unwound
+        if self.frames.len() > saved_depth {
+            let from = self.frames[saved_depth].base;
+            let _ = self.close_tbc_vars(from, err_obj);
+        }
         while self.frames.len() > saved_depth {
             let frame_base = self.frames.last().unwrap().base;
             self.close_upvalues(frame_base);

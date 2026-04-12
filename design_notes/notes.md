@@ -179,8 +179,6 @@ All 138 tests pass (136 unit + 1 lex upstream + 1 parse upstream). No regression
 - 156 unit tests (cargo test)
 - Integration tests: test_basic.lua, test_gc_stress.lua, test_metamethods.lua
 
-## APPEND HERE
-
 ## Session 5 — Phase 1 Completion (pcall + Open-Addressing Hash Table)
 
 ### M1.5 — pcall / Error Handling
@@ -206,3 +204,31 @@ All 138 tests pass (136 unit + 1 lex upstream + 1 parse upstream). No regression
 
 ### Phase 1 Status
 All Phase 1 milestones (M1.1–M1.8) are now **complete**. Ready for Phase 2 (metamethods, full operator semantics, etc.).
+
+## Session: M2.5 + M2.3 Implementation (Tail Calls, Goto, Variable Declarations)
+
+### Completed
+- **M2.5 — Tail Calls**: Compiler now detects tail call position (`return f()` with no `<close>` vars in scope) and emits `TAILCALL` opcode. VM already had `TAILCALL` handler from Phase 1. Added `has_close_vars_in_scope()` helper and `is_tailcall` parameter to `compile_funcall`. Verified deep recursion (100,000 levels) without stack overflow.
+- **M2.5 — Goto/Labels**: Already fully implemented in Phase 1 (compile_goto, compile_label, scope validation, JMP dispatch).
+- **M2.3 — local `<const>`**: Already implemented in Phase 1 (compile-time assignment check).
+- **M2.3 — global declarations**: Already implemented in Phase 1 (SETTABUP to _ENV).
+- **M2.3 — local `<close>` / TBC / `__close`**: Full implementation:
+  - Added `MM_CLOSE` constant and pre-interning in `create_global_env`
+  - Added `tbc_slots: Vec<usize>` to VM for tracking to-be-closed variable stack positions
+  - Implemented `close_tbc_vars(from, err_obj)` — closes TBC vars in reverse order, calls `__close` metamethod
+  - TBC opcode validates value has `__close` or is nil/false
+  - CLOSE opcode calls `close_tbc_vars` before `close_upvalues`
+  - RETURN/TAILCALL close TBC vars before returning
+  - Compiler `leave_scope` emits CLOSE when scope has `<close>` locals
+
+### Bug Fixes
+1. **Upvalue resolution for nested functions**: When a lambda (e.g., `__close` handler) inside function `f` references a variable from `f`'s parent scope, the dummy FuncState used in `compile_func_body_with_parent` couldn't resolve it (dummy had `enclosing: None`). Fixed by implementing `collect_free_names()` — an AST walker (~170 lines) that collects all variable references from a function body. Before creating the dummy snapshot, all free names are pre-resolved via `parent_fs.find_upvalue(name)`, ensuring the parent's upvalue list is complete.
+2. **TBC closing on error**: When an error occurred inside a pcall'd function, `recover_from_error` closed upvalues but not TBC variables. Fixed by adding `err_obj: Option<Value>` parameter to `recover_from_error` and calling `close_tbc_vars(from, err_obj)` before unwinding frames. Both error paths in `handle_pcall` now convert the error value before calling recovery.
+
+### Test Results
+- 158 unit tests pass (156 lib + 1 lex + 1 parse)
+- All integration tests pass: test_basic.lua, test_gc_stress.lua, test_metamethods.lua, test_tailcall_goto_close.lua
+- New test file: `tests/test_tailcall_goto_close.lua` — covers tail calls (deep recursion, mutual, multiple args), goto, `<const>`, `<close>` (scope exit, reverse order, nil/false, return, error via pcall), global declarations, tail call inhibited by `<close>
+
+
+## APPEND HERE
