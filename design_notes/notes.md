@@ -106,7 +106,6 @@ Files created/updated:
 - `design_notes/rua-design.md`: Section 6 condensed to summary + reference to bytecode.md. Key decisions table updated.
 - `design_notes/ROADMAP.md`: M1.4 updated (3 formats, 50 opcodes, no TFORCALL/RETURN0/RETURN1). M4.3 updated (benchmark-guided specialization).
 
-## APPEND HERE
 
 ## M1.4 — Bytecode Compiler (completed)
 
@@ -128,3 +127,18 @@ Implemented the full bytecode compiler for M1.4, transforming AST → bytecode `
 
 ### Test results
 All 138 tests pass (136 unit + 1 lex upstream + 1 parse upstream). No regressions.
+
+
+## Session – VM Bug Fixes (FORPREP & Multi-Return)
+
+### Bugs Found & Fixed
+
+1. **FORPREP pre-subtract step** (`vm.rs`): `ForPrep` handler only validated and jumped to `ForLoop` without pre-subtracting step from init. Since `ForLoop` first adds step then checks the range, the first iteration got `init+step` instead of `init`. Fix: added `Self::arith_sub(init, step)` and `set_reg` in `ForPrep` handler before jumping.
+
+2. **Multi-return nil-fill in `compile_local_decl`** (`compiler.rs`): For `local a, b, c = multi()`, the compiler correctly called `compile_expr_multi` which emits `CALL R0, 1, 4` (wanting 3 results). But then the post-loop nil-fill `if nvalues < nnames` ran and emitted `LoadNil` over R1/R2, overwriting the CALL results. Fix: changed condition to `if nvalues == 0 && nnames > 0` — nil-fill only when no value expressions at all, since `compile_expr_multi` already handles remaining slots (both for multi-value and single-value expressions).
+
+### Test Results
+- All 152 tests pass (150 unit + 2 integration)
+- `test_basic.lua` runs end-to-end correctly: arithmetic, variables, control flow, while loops, numeric for (1..5), functions (factorial, fibonacci), closures, tables, type checking, multi-return, boolean logic
+
+## APPEND HERE

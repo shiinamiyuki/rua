@@ -1286,15 +1286,12 @@ fn compile_local_decl(
         }
     }
 
-    // If fewer values than names, nil-fill
-    if nvalues < nnames {
-        let fill_start = base + nvalues as u8;
-        let fill_count = (nnames - nvalues) as u8;
-        if nvalues == 0 {
-            // Need to allocate the registers first
-            fs.alloc_regs(fill_count)?;
-        }
-        fs.emit_abc(OpCode::LoadNil, fill_start, fill_count - 1, 0, line);
+    // If no values at all, nil-fill all names.
+    // (When nvalues > 0 and nnames > nvalues, compile_expr_multi already handled remaining slots)
+    if nvalues == 0 && nnames > 0 {
+        let fill_count = nnames as u8;
+        fs.alloc_regs(fill_count)?;
+        fs.emit_abc(OpCode::LoadNil, base, fill_count - 1, 0, line);
     }
 
     // Register locals

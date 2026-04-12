@@ -61,6 +61,14 @@ impl GcObject {
             _ => None,
         }
     }
+
+    /// Get a mutable reference to the closure data, if this is a closure object.
+    pub fn as_closure_mut(&mut self) -> Option<&mut Closure> {
+        match &mut self.kind {
+            GcObjectKind::Closure(c) => Some(c),
+            _ => None,
+        }
+    }
 }
 
 /// A reference to a GC-managed object.
