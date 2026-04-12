@@ -161,3 +161,29 @@ All 138 tests pass (136 unit + 1 lex upstream + 1 parse upstream). No regression
 - `test_basic.lua` and `test_gc_stress.lua` both pass end-to-end
 
 ## APPEND HERE
+
+## Session 5 — Phase 1 Completion (pcall + Open-Addressing Hash Table)
+
+### M1.5 — pcall / Error Handling
+- `LuaError` now carries `value: Option<Value>` so Lua errors can be any value type (not just strings)
+- Added `LuaError::with_value(Value)`, `to_value(&mut Gc) -> Value` methods
+- pcall is VM-level (not a native function) — identified by GcRef pointer comparison in the CALL opcode handler
+- Refactored `execute()` → `execute_to_depth(min_depth)` to support recursive protected calls
+- `handle_pcall()` saves frame depth + open upvalue count, sets up inner call, runs `execute_to_depth(saved_depth)`, catches errors
+- `recover_from_error()` unwinds frames and upvalues on error
+- Returns `(true, results...)` on success, `(false, err)` on failure
+- Tested: basic error, multi-return, arg forwarding, nil call, error(42), nested pcall — all working
+
+### M1.7 — Open-Addressing Hash Table
+- Replaced `Vec<(Value, Value)>` linear-scan hash with proper open-addressing hash map
+- Power-of-2 sizing with `hash_log2` tracking, linear probing
+- `HashEntry { key: Value, val: Value }` stored as `Vec<Option<HashEntry>>`
+- Hash function: Fibonacci multiplicative hash for integers, bit reinterpretation for floats, precomputed hash for strings, pointer hash for tables/closures
+- Backward-shift deletion (no tombstones needed) — maintains probe chain integrity
+- Grows at 75% load factor, initial capacity of 4 (1 << 2) on first insert
+- `migrate_hash_to_array()` moves sequential integer keys to array part on extension
+- Updated GC tracing in `gc.rs` to iterate `Option<HashEntry>` slots
+- All 156 unit tests + integration tests (test_basic.lua, test_gc_stress.lua) pass
+
+### Phase 1 Status
+All Phase 1 milestones (M1.1–M1.8) are now **complete**. Ready for Phase 2 (metamethods, full operator semantics, etc.).

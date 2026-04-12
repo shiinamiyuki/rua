@@ -222,7 +222,7 @@ impl Gc {
             GcObjectKind::String(s) => base + s.as_bytes().len(),
             GcObjectKind::Table(t) => {
                 base + t.array.capacity() * std::mem::size_of::<Value>()
-                    + t.hash.capacity() * std::mem::size_of::<(Value, Value)>()
+                    + t.hash.capacity() * std::mem::size_of::<Option<(Value, Value)>>()
             }
             GcObjectKind::Closure(_) => base,
         }
@@ -278,12 +278,14 @@ impl Gc {
                     }
                 }
                 // Trace hash keys and values
-                for (k, v) in &t.hash {
-                    if let Value::Object(r) = k {
-                        self.mark_object(*r, gray);
-                    }
-                    if let Value::Object(r) = v {
-                        self.mark_object(*r, gray);
+                for entry in &t.hash {
+                    if let Some(e) = entry {
+                        if let Value::Object(r) = e.key {
+                            self.mark_object(r, gray);
+                        }
+                        if let Value::Object(r) = e.val {
+                            self.mark_object(r, gray);
+                        }
                     }
                 }
                 // Trace metatable

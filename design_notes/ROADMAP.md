@@ -73,28 +73,28 @@ Goal: Run simple Lua programs — arithmetic, control flow, functions, tables, r
 - [x] Numeric for loop
 - [x] Generic for loop
 - [x] Multiple return values
-- [ ] Error handling: `LuaError`, `pcall` (basic)
+- [x] Error handling: `LuaError`, `pcall` (basic)
 
 ### M1.6 — Basic GC
-- [ ] Stop-the-world mark-and-sweep
-- [ ] GC object header (type tag, mark bit, next pointer)
-- [ ] Allocation: all GC objects go through `Gc::alloc()`
-- [ ] Root scanning: stack, global table, open upvalues
-- [ ] Mark phase: trace from roots
-- [ ] Sweep phase: free unmarked objects
-- [ ] Trigger: allocate N bytes → run GC cycle
+- [x] Stop-the-world mark-and-sweep
+- [x] GC object header (type tag, mark bit, next pointer) — intrusive linked list
+- [x] Allocation: all GC objects go through `Gc::alloc()`
+- [x] Root scanning: stack, global table, open upvalues
+- [x] Mark phase: trace from roots (gray worklist, iterative)
+- [x] Sweep phase: free unmarked objects (intrusive list pointer surgery)
+- [x] Trigger: allocate N bytes → run GC cycle (threshold-based, checked at NEWTABLE/CLOSURE/CONCAT)
 
 ### M1.7 — Table
-- [x] Hybrid array + hash map (array + linear-scan hash; open-addressing deferred to M4)
+- [x] Hybrid array + open-addressing hash map
 - [x] Array part: `Vec<Value>`, integer keys `[1..n]`
-- [ ] Hash part: open-addressing, power-of-2 sizing (currently linear-scan `Vec<(Value, Value)>`)
+- [x] Hash part: open-addressing, power-of-2 sizing, linear probing, backward-shift deletion
 - [x] `rawget`, `rawset`, `next` traversal
 - [x] Length operator (array part length)
 - [x] Float-key-to-integer canonicalization, NaN rejection
 
 ### M1.8 — Minimal Stdlib & CLI
 - [x] Basic library: `print`, `type`, `tostring`, `tonumber`, `error`, `pcall`, `assert`, `ipairs`, `pairs`, `next`, `select`, `rawget`, `rawset`, `rawequal`, `rawlen`, `setmetatable`, `getmetatable`
-- [ ] `_VERSION` = `"Lua 5.5"`
+- [x] `_VERSION` = `"Lua 5.5"`
 - [x] CLI (`main.rs`): `rua script.lua`, `rua -e "code"`, basic REPL
 - [x] Integration tests: fibonacci, factorial, table ops, closures, scoping
 

@@ -46,6 +46,8 @@ pub struct Vm {
     open_upvalues: Vec<UpvalueRef>,
     /// Stack top for variable-length arg/result lists.
     top: usize,
+    /// GcRef to the pcall closure (for special-case detection in CALL).
+    pcall_ref: Option<GcRef>,
 }
 
 impl Vm {
@@ -57,6 +59,7 @@ impl Vm {
             frames: Vec::new(),
             open_upvalues: Vec::new(),
             top: 0,
+            pcall_ref: None,
         }
     }
 
@@ -100,7 +103,16 @@ impl Vm {
         self.register_native(&mut env, "tonumber", crate::stdlib::lua_tonumber);
         self.register_native(&mut env, "assert", crate::stdlib::lua_assert);
         self.register_native(&mut env, "error", crate::stdlib::lua_error);
-        self.register_native(&mut env, "pcall", crate::stdlib::lua_pcall);
+
+        // pcall is special: handled by the VM directly, not as a regular native call.
+        {
+            let pcall_closure = Closure::new_native("pcall", |_, _| Ok(vec![]));
+            let pcall_gc = self.gc.new_closure(pcall_closure);
+            self.pcall_ref = Some(pcall_gc);
+            let key = self.gc.new_string(b"pcall");
+            env.raw_set(Value::Object(key), Value::Object(pcall_gc));
+        }
+
         self.register_native(&mut env, "ipairs", crate::stdlib::lua_ipairs);
         self.register_native(&mut env, "pairs", crate::stdlib::lua_pairs);
         self.register_native(&mut env, "rawget", crate::stdlib::lua_rawget);
@@ -515,8 +527,12 @@ impl Vm {
     // ── Main dispatch loop ─────────────────────────────────────────
 
     fn execute(&mut self) -> Result<(), LuaError> {
+        self.execute_to_depth(0)
+    }
+
+    fn execute_to_depth(&mut self, min_depth: usize) -> Result<(), LuaError> {
         loop {
-            if self.frames.is_empty() {
+            if self.frames.len() <= min_depth {
                 return Ok(());
             }
 
@@ -910,7 +926,23 @@ impl Vm {
                 }
 
                 OpCode::Call => {
-                    self.call_function(base + a, b, if c == 0 { -1 } else { c as i32 - 1 })?;
+                    let func_val = self.stack[base + a];
+                    let is_pcall = if let (Value::Object(r), Some(pcall_r)) = (func_val, self.pcall_ref) {
+                        r == pcall_r
+                    } else {
+                        false
+                    };
+
+                    if is_pcall {
+                        let num_results = if c == 0 { -1 } else { c as i32 - 1 };
+                        let num_args = if b > 0 { b - 1 } else { self.top - (base + a) - 1 };
+                        let args: Vec<Value> = (0..num_args)
+                            .map(|i| self.stack[base + a + 1 + i])
+                            .collect();
+                        self.handle_pcall(&args, base + a, num_results)?;
+                    } else {
+                        self.call_function(base + a, b, if c == 0 { -1 } else { c as i32 - 1 })?;
+                    }
                 }
 
                 OpCode::TailCall => {
@@ -1105,6 +1137,114 @@ impl Vm {
                 self.stack[result_base + i] = results.get(i).copied().unwrap_or(Value::Nil);
             }
         }
+    }
+
+    // ── Protected call (pcall) ─────────────────────────────────────
+
+    /// Handle pcall(f, ...).
+    ///
+    /// pcall_args: the arguments passed to pcall itself (f, arg1, arg2, ...)
+    /// result_base: where to place (true, results...) or (false, err)
+    /// num_results: how many results the caller expects
+    fn handle_pcall(
+        &mut self,
+        pcall_args: &[Value],
+        result_base: usize,
+        num_results: i32,
+    ) -> Result<(), LuaError> {
+        let func = pcall_args.first().copied().unwrap_or(Value::Nil);
+        let call_args: Vec<Value> = if pcall_args.len() > 1 {
+            pcall_args[1..].to_vec()
+        } else {
+            vec![]
+        };
+
+        let saved_depth = self.frames.len();
+        let saved_open_uv_len = self.open_upvalues.len();
+
+        // Inner call: results go to result_base+1 to leave room for the boolean
+        let inner_result_base = result_base + 1;
+        let inner_num_results = if num_results < 0 {
+            -1
+        } else if num_results > 1 {
+            num_results - 1
+        } else {
+            0
+        };
+
+        // Set up the call on the stack
+        self.ensure_stack(inner_result_base + call_args.len() + 1);
+        self.stack[inner_result_base] = func;
+        for (i, arg) in call_args.iter().enumerate() {
+            self.stack[inner_result_base + 1 + i] = *arg;
+        }
+
+        let call_result = self.do_call(
+            func,
+            inner_result_base,
+            &call_args,
+            inner_result_base,
+            inner_num_results,
+        );
+
+        match call_result {
+            Ok(()) => {
+                if self.frames.len() > saved_depth {
+                    // Lua function: a frame was pushed, execute it protectedly
+                    match self.execute_to_depth(saved_depth) {
+                        Ok(()) => {
+                            // Success: prepend true
+                            self.stack[result_base] = Value::Boolean(true);
+                            if num_results < 0 {
+                                // self.top was set by the inner Return; it points
+                                // past the last inner result. That's already correct
+                                // since results sit at inner_result_base..self.top
+                                // and we wrote true at result_base = inner_result_base - 1.
+                            }
+                        }
+                        Err(e) => {
+                            self.recover_from_error(saved_depth, saved_open_uv_len);
+                            let err_val = e.to_value(&mut self.gc);
+                            self.place_results(
+                                result_base,
+                                num_results,
+                                &[Value::Boolean(false), err_val],
+                            );
+                        }
+                    }
+                } else {
+                    // Native function completed synchronously
+                    // do_call already placed results at inner_result_base
+                    self.stack[result_base] = Value::Boolean(true);
+                    if num_results < 0 {
+                        // top was set by place_results inside do_call. The results
+                        // are at inner_result_base..self.top. Result_base has true.
+                    }
+                }
+            }
+            Err(e) => {
+                // The call itself failed (e.g. calling a non-function)
+                self.recover_from_error(saved_depth, saved_open_uv_len);
+                let err_val = e.to_value(&mut self.gc);
+                self.place_results(
+                    result_base,
+                    num_results,
+                    &[Value::Boolean(false), err_val],
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Unwind frames and upvalues back to a saved checkpoint after an error.
+    fn recover_from_error(&mut self, saved_depth: usize, saved_open_uv_len: usize) {
+        while self.frames.len() > saved_depth {
+            let frame_base = self.frames.last().unwrap().base;
+            self.close_upvalues(frame_base);
+            self.frames.pop();
+        }
+        // Trim any open upvalues that were created inside the failed call
+        self.open_upvalues.truncate(saved_open_uv_len);
     }
 
     // ── For-loop helpers ───────────────────────────────────────────

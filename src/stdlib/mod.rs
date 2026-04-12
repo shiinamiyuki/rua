@@ -88,19 +88,7 @@ pub fn lua_assert(args: &[Value], _gc: &mut Gc) -> Result<Vec<Value>, LuaError> 
 /// error(message) — Raise an error.
 pub fn lua_error(args: &[Value], _gc: &mut Gc) -> Result<Vec<Value>, LuaError> {
     let msg = args.first().copied().unwrap_or(Value::Nil);
-    Err(LuaError::new(format!("{msg}")))
-}
-
-/// pcall(f, ...) — Protected call.
-/// NOTE: This is a simplified version. Full pcall requires VM access to push
-/// a call frame protectively. For now, we can't actually handle Lua function
-/// errors here since we don't have VM access. This will be enhanced later.
-pub fn lua_pcall(args: &[Value], _gc: &mut Gc) -> Result<Vec<Value>, LuaError> {
-    // We can't actually implement pcall properly without VM access.
-    // For now, just return an error saying it's not yet implemented for Lua functions.
-    // Native functions that error can be caught inline later.
-    let _ = args;
-    Err(LuaError::new("pcall not yet fully implemented"))
+    Err(LuaError::with_value(msg))
 }
 
 /// ipairs(t) — Return an iterator for array part of table.
