@@ -89,4 +89,21 @@
 - 116 unit tests passing (86 lexer/value/string/gc + 30 parser)
 - 2 integration tests passing (lex_upstream + parse_upstream on 34 files)
 
+## 2025-04-11: Bytecode Design Overhaul
+
+Redesigned the bytecode ISA with a simplicity-first approach:
+
+- **Reduced from ~83 opcodes (PUC-Rio style) to 50 opcodes.**
+- **3 instruction formats** (ABC, ABx, AsBx) instead of 7. Dropped AX and special formats.
+- **Deferred all specialized opcodes to Phase 4** (M4.3): `ADDK`, `ADDI`, `GETI`, `SETI`, `GETFIELD`, `SETFIELD`, `EQK`, `EQI`, `LTI`, `LEI`, `GTI`, `GEI`. These will only be added if benchmarks justify them.
+- **Merged TFORCALL + TFORLOOP** into a single `TFORLOOP` opcode for generic for loops.
+- **Single RETURN** opcode (no RETURN0/RETURN1) with fast-path branches inside the handler.
+- **No RK-encoding** (constant-in-operand bit flag). Constants always loaded into registers first, except `GETTABUP`/`SETTABUP` which embed constant keys for global access frequency.
+- Renamed `LOADINT` → `LOADI` for consistency.
+
+Files created/updated:
+- `design_notes/bytecode.md` (new): Full opcode reference, encoding, register layout, compilation examples, Phase 4 plan.
+- `design_notes/rua-design.md`: Section 6 condensed to summary + reference to bytecode.md. Key decisions table updated.
+- `design_notes/ROADMAP.md`: M1.4 updated (3 formats, 50 opcodes, no TFORCALL/RETURN0/RETURN1). M4.3 updated (benchmark-guided specialization).
+
 ## APPEND HERE

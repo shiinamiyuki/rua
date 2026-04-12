@@ -212,158 +212,78 @@ Precedence levels (low → high):
 
 ## 6. Bytecode Design
 
-### 6.1 Instruction Format
+> **Detailed design:** See [`bytecode.md`](bytecode.md) for the full opcode reference,
+> compilation examples, encoding helpers, and Phase 4 specialization plan.
 
-Use a **fixed 32-bit instruction** format, similar to PUC-Rio Lua but with our own opcode set:
+### 6.1 Design Philosophy
 
-```
-Format A:  [opcode:8][A:8][B:8][C:8]
-Format AB: [opcode:8][A:8][Bx:16]       (unsigned 16-bit)
-Format AS: [opcode:8][A:8][sBx:16]      (signed 16-bit, biased)
-Format AX: [opcode:8][Ax:24]            (unsigned 24-bit, for large constants)
-```
+We use a **simplicity-first** approach: start with ~50 generic opcodes across 3 instruction
+formats (vs. PUC-Rio's 83 opcodes / 7 formats). Specialized fast-path opcodes (`ADDK`, `GETI`,
+`EQI`, etc.) are deferred to Phase 4, guided by benchmark data. This reduces implementation
+surface area without sacrificing correctness.
 
-- **A** usually refers to a destination register.
-- **B, C** are source registers or constants (if MSB set, index into constant table).
-- **sBx** is a signed offset, used for jumps.
+### 6.2 Instruction Format
 
-### 6.2 Register Allocation
-
-- Each function has a fixed register window (max 250 registers, matching Lua's practical limits).
-- Locals map directly to registers.
-- Temporaries are allocated on top of locals.
-- The compiler tracks the current "top of stack" for register allocation.
-
-### 6.3 Opcode Table
+Fixed 32-bit instructions in **3 formats**:
 
 ```
-Category: Loading
-  LOADNIL     A B       -- R[A], R[A+1], ..., R[A+B] := nil
-  LOADBOOL    A B C     -- R[A] := (Bool)B; if C then PC++
-  LOADINT     A sBx     -- R[A] := sBx (small integer)
-  LOADK       A Bx      -- R[A] := K[Bx]
-  LOADKX      A         -- R[A] := K[extra_arg] (next instruction is EXTRAARG)
-
-Category: Upvalues & Globals  
-  GETUPVAL    A B       -- R[A] := UpValue[B]
-  SETUPVAL    A B       -- UpValue[B] := R[A]
-  GETTABUP    A B C     -- R[A] := UpValue[B][K[C]]  (global access via _ENV)
-  SETTABUP    A B C     -- UpValue[A][K[B]] := R[C]
-
-Category: Table Operations
-  GETTABLE    A B C     -- R[A] := R[B][R[C]]
-  SETTABLE    A B C     -- R[A][R[B]] := R[C]
-  GETI        A B C     -- R[A] := R[B][C]  (integer key)
-  SETI        A B C     -- R[A][B] := R[C]  (integer key)
-  GETFIELD    A B C     -- R[A] := R[B][K[C]]  (string key)
-  SETFIELD    A B C     -- R[A][K[B]] := R[C]  (string key)
-  NEWTABLE    A B C     -- R[A] := {} (size hints: B=array, C=hash)
-  SETLIST     A B C     -- R[A][(C-1)*FPF+i] := R[A+i], 1 <= i <= B
-
-Category: Arithmetic & Bitwise
-  ADD         A B C     -- R[A] := R[B] + R[C]
-  SUB         A B C     -- R[A] := R[B] - R[C]
-  MUL         A B C     -- R[A] := R[B] * R[C]
-  DIV         A B C     -- R[A] := R[B] / R[C]  (float division)
-  IDIV        A B C     -- R[A] := R[B] // R[C]  (floor division)
-  MOD         A B C     -- R[A] := R[B] % R[C]
-  POW         A B C     -- R[A] := R[B] ^ R[C]
-  UNM         A B       -- R[A] := -R[B]
-  BAND        A B C     -- R[A] := R[B] & R[C]
-  BOR         A B C     -- R[A] := R[B] | R[C]
-  BXOR        A B C     -- R[A] := R[B] ~ R[C]
-  BNOT        A B       -- R[A] := ~R[B]
-  SHL         A B C     -- R[A] := R[B] << R[C]
-  SHR         A B C     -- R[A] := R[B] >> R[C]
-
-  // fused constant-operand versions for common patterns
-  ADDK        A B C     -- R[A] := R[B] + K[C]
-  SUBK        A B C     -- R[A] := R[B] - K[C]
-  MULK        A B C     -- R[A] := R[B] * K[C]
-  DIVK        A B C     -- R[A] := R[B] / K[C]
-  IDIVK       A B C     -- R[A] := R[B] // K[C]
-  MODK        A B C     -- R[A] := R[B] % K[C]
-  POWK        A B C     -- R[A] := R[B] ^ K[C]
-  ADDI        A B sC    -- R[A] := R[B] + sC (small int immediate)
-  
-Category: String
-  CONCAT      A B C     -- R[A] := R[B] .. R[B+1] .. ... .. R[C]
-  LEN         A B       -- R[A] := #R[B]  (length)
-
-Category: Comparison & Logic
-  EQ          A B C     -- if (R[B] == R[C]) ~= A then PC++
-  LT          A B C     -- if (R[B] <  R[C]) ~= A then PC++
-  LE          A B C     -- if (R[B] <= R[C]) ~= A then PC++
-  EQK         A B C     -- if (R[B] == K[C]) ~= A then PC++
-  EQI         A B sC    -- if (R[B] == sC) ~= A then PC++
-  LTI         A B sC    -- if (R[B] <  sC) ~= A then PC++
-  LEI         A B sC    -- if (R[B] <= sC) ~= A then PC++
-  GTI         A B sC    -- if (R[B] >  sC) ~= A then PC++
-  GEI         A B sC    -- if (R[B] >= sC) ~= A then PC++
-  TEST        A C       -- if (not R[A]) == C then PC++
-  TESTSET     A B C     -- if (not R[B]) == C then PC++ else R[A] := R[B]
-  NOT         A B       -- R[A] := not R[B]
-
-Category: Control Flow
-  JMP         sBx       -- PC += sBx
-  FORLOOP     A sBx     -- numeric for loop step
-  FORPREP     A sBx     -- numeric for loop init
-  TFORPREP    A sBx     -- generic for loop init
-  TFORCALL    A C       -- call iterator: R[A+4],... := R[A](R[A+1], R[A+2])
-  TFORLOOP    A sBx     -- generic for loop step
-  
-Category: Function
-  CLOSURE     A Bx      -- R[A] := closure(Proto[Bx])
-  CALL        A B C     -- R[A],...,R[A+C-2] := R[A](R[A+1],...,R[A+B-1])
-  TAILCALL    A B C     -- return R[A](R[A+1],...,R[A+B-1])
-  RETURN      A B       -- return R[A],...,R[A+B-2]
-  RETURN0               -- return (no values)
-  RETURN1     A         -- return R[A]
-  VARARG      A C       -- R[A],R[A+1],...,R[A+C-2] := vararg
-  VARARGPREP  A         -- adjust varargs (A = num fixed params)
-
-Category: Miscellaneous
-  MOVE        A B       -- R[A] := R[B]
-  CLOSE       A         -- close upvalues >= R[A]; close to-be-closed vars
-  TBC         A         -- mark R[A] as to-be-closed
-  EXTRAARG    Ax        -- extra argument for previous instruction
+ABC:   [opcode:8][A:8][B:8][C:8]       — most instructions
+ABx:   [opcode:8][A:8][Bx:16]          — unsigned 16-bit (constants, protos)
+AsBx:  [opcode:8][A:8][sBx:16]         — signed 16-bit (jumps, small ints)
 ```
 
-### 6.4 Function Prototype (Proto)
+No RK-encoding trick (constant-in-operand via bit flag). Operands are always registers;
+constants are loaded via `LOADK`/`LOADI` first. The exception is `GETTABUP`/`SETTABUP` which
+embed a constant index for the key (global access is too frequent to require an extra load).
+
+### 6.3 Opcode Summary (50 opcodes)
+
+| Category            | Opcodes                                                          | Count |
+|---------------------|------------------------------------------------------------------|-------|
+| Loading             | `LOADNIL`, `LOADBOOL`, `LOADI`, `LOADK`, `LOADKX`               | 5     |
+| Move & Upvalues     | `MOVE`, `GETUPVAL`, `SETUPVAL`, `GETTABUP`, `SETTABUP`          | 5     |
+| Table               | `NEWTABLE`, `GETTABLE`, `SETTABLE`, `SETLIST`                   | 4     |
+| Arithmetic          | `ADD`, `SUB`, `MUL`, `DIV`, `IDIV`, `MOD`, `POW`, `UNM`, `NOT` | 9     |
+| Bitwise             | `BAND`, `BOR`, `BXOR`, `SHL`, `SHR`, `BNOT`                    | 6     |
+| String & Length     | `CONCAT`, `LEN`                                                 | 2     |
+| Comparison          | `EQ`, `LT`, `LE`, `TEST`, `TESTSET`                             | 5     |
+| Control Flow        | `JMP`, `FORPREP`, `FORLOOP`, `TFORPREP`, `TFORLOOP`             | 5     |
+| Function            | `CLOSURE`, `CALL`, `TAILCALL`, `RETURN`, `VARARG`, `VARARGPREP` | 6     |
+| Scope & Cleanup     | `CLOSE`, `TBC`, `EXTRAARG`                                      | 3     |
+
+Key simplifications vs. PUC-Rio:
+- **No specialized arithmetic** (`ADDK`, `ADDI`, etc.) — deferred to Phase 4.
+- **No specialized table access** (`GETI`, `GETFIELD`, etc.) — deferred to Phase 4.
+- **No specialized comparisons** (`EQI`, `LTI`, etc.) — deferred to Phase 4.
+- **Single `RETURN`** with fast paths inside (no `RETURN0`/`RETURN1`).
+- **Merged `TFORLOOP`** combines iterator call + nil test + branch (no separate `TFORCALL`).
+
+### 6.4 Register Allocation
+
+- Locals map 1:1 to registers from R[0].
+- Temporaries allocated above locals via a `free_reg` bump pointer.
+- Numeric `for` reserves 4 consecutive registers: (index, limit, step, user_var).
+- Generic `for` reserves: (iter_fn, state, control, tbc, var1, var2, ...).
+- Max 250 registers per function.
+
+### 6.5 Function Prototype (Proto)
 
 ```rust
-struct Proto {
-    /// Bytecode instructions
-    code: Vec<u32>,
-    /// Constants pool
-    constants: Vec<Value>,
-    /// Nested function prototypes
-    protos: Vec<Proto>,
-    /// Upvalue descriptors
-    upvalues: Vec<UpvalueDesc>,
-    /// Source location for debugging (line numbers per instruction)
-    line_info: Vec<u32>,
-    /// Local variable debug info
-    local_vars: Vec<LocalVarInfo>,
-    /// Source file name
-    source: Option<LuaString>,
-    /// Number of fixed parameters
-    num_params: u8,
-    /// Is variadic
-    is_vararg: bool,
-    /// Maximum stack size (registers needed)
-    max_stack_size: u8,
-}
-
-struct UpvalueDesc {
-    name: Option<LuaString>,
-    /// true = upvalue is in the enclosing function's register;
-    /// false = upvalue is in enclosing function's upvalue list
-    in_stack: bool,
-    /// Register index or upvalue index in parent
-    index: u8,
+pub struct Proto {
+    pub code: Vec<u32>,              // bytecode instructions
+    pub constants: Vec<Value>,       // constant pool
+    pub protos: Vec<Proto>,          // nested function prototypes
+    pub upvalues: Vec<UpvalueDesc>,  // upvalue descriptors
+    pub line_info: Vec<u32>,         // line number per instruction
+    pub locals: Vec<LocalVarInfo>,   // local variable debug info
+    pub source: Option<String>,      // source file name
+    pub num_params: u8,              // fixed parameter count
+    pub is_vararg: bool,             // variadic function
+    pub max_stack_size: u8,          // registers needed
 }
 ```
+
+The top-level chunk is a variadic `Proto` with upvalue[0] = `_ENV`.
 
 ## 7. Virtual Machine
 
@@ -771,7 +691,7 @@ src/
 - Incremental GC
 - Generational GC
 - NaN-boxing value representation (optional)
-- Instruction specialization (ADDI, GETI, SETI, EQK, etc.)
+- Instruction specialization: add ~20 specialized opcodes (`ADDK`, `ADDI`, `GETI`, `SETI`, `GETFIELD`, `SETFIELD`, `EQK`, `EQI`, `LTI`, `LEI`, `GTI`, `GEI`) — see [`bytecode.md`](bytecode.md) §7
 - String interning optimization
 - Table access caching
 - Benchmarking against PUC-Rio Lua
@@ -790,7 +710,7 @@ src/
 |----------|--------|-----------|
 | Value repr | Enum (phase 1), NaN-boxing (phase 4) | Correctness first, optimize later |
 | Parser output | AST (not single-pass compile) | Easier debugging, potential for AST-level optimization |
-| Instruction format | Fixed 32-bit, 4 formats | Matches proven Lua design, simple decoding |
+| Instruction format | Fixed 32-bit, 3 formats (ABC/ABx/AsBx) | Simpler than PUC-Rio's 7 formats; 50 opcodes vs. 83 |
 | GC | Tri-color mark-sweep (incremental + generational) | Required by Lua 5.5 spec semantics |
 | Hash table | Open addressing, power-of-2 | Cache-friendly, fast for typical Lua workloads |
 | String interning | Global pool, lazy for long strings | Fast equality, memory dedup |

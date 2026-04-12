@@ -39,11 +39,12 @@ Goal: Run simple Lua programs — arithmetic, control flow, functions, tables, r
 
 ### M1.4 — Bytecode Compiler
 - [ ] `Proto` struct: code, constants, upvalue descriptors, nested protos, debug info
-- [ ] 32-bit instruction encoding/decoding (formats A, AB, AS, AX)
+- [ ] 32-bit instruction encoding/decoding (3 formats: ABC, ABx, AsBx) — see [`bytecode.md`](bytecode.md)
+- [ ] 50 generic opcodes (no specialized variants — deferred to M4.3)
 - [ ] Scope / local variable tracking, register allocation
 - [ ] Upvalue resolution (in_stack vs. parent upvalue chain)
 - [ ] Compile expressions → register-targeted code
-  - Constants: `LOADNIL`, `LOADBOOL`, `LOADINT`, `LOADK`
+  - Constants: `LOADNIL`, `LOADBOOL`, `LOADI`, `LOADK`
   - Arithmetic: `ADD`, `SUB`, `MUL`, `DIV`, `IDIV`, `MOD`, `POW`, `UNM`
   - Bitwise: `BAND`, `BOR`, `BXOR`, `BNOT`, `SHL`, `SHR`
   - Comparison + conditional jumps: `EQ`, `LT`, `LE`, `TEST`, `TESTSET`
@@ -52,8 +53,8 @@ Goal: Run simple Lua programs — arithmetic, control flow, functions, tables, r
   - Logic: short-circuit `and`/`or`, `NOT`
 - [ ] Compile statements → bytecode
   - Assignment (local, global via `GETTABUP`/`SETTABUP` on `_ENV`)
-  - Control flow: `JMP`, `FORLOOP`, `FORPREP`, `TFORPREP`, `TFORCALL`, `TFORLOOP`
-  - Function call: `CALL`, `TAILCALL`, `RETURN`, `RETURN0`, `RETURN1`
+  - Control flow: `JMP`, `FORLOOP`, `FORPREP`, `TFORPREP`, `TFORLOOP`
+  - Function call: `CALL`, `TAILCALL`, `RETURN`
   - Table: `NEWTABLE`, `SETTABLE`, `GETTABLE`, `SETLIST`
   - Upvalues: `GETUPVAL`, `SETUPVAL`, `GETTABUP`, `SETTABUP`
   - Closures: `CLOSURE`
@@ -264,10 +265,12 @@ Goal: Performance comparable to PUC-Rio Lua. Production-ready interpreter.
 - [ ] `minormul` parameter
 
 ### M4.3 — Instruction Specialization
-- [ ] Constant-operand variants: `ADDK`, `SUBK`, `MULK`, `DIVK`, `IDIVK`, `MODK`, `POWK`
-- [ ] Immediate integer variants: `ADDI`, `EQI`, `LTI`, `LEI`, `GTI`, `GEI`
-- [ ] Indexed access: `GETI`, `SETI`, `GETFIELD`, `SETFIELD`, `EQK`
-- [ ] Compiler: emit specialized opcodes when operands are known constants/integers
+- [ ] Constant-operand arithmetic: `ADDK`, `SUBK`, `MULK`, `DIVK`, `IDIVK`, `MODK`, `POWK`
+- [ ] Immediate integer arithmetic: `ADDI`
+- [ ] Specialized table access: `GETI`, `SETI`, `GETFIELD`, `SETFIELD`
+- [ ] Specialized comparisons: `EQK`, `EQI`, `LTI`, `LEI`, `GTI`, `GEI`
+- [ ] Compiler: peephole pass or direct emit of specialized opcodes when operands are constants/integers
+- [ ] Benchmark before/after to validate each specialization is worth keeping
 
 ### M4.4 — Value Representation Optimization
 - [ ] NaN-boxing: pack all values into 8 bytes
