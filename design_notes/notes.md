@@ -160,6 +160,25 @@ All 138 tests pass (136 unit + 1 lex upstream + 1 parse upstream). No regression
 - All 158 tests pass (156 unit + 2 integration)
 - `test_basic.lua` and `test_gc_stress.lua` both pass end-to-end
 
+## Session: M2.1 + M2.2 — Metamethods & Full Operator Semantics (Final)
+
+### Completed
+- Created comprehensive metamethod test suite (`tests/test_metamethods.lua`) covering:
+  - `__index` (function, table chain, multi-level inheritance)
+  - `__newindex` (function, table delegation)
+  - All arithmetic metamethods: `__add`, `__sub`, `__mul`, `__div`, `__mod`, `__pow`, `__unm`, `__idiv`
+  - All bitwise metamethods: `__band`, `__bor`, `__bxor`, `__bnot`, `__shl`, `__shr`
+  - `__concat`, `__len`, `__call`
+  - Comparison metamethods: `__eq`, `__lt`, `__le`
+  - `__metatable` protection (getmetatable returns field, setmetatable errors)
+  - String-to-number coercion for arithmetic and bitwise
+- All 158 existing tests pass + new metamethod test suite passes
+- Updated ROADMAP.md: M2.1 and M2.2 marked complete
+
+### Test Coverage Summary
+- 156 unit tests (cargo test)
+- Integration tests: test_basic.lua, test_gc_stress.lua, test_metamethods.lua
+
 ## APPEND HERE
 
 ## Session 5 — Phase 1 Completion (pcall + Open-Addressing Hash Table)

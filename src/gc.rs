@@ -182,6 +182,11 @@ impl Gc {
         self.alloc(GcObjectKind::Table(table))
     }
 
+    /// Find an existing interned string by its bytes (no allocation).
+    pub fn find_string(&self, data: &[u8]) -> Option<GcRef> {
+        self.string_pool.get(data).copied()
+    }
+
     /// Allocate a new closure.
     pub fn new_closure(&mut self, closure: Closure) -> GcRef {
         self.alloc(GcObjectKind::Closure(closure))

@@ -107,23 +107,23 @@ Goal: Run simple Lua programs — arithmetic, control flow, functions, tables, r
 Goal: Pass the majority of the Lua test suite (non-coroutine, non-IO parts).
 
 ### M2.1 — Metamethods
-- [ ] Metatable storage on `Table` (and per-type metatables for string)
-- [ ] Arithmetic metamethods: `__add`, `__sub`, `__mul`, `__div`, `__mod`, `__pow`, `__unm`, `__idiv`
-- [ ] Bitwise metamethods: `__band`, `__bor`, `__bxor`, `__bnot`, `__shl`, `__shr`
-- [ ] Comparison: `__eq`, `__lt`, `__le`
-- [ ] String/length: `__concat`, `__len`
-- [ ] Table access: `__index` (function or table chain), `__newindex` (function or table chain)
-- [ ] `__call` metamethod (with 15-level chain limit)
-- [ ] `__tostring`, `__name`, `__metatable`
-- [ ] VM fast path: check metatable only on type mismatch / table miss
+- [x] Metatable storage on `Table` (and per-type metatables for string)
+- [x] Arithmetic metamethods: `__add`, `__sub`, `__mul`, `__div`, `__mod`, `__pow`, `__unm`, `__idiv`
+- [x] Bitwise metamethods: `__band`, `__bor`, `__bxor`, `__bnot`, `__shl`, `__shr`
+- [x] Comparison: `__eq`, `__lt`, `__le`
+- [x] String/length: `__concat`, `__len`
+- [x] Table access: `__index` (function or table chain), `__newindex` (function or table chain)
+- [x] `__call` metamethod (with 16-level chain limit)
+- [x] `__tostring`, `__name`, `__metatable`
+- [x] VM fast path: check metatable only on type mismatch / table miss
 
 ### M2.2 — Full Operator Semantics
-- [ ] Integer/float coercion rules (arithmetic, bitwise, comparison)
-- [ ] String-to-number coercion (string library metamethods)
-- [ ] Float-to-integer exact conversion checks
-- [ ] Integer overflow wrapping (two's complement)
-- [ ] Division/modulo edge cases (floor division semantics)
-- [ ] Exponentiation always returns float
+- [x] Integer/float coercion rules (arithmetic, bitwise, comparison)
+- [x] String-to-number coercion (string library metamethods)
+- [x] Float-to-integer exact conversion checks
+- [x] Integer overflow wrapping (two's complement)
+- [x] Division/modulo edge cases (floor division semantics)
+- [x] Exponentiation always returns float
 
 ### M2.3 — Variable Declarations (Lua 5.5)
 - [ ] `global` name declarations (compiler-level name resolution)

@@ -244,6 +244,19 @@ pub fn lua_setmetatable(args: &[Value], _gc: &mut Gc) -> Result<Vec<Value>, LuaE
     let mt = args.get(1).copied().unwrap_or(Value::Nil);
     match table {
         Value::Object(mut r) if r.as_object().as_table().is_some() => {
+            // Check __metatable protection on existing metatable
+            if let Some(existing_mt) = r.as_object().as_table().unwrap().metatable {
+                if let Some(mt_table) = existing_mt.as_object().as_table() {
+                    // Look for __metatable field
+                    let mm_key_ref = _gc.find_string(b"__metatable");
+                    if let Some(key_ref) = mm_key_ref {
+                        let mm_val = mt_table.raw_get(&Value::Object(key_ref));
+                        if !mm_val.is_nil() {
+                            return Err(LuaError::new("cannot change a protected metatable"));
+                        }
+                    }
+                }
+            }
             let mt_ref = match mt {
                 Value::Nil => None,
                 Value::Object(mr) if mr.as_object().as_table().is_some() => Some(mr),
@@ -258,13 +271,24 @@ pub fn lua_setmetatable(args: &[Value], _gc: &mut Gc) -> Result<Vec<Value>, LuaE
     }
 }
 
-/// getmetatable(object) — Get metatable.
+/// getmetatable(object) — Get metatable (returns __metatable field if set).
 pub fn lua_getmetatable(args: &[Value], _gc: &mut Gc) -> Result<Vec<Value>, LuaError> {
     let v = args.first().copied().unwrap_or(Value::Nil);
     match v {
         Value::Object(r) if r.as_object().as_table().is_some() => {
             match r.as_object().as_table().unwrap().metatable {
-                Some(mt) => Ok(vec![Value::Object(mt)]),
+                Some(mt) => {
+                    // Check for __metatable field — return it instead of the actual metatable
+                    if let Some(mt_table) = mt.as_object().as_table() {
+                        if let Some(key_ref) = _gc.find_string(b"__metatable") {
+                            let mm_val = mt_table.raw_get(&Value::Object(key_ref));
+                            if !mm_val.is_nil() {
+                                return Ok(vec![mm_val]);
+                            }
+                        }
+                    }
+                    Ok(vec![Value::Object(mt)])
+                }
                 None => Ok(vec![Value::Nil]),
             }
         }
