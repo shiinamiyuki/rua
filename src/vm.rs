@@ -5,6 +5,7 @@ use std::rc::Rc;
 
 use crate::bytecode::*;
 use crate::closure::*;
+use crate::coroutine::{Coroutine, CoroutineStatus};
 use crate::error::LuaError;
 use crate::gc::{Gc, GcObjectKind, GcRef};
 use crate::table::Table;
@@ -41,23 +42,42 @@ const MM_CLOSE: &[u8] = b"__close";
 // ── Call frame ─────────────────────────────────────────────────────
 
 /// A single activation record on the call stack.
-struct CallFrame {
+pub(crate) struct CallFrame {
     /// GcRef to the closure being executed.
-    closure: GcRef,
+    pub(crate) closure: GcRef,
     /// Cached prototype (Rc clone, avoids going through GcRef each instruction).
-    proto: Rc<Proto>,
+    pub(crate) proto: Rc<Proto>,
     /// Cached upvalues from the closure.
-    upvalues: Vec<UpvalueRef>,
+    pub(crate) upvalues: Vec<UpvalueRef>,
     /// Base register index in the shared stack.
-    base: usize,
+    pub(crate) base: usize,
     /// Program counter (index into proto.code).
-    pc: usize,
+    pub(crate) pc: usize,
     /// Where to place results in the caller's stack (absolute index).
-    result_base: usize,
+    pub(crate) result_base: usize,
     /// Number of results the caller expects (-1 = variable).
-    num_results: i32,
+    pub(crate) num_results: i32,
     /// Vararg values for this frame.
-    varargs: Vec<Value>,
+    pub(crate) varargs: Vec<Value>,
+}
+
+/// Saved pcall/xpcall context for yield-across-pcall support.
+/// When yield happens inside a pcall, we save the pcall context here
+/// so it can be restored when the coroutine resumes.
+#[derive(Clone)]
+pub(crate) struct PcallGuard {
+    /// Frame depth when pcall started (= saved_depth).
+    pub(crate) frame_depth: usize,
+    /// Number of open upvalues when pcall started.
+    pub(crate) open_uv_len: usize,
+    /// Where to place the pcall boolean result.
+    pub(crate) result_base: usize,
+    /// Number of results the caller expects.
+    pub(crate) num_results: i32,
+    /// true for xpcall (has a message handler).
+    pub(crate) is_xpcall: bool,
+    /// Message handler function (for xpcall).
+    pub(crate) handler: Value,
 }
 
 // ── VM state ───────────────────────────────────────────────────────
@@ -84,6 +104,26 @@ pub struct Vm {
     tbc_slots: Vec<usize>,
     /// Shared metatable for all string values.
     string_metatable: Option<GcRef>,
+
+    // ── Coroutine support ──────────────────────────────────────────
+    /// GcRef to the main thread coroutine object.
+    main_thread: Option<GcRef>,
+    /// GcRef to the currently running coroutine (None = main thread).
+    current_thread: Option<GcRef>,
+    /// Yield flag: set by coroutine.yield, cleared by resume.
+    /// Contains the yielded values.
+    yielded: Option<Vec<Value>>,
+    /// Return values from a top-level RETURN (used by resume to collect results).
+    last_return_values: Vec<Value>,
+    /// GcRef identity markers for coroutine library functions.
+    coro_resume_ref: Option<GcRef>,
+    coro_yield_ref: Option<GcRef>,
+    coro_wrap_ref: Option<GcRef>,
+    coro_running_ref: Option<GcRef>,
+    coro_isyieldable_ref: Option<GcRef>,
+    coro_close_ref: Option<GcRef>,
+    /// Pcall/xpcall guard stack for yield-across-pcall support.
+    pcall_guards: Vec<PcallGuard>,
 }
 
 impl Vm {
@@ -100,6 +140,17 @@ impl Vm {
             error_ref: None,
             tbc_slots: Vec::new(),
             string_metatable: None,
+            main_thread: None,
+            current_thread: None,
+            yielded: None,
+            last_return_values: Vec::new(),
+            coro_resume_ref: None,
+            coro_yield_ref: None,
+            coro_wrap_ref: None,
+            coro_running_ref: None,
+            coro_isyieldable_ref: None,
+            coro_close_ref: None,
+            pcall_guards: Vec::new(),
         }
     }
 
@@ -107,6 +158,23 @@ impl Vm {
     pub fn execute_main(&mut self, proto: Proto) -> Result<(), LuaError> {
         // Create the global environment table (_ENV)
         let env_table = self.create_global_env();
+
+        // Create the main thread (coroutine representing the main execution)
+        let main_coro = Coroutine {
+            status: CoroutineStatus::Running,
+            stack: Vec::new(),
+            frames: Vec::new(),
+            open_upvalues: Vec::new(),
+            tbc_slots: Vec::new(),
+            top: 0,
+            body: None,
+            yield_result_base: 0,
+            yield_num_results: 0,
+            is_main: true,
+            pcall_guards: Vec::new(),
+        };
+        let main_thread_ref = self.gc.new_thread(main_coro);
+        self.main_thread = Some(main_thread_ref);
 
         // Create the main closure from the proto
         let proto_rc = Rc::new(proto);
@@ -234,6 +302,61 @@ impl Vm {
         let table_key = self.gc.new_string(b"table");
         env.raw_set(Value::Object(table_key), Value::Object(table_ref));
 
+        // coroutine library
+        let mut coro_table = Table::new();
+
+        // coroutine.create(f) — regular native
+        self.register_native(&mut coro_table, "create", crate::stdlib::coroutine::lua_coroutine_create);
+        // coroutine.status(co) — regular native
+        self.register_native(&mut coro_table, "status", crate::stdlib::coroutine::lua_coroutine_status);
+        // coroutine.wrap(f) — regular native
+        self.register_native(&mut coro_table, "wrap", crate::stdlib::coroutine::lua_coroutine_wrap);
+
+        // coroutine.resume — special: handled by VM
+        {
+            let c = Closure::new_native("resume", |_, _| Ok(vec![]));
+            let r = self.gc.new_closure(c);
+            self.coro_resume_ref = Some(r);
+            let k = self.gc.new_string(b"resume");
+            coro_table.raw_set(Value::Object(k), Value::Object(r));
+        }
+        // coroutine.yield — special: handled by VM
+        {
+            let c = Closure::new_native("yield", |_, _| Ok(vec![]));
+            let r = self.gc.new_closure(c);
+            self.coro_yield_ref = Some(r);
+            let k = self.gc.new_string(b"yield");
+            coro_table.raw_set(Value::Object(k), Value::Object(r));
+        }
+        // coroutine.running — special: handled by VM
+        {
+            let c = Closure::new_native("running", |_, _| Ok(vec![]));
+            let r = self.gc.new_closure(c);
+            self.coro_running_ref = Some(r);
+            let k = self.gc.new_string(b"running");
+            coro_table.raw_set(Value::Object(k), Value::Object(r));
+        }
+        // coroutine.isyieldable — special: handled by VM
+        {
+            let c = Closure::new_native("isyieldable", |_, _| Ok(vec![]));
+            let r = self.gc.new_closure(c);
+            self.coro_isyieldable_ref = Some(r);
+            let k = self.gc.new_string(b"isyieldable");
+            coro_table.raw_set(Value::Object(k), Value::Object(r));
+        }
+        // coroutine.close — special: handled by VM
+        {
+            let c = Closure::new_native("close", |_, _| Ok(vec![]));
+            let r = self.gc.new_closure(c);
+            self.coro_close_ref = Some(r);
+            let k = self.gc.new_string(b"close");
+            coro_table.raw_set(Value::Object(k), Value::Object(r));
+        }
+
+        let coro_ref = self.gc.new_table(coro_table);
+        let coro_key = self.gc.new_string(b"coroutine");
+        env.raw_set(Value::Object(coro_key), Value::Object(coro_ref));
+
         self.gc.new_table(env)
     }
 
@@ -356,6 +479,7 @@ impl Vm {
                 GcObjectKind::Table(t) => t.metatable,
                 GcObjectKind::Closure(_) => None,
                 GcObjectKind::String(_) => self.string_metatable,
+                GcObjectKind::Thread(_) => None,
             },
             _ => None,
         }
@@ -432,7 +556,7 @@ impl Vm {
         }
 
         let gc_ref = actual_func.as_gc_ref().unwrap();
-        let is_native = matches!(gc_ref.as_object().as_closure().unwrap(), Closure::Native(_) | Closure::NativeDyn(_));
+        let is_native = matches!(gc_ref.as_object().as_closure().unwrap(), Closure::Native(_) | Closure::NativeDyn(_) | Closure::WrapIterator(_));
 
         if is_native {
             // Intercept error() to add source:line annotation
@@ -443,7 +567,7 @@ impl Vm {
             return match gc_ref.as_object().as_closure().unwrap() {
                 Closure::Native(nc) => (nc.func)(args, &mut self.gc),
                 Closure::NativeDyn(nc) => (nc.func)(args, &mut self.gc),
-                _ => unreachable!(),
+                Closure::WrapIterator(_) | Closure::Lua(_) => unreachable!(),
             };
         }
 
@@ -1092,6 +1216,31 @@ impl Vm {
             }
         }
 
+        // Root: coroutine objects (main thread, current thread)
+        if let Some(mt) = self.main_thread {
+            roots.push(mt);
+        }
+        if let Some(ct) = self.current_thread {
+            roots.push(ct);
+        }
+
+        // Root: special coroutine function refs
+        for r in [
+            self.coro_resume_ref, self.coro_yield_ref, self.coro_wrap_ref,
+            self.coro_running_ref, self.coro_isyieldable_ref, self.coro_close_ref,
+        ] {
+            if let Some(r) = r {
+                roots.push(r);
+            }
+        }
+
+        // Root: pcall guard handler values (for xpcall)
+        for guard in &self.pcall_guards {
+            if let Value::Object(r) = guard.handler {
+                roots.push(r);
+            }
+        }
+
         self.gc.collect(&roots);
     }
 
@@ -1112,6 +1261,11 @@ impl Vm {
     fn  execute_to_depth(&mut self, min_depth: usize) -> Result<(), LuaError> {
         loop {
             if self.frames.len() <= min_depth {
+                return Ok(());
+            }
+
+            // If a coroutine has yielded, stop executing and bubble up.
+            if self.yielded.is_some() {
                 return Ok(());
             }
 
@@ -1537,6 +1691,12 @@ impl Vm {
                         if self.pcall_ref == Some(r) { 1 }
                         else if self.xpcall_ref == Some(r) { 2 }
                         else if self.error_ref == Some(r) { 3 }
+                        else if self.coro_resume_ref == Some(r) { 4 }
+                        else if self.coro_yield_ref == Some(r) { 5 }
+                        else if self.coro_running_ref == Some(r) { 6 }
+                        else if self.coro_isyieldable_ref == Some(r) { 7 }
+                        else if self.coro_close_ref == Some(r) { 8 }
+                        else if r.as_object().as_closure().map_or(false, |c| matches!(c, Closure::WrapIterator(_))) { 9 }
                         else { 0 }
                     } else { 0 };
 
@@ -1562,6 +1722,46 @@ impl Vm {
                                 .collect();
                             self.handle_error(&args)?;
                         }
+                        4 => { // coroutine.resume
+                            let args: Vec<Value> = (0..num_args)
+                                .map(|i| self.stack[base + a + 1 + i])
+                                .collect();
+                            self.handle_resume(&args, base + a, num_results)?;
+                        }
+                        5 => { // coroutine.yield
+                            let args: Vec<Value> = (0..num_args)
+                                .map(|i| self.stack[base + a + 1 + i])
+                                .collect();
+                            self.handle_yield(&args, base + a, num_results)?;
+                        }
+                        6 => { // coroutine.running
+                            self.handle_running(base + a, num_results);
+                        }
+                        7 => { // coroutine.isyieldable
+                            let args: Vec<Value> = (0..num_args)
+                                .map(|i| self.stack[base + a + 1 + i])
+                                .collect();
+                            self.handle_isyieldable(&args, base + a, num_results);
+                        }
+                        8 => { // coroutine.close
+                            let args: Vec<Value> = (0..num_args)
+                                .map(|i| self.stack[base + a + 1 + i])
+                                .collect();
+                            self.handle_close(&args, base + a, num_results)?;
+                        }
+                        9 => { // wrap iterator
+                            let co_ref = match func_val {
+                                Value::Object(r) => match r.as_object().as_closure().unwrap() {
+                                    Closure::WrapIterator(co) => *co,
+                                    _ => unreachable!(),
+                                },
+                                _ => unreachable!(),
+                            };
+                            let args: Vec<Value> = (0..num_args)
+                                .map(|i| self.stack[base + a + 1 + i])
+                                .collect();
+                            self.handle_wrap_call(co_ref, &args, base + a, num_results)?;
+                        }
                         _ => {
                             self.call_function(base + a, b, num_results)?;
                         }
@@ -1571,7 +1771,7 @@ impl Vm {
                 OpCode::TailCall => {
                     let func_val = self.reg(base, a);
 
-                    // Intercept error() in tail position
+                    // Intercept special functions in tail position
                     if let Value::Object(r) = func_val {
                         if self.error_ref == Some(r) {
                             let num_args = if b > 0 { b - 1 } else { self.top - (base + a) - 1 };
@@ -1579,8 +1779,15 @@ impl Vm {
                                 .map(|i| self.stack[base + a + 1 + i])
                                 .collect();
                             self.handle_error(&args)?;
-                            // handle_error always returns Err, so this is unreachable
                             unreachable!();
+                        }
+                        if self.coro_yield_ref == Some(r) {
+                            let num_args = if b > 0 { b - 1 } else { self.top - (base + a) - 1 };
+                            let args: Vec<Value> = (0..num_args)
+                                .map(|i| self.stack[base + a + 1 + i])
+                                .collect();
+                            self.handle_yield(&args, base + a, self.frames[fi].num_results)?;
+                            continue;
                         }
                     }
 
@@ -1622,10 +1829,21 @@ impl Vm {
                     self.frames.pop();
 
                     if self.frames.is_empty() {
+                        self.last_return_values = results;
                         return Ok(());
                     }
 
                     self.place_results(result_base, num_results, &results);
+
+                    // Check if we just returned from a pcall-guarded frame.
+                    // If so, write the `true` prefix that pcall didn't get to write
+                    // because it returned early on yield.
+                    if let Some(guard) = self.pcall_guards.last() {
+                        if self.frames.len() == guard.frame_depth {
+                            let guard = self.pcall_guards.pop().unwrap();
+                            self.stack[guard.result_base] = Value::Boolean(true);
+                        }
+                    }
                 }
 
                 OpCode::VarArg => {
@@ -1741,7 +1959,7 @@ impl Vm {
 
             let is_native = matches!(
                 gc_ref.as_object().as_closure().unwrap(),
-                Closure::Native(_) | Closure::NativeDyn(_)
+                Closure::Native(_) | Closure::NativeDyn(_) | Closure::WrapIterator(_)
             );
 
             if is_native {
@@ -1749,9 +1967,20 @@ impl Vm {
                 if self.error_ref == Some(gc_ref) {
                     return self.handle_error(&actual_args);
                 }
+                // Intercept coroutine special functions
+                if self.coro_resume_ref == Some(gc_ref) {
+                    return self.handle_resume(&actual_args, result_base, num_results);
+                }
+                if self.coro_yield_ref == Some(gc_ref) {
+                    return self.handle_yield(&actual_args, result_base, num_results);
+                }
                 let results = match gc_ref.as_object().as_closure().unwrap() {
                     Closure::Native(nc) => (nc.func)(&actual_args, &mut self.gc)?,
                     Closure::NativeDyn(nc) => (nc.func)(&actual_args, &mut self.gc)?,
+                    Closure::WrapIterator(co) => {
+                        let co = *co;
+                        return self.handle_wrap_call(co, &actual_args, result_base, num_results);
+                    }
                     _ => unreachable!(),
                 };
                 self.place_results(result_base, num_results, &results);
@@ -1881,6 +2110,19 @@ impl Vm {
                     // Lua function: a frame was pushed, execute it protectedly
                     match self.execute_to_depth(saved_depth) {
                         Ok(()) => {
+                            // If a yield happened inside pcall, save a guard so
+                            // resume can provide error protection and true-prefix.
+                            if self.yielded.is_some() {
+                                self.pcall_guards.push(PcallGuard {
+                                    frame_depth: saved_depth,
+                                    open_uv_len: saved_open_uv_len,
+                                    result_base,
+                                    num_results,
+                                    is_xpcall: false,
+                                    handler: Value::Nil,
+                                });
+                                return Ok(());
+                            }
                             // Success: prepend true
                             self.stack[result_base] = Value::Boolean(true);
                             if num_results < 0 {
@@ -1938,6 +2180,409 @@ impl Vm {
         }
         // Trim any open upvalues that were created inside the failed call
         self.open_upvalues.truncate(saved_open_uv_len);
+    }
+
+    // ── Coroutine operations ───────────────────────────────────────
+
+    /// Save the currently running thread's execution state into its Coroutine object.
+    fn save_vm_to_thread(&mut self, thread_ref: GcRef) {
+        let co = thread_ref.as_object_mut().as_coroutine_mut().unwrap();
+        co.stack = std::mem::replace(&mut self.stack, vec![Value::Nil; 256]);
+        co.frames = std::mem::take(&mut self.frames);
+        co.open_upvalues = std::mem::take(&mut self.open_upvalues);
+        co.tbc_slots = std::mem::take(&mut self.tbc_slots);
+        co.pcall_guards = std::mem::take(&mut self.pcall_guards);
+        co.top = self.top;
+        self.top = 0;
+    }
+
+    /// Load a coroutine's execution state into the VM.
+    fn load_thread_to_vm(&mut self, thread_ref: GcRef) {
+        let co = thread_ref.as_object_mut().as_coroutine_mut().unwrap();
+        self.stack = std::mem::replace(&mut co.stack, Vec::new());
+        self.frames = std::mem::take(&mut co.frames);
+        self.open_upvalues = std::mem::take(&mut co.open_upvalues);
+        self.tbc_slots = std::mem::take(&mut co.tbc_slots);
+        self.pcall_guards = std::mem::take(&mut co.pcall_guards);
+        self.top = co.top;
+        co.top = 0;
+    }
+
+    /// Get the GcRef of the currently running thread.
+    fn running_thread(&self) -> GcRef {
+        self.current_thread.unwrap_or_else(|| self.main_thread.unwrap())
+    }
+
+    /// Handle coroutine.resume(co [, val1, ...]).
+    fn handle_resume(
+        &mut self,
+        args: &[Value],
+        result_base: usize,
+        num_results: i32,
+    ) -> Result<(), LuaError> {
+        let co_val = args.first().copied().unwrap_or(Value::Nil);
+        let co_ref = match co_val {
+            Value::Object(r) if r.as_object().as_coroutine().is_some() => r,
+            _ => {
+                let err_str = self.gc.new_string(b"value is not a thread");
+                self.place_results(
+                    result_base,
+                    num_results,
+                    &[Value::Boolean(false), Value::Object(err_str)],
+                );
+                return Ok(());
+            }
+        };
+
+        let resume_args: Vec<Value> = if args.len() > 1 { args[1..].to_vec() } else { vec![] };
+
+        // Check status
+        let status = co_ref.as_object().as_coroutine().unwrap().status;
+        if status != CoroutineStatus::Suspended {
+            let msg = match status {
+                CoroutineStatus::Dead => "cannot resume dead coroutine",
+                CoroutineStatus::Running => "cannot resume running coroutine",
+                CoroutineStatus::Normal => "cannot resume normal coroutine",
+                _ => unreachable!(),
+            };
+            let err_str = self.gc.new_string(msg.as_bytes());
+            self.place_results(
+                result_base,
+                num_results,
+                &[Value::Boolean(false), Value::Object(err_str)],
+            );
+            return Ok(());
+        }
+
+        let is_first_resume = co_ref.as_object().as_coroutine().unwrap().body.is_some();
+
+        // Save the current (resumer) thread state
+        let resumer_ref = self.running_thread();
+        self.save_vm_to_thread(resumer_ref);
+
+        // Set resumer to Normal
+        resumer_ref.as_object_mut().as_coroutine_mut().unwrap().status = CoroutineStatus::Normal;
+        // Save where to place resume results when we come back
+        resumer_ref.as_object_mut().as_coroutine_mut().unwrap().yield_result_base = result_base;
+        resumer_ref.as_object_mut().as_coroutine_mut().unwrap().yield_num_results = num_results;
+
+        // Load the target coroutine state
+        self.load_thread_to_vm(co_ref);
+        co_ref.as_object_mut().as_coroutine_mut().unwrap().status = CoroutineStatus::Running;
+        self.current_thread = if co_ref == self.main_thread.unwrap() { None } else { Some(co_ref) };
+
+        if is_first_resume {
+            let body = co_ref.as_object_mut().as_coroutine_mut().unwrap().body.take().unwrap();
+            // Set up the initial call
+            let call_base = 0;
+            self.ensure_stack(call_base + resume_args.len() + 2);
+            self.stack[call_base] = Value::Object(body);
+            for (i, &arg) in resume_args.iter().enumerate() {
+                self.stack[call_base + 1 + i] = arg;
+            }
+            self.do_call(Value::Object(body), call_base, &resume_args, call_base, -1)?;
+        } else {
+            // Resumed after yield: deliver resume args as yield's return values
+            let yr_base = co_ref.as_object().as_coroutine().unwrap().yield_result_base;
+            let yr_num = co_ref.as_object().as_coroutine().unwrap().yield_num_results;
+            self.place_results(yr_base, yr_num, &resume_args);
+        }
+
+        // Execute the coroutine (with pcall guard retry loop).
+        let exec_result = loop {
+            match self.execute() {
+                Ok(()) => break Ok(()),
+                Err(e) => {
+                    // Check if a pcall guard can catch this error.
+                    if let Some(guard) = self.pcall_guards.last() {
+                        if guard.frame_depth <= self.frames.len() {
+                            let guard = self.pcall_guards.pop().unwrap();
+                            let err_val = e.to_value(&mut self.gc);
+                            let handled = if guard.is_xpcall {
+                                self.call_message_handler(guard.handler, err_val)
+                            } else {
+                                err_val
+                            };
+                            self.recover_from_error(guard.frame_depth, guard.open_uv_len, Some(err_val));
+                            self.place_results(
+                                guard.result_base,
+                                guard.num_results,
+                                &[Value::Boolean(false), handled],
+                            );
+                            continue; // Re-enter execution
+                        }
+                    }
+                    break Err(e);
+                }
+            }
+        };
+
+        // Determine outcome
+        if let Err(e) = exec_result {
+            // Error: coroutine is now dead
+            let err_val = e.to_value(&mut self.gc);
+            co_ref.as_object_mut().as_coroutine_mut().unwrap().status = CoroutineStatus::Dead;
+            self.save_vm_to_thread(co_ref);
+
+            // Restore resumer
+            self.load_thread_to_vm(resumer_ref);
+            resumer_ref.as_object_mut().as_coroutine_mut().unwrap().status = CoroutineStatus::Running;
+            self.current_thread = if resumer_ref == self.main_thread.unwrap() { None } else { Some(resumer_ref) };
+
+            let rb = resumer_ref.as_object().as_coroutine().unwrap().yield_result_base;
+            let nr = resumer_ref.as_object().as_coroutine().unwrap().yield_num_results;
+            self.place_results(rb, nr, &[Value::Boolean(false), err_val]);
+        } else if let Some(yield_vals) = self.yielded.take() {
+            // Yield: coroutine suspended
+            co_ref.as_object_mut().as_coroutine_mut().unwrap().status = CoroutineStatus::Suspended;
+            self.save_vm_to_thread(co_ref);
+
+            // Restore resumer
+            self.load_thread_to_vm(resumer_ref);
+            resumer_ref.as_object_mut().as_coroutine_mut().unwrap().status = CoroutineStatus::Running;
+            self.current_thread = if resumer_ref == self.main_thread.unwrap() { None } else { Some(resumer_ref) };
+
+            let rb = resumer_ref.as_object().as_coroutine().unwrap().yield_result_base;
+            let nr = resumer_ref.as_object().as_coroutine().unwrap().yield_num_results;
+            let mut results = Vec::with_capacity(1 + yield_vals.len());
+            results.push(Value::Boolean(true));
+            results.extend(yield_vals);
+            self.place_results(rb, nr, &results);
+        } else {
+            // Normal return: coroutine's body finished
+            let return_vals = std::mem::take(&mut self.last_return_values);
+            co_ref.as_object_mut().as_coroutine_mut().unwrap().status = CoroutineStatus::Dead;
+            self.save_vm_to_thread(co_ref);
+
+            // Restore resumer
+            self.load_thread_to_vm(resumer_ref);
+            resumer_ref.as_object_mut().as_coroutine_mut().unwrap().status = CoroutineStatus::Running;
+            self.current_thread = if resumer_ref == self.main_thread.unwrap() { None } else { Some(resumer_ref) };
+
+            let rb = resumer_ref.as_object().as_coroutine().unwrap().yield_result_base;
+            let nr = resumer_ref.as_object().as_coroutine().unwrap().yield_num_results;
+            let mut results = Vec::with_capacity(1 + return_vals.len());
+            results.push(Value::Boolean(true));
+            results.extend(return_vals);
+            self.place_results(rb, nr, &results);
+        }
+
+        Ok(())
+    }
+
+    /// Handle coroutine.yield(...).
+    fn handle_yield(
+        &mut self,
+        args: &[Value],
+        result_base: usize,
+        num_results: i32,
+    ) -> Result<(), LuaError> {
+        if self.current_thread.is_none() {
+            return Err(LuaError::new("cannot yield from main thread"));
+        }
+
+        // Save where to deliver resume arguments when this coroutine is resumed
+        let co_ref = self.current_thread.unwrap();
+        co_ref.as_object_mut().as_coroutine_mut().unwrap().yield_result_base = result_base;
+        co_ref.as_object_mut().as_coroutine_mut().unwrap().yield_num_results = num_results;
+
+        // Set the yield flag — execute_to_depth will stop
+        self.yielded = Some(args.to_vec());
+        Ok(())
+    }
+
+    /// Handle coroutine.wrap(f) iterator call.
+    fn handle_wrap_call(
+        &mut self,
+        co_ref: GcRef,
+        args: &[Value],
+        result_base: usize,
+        num_results: i32,
+    ) -> Result<(), LuaError> {
+        // Build pseudo-args for resume: [co, args...]
+        let mut resume_args = Vec::with_capacity(1 + args.len());
+        resume_args.push(Value::Object(co_ref));
+        resume_args.extend_from_slice(args);
+
+        // Save result placement so handle_resume can use it
+        // We call handle_resume which will place results at result_base
+
+        // Instead of calling handle_resume, we do a direct resume that strips the boolean prefix
+        let status = co_ref.as_object().as_coroutine().unwrap().status;
+        if status != CoroutineStatus::Suspended {
+            let msg = if status == CoroutineStatus::Dead {
+                "cannot resume dead coroutine"
+            } else {
+                "cannot resume running coroutine"
+            };
+            return Err(LuaError::new(msg));
+        }
+
+        let is_first = co_ref.as_object().as_coroutine().unwrap().body.is_some();
+        let resumer_ref = self.running_thread();
+        self.save_vm_to_thread(resumer_ref);
+        resumer_ref.as_object_mut().as_coroutine_mut().unwrap().status = CoroutineStatus::Normal;
+        resumer_ref.as_object_mut().as_coroutine_mut().unwrap().yield_result_base = result_base;
+        resumer_ref.as_object_mut().as_coroutine_mut().unwrap().yield_num_results = num_results;
+
+        self.load_thread_to_vm(co_ref);
+        co_ref.as_object_mut().as_coroutine_mut().unwrap().status = CoroutineStatus::Running;
+        self.current_thread = if co_ref == self.main_thread.unwrap() { None } else { Some(co_ref) };
+
+        if is_first {
+            let body = co_ref.as_object_mut().as_coroutine_mut().unwrap().body.take().unwrap();
+            let call_base = 0;
+            self.ensure_stack(call_base + args.len() + 2);
+            self.stack[call_base] = Value::Object(body);
+            for (i, &arg) in args.iter().enumerate() {
+                self.stack[call_base + 1 + i] = arg;
+            }
+            if let Err(e) = self.do_call(Value::Object(body), call_base, args, call_base, -1) {
+                co_ref.as_object_mut().as_coroutine_mut().unwrap().status = CoroutineStatus::Dead;
+                self.save_vm_to_thread(co_ref);
+                self.load_thread_to_vm(resumer_ref);
+                resumer_ref.as_object_mut().as_coroutine_mut().unwrap().status = CoroutineStatus::Running;
+                self.current_thread = if resumer_ref == self.main_thread.unwrap() { None } else { Some(resumer_ref) };
+                return Err(e);
+            }
+        } else {
+            let yr_base = co_ref.as_object().as_coroutine().unwrap().yield_result_base;
+            let yr_num = co_ref.as_object().as_coroutine().unwrap().yield_num_results;
+            self.place_results(yr_base, yr_num, args);
+        }
+
+        let exec_result = loop {
+            match self.execute() {
+                Ok(()) => break Ok(()),
+                Err(e) => {
+                    if let Some(guard) = self.pcall_guards.last() {
+                        if guard.frame_depth <= self.frames.len() {
+                            let guard = self.pcall_guards.pop().unwrap();
+                            let err_val = e.to_value(&mut self.gc);
+                            let handled = if guard.is_xpcall {
+                                self.call_message_handler(guard.handler, err_val)
+                            } else {
+                                err_val
+                            };
+                            self.recover_from_error(guard.frame_depth, guard.open_uv_len, Some(err_val));
+                            self.place_results(
+                                guard.result_base,
+                                guard.num_results,
+                                &[Value::Boolean(false), handled],
+                            );
+                            continue;
+                        }
+                    }
+                    break Err(e);
+                }
+            }
+        };
+
+        if let Err(e) = exec_result {
+            co_ref.as_object_mut().as_coroutine_mut().unwrap().status = CoroutineStatus::Dead;
+            self.save_vm_to_thread(co_ref);
+            self.load_thread_to_vm(resumer_ref);
+            resumer_ref.as_object_mut().as_coroutine_mut().unwrap().status = CoroutineStatus::Running;
+            self.current_thread = if resumer_ref == self.main_thread.unwrap() { None } else { Some(resumer_ref) };
+            return Err(e);
+        } else if let Some(yield_vals) = self.yielded.take() {
+            co_ref.as_object_mut().as_coroutine_mut().unwrap().status = CoroutineStatus::Suspended;
+            self.save_vm_to_thread(co_ref);
+            self.load_thread_to_vm(resumer_ref);
+            resumer_ref.as_object_mut().as_coroutine_mut().unwrap().status = CoroutineStatus::Running;
+            self.current_thread = if resumer_ref == self.main_thread.unwrap() { None } else { Some(resumer_ref) };
+
+            let rb = resumer_ref.as_object().as_coroutine().unwrap().yield_result_base;
+            let nr = resumer_ref.as_object().as_coroutine().unwrap().yield_num_results;
+            // wrap: no boolean prefix, just the values
+            self.place_results(rb, nr, &yield_vals);
+        } else {
+            let return_vals = std::mem::take(&mut self.last_return_values);
+            co_ref.as_object_mut().as_coroutine_mut().unwrap().status = CoroutineStatus::Dead;
+            self.save_vm_to_thread(co_ref);
+            self.load_thread_to_vm(resumer_ref);
+            resumer_ref.as_object_mut().as_coroutine_mut().unwrap().status = CoroutineStatus::Running;
+            self.current_thread = if resumer_ref == self.main_thread.unwrap() { None } else { Some(resumer_ref) };
+
+            let rb = resumer_ref.as_object().as_coroutine().unwrap().yield_result_base;
+            let nr = resumer_ref.as_object().as_coroutine().unwrap().yield_num_results;
+            self.place_results(rb, nr, &return_vals);
+        }
+
+        Ok(())
+    }
+
+    /// Handle coroutine.running().
+    fn handle_running(&mut self, result_base: usize, num_results: i32) {
+        let thread_ref = self.running_thread();
+        let is_main = thread_ref.as_object().as_coroutine().unwrap().is_main;
+        self.place_results(
+            result_base,
+            num_results,
+            &[Value::Object(thread_ref), Value::Boolean(is_main)],
+        );
+    }
+
+    /// Handle coroutine.isyieldable([co]).
+    fn handle_isyieldable(&mut self, args: &[Value], result_base: usize, num_results: i32) {
+        let co_ref = match args.first() {
+            Some(Value::Object(r)) if r.as_object().as_coroutine().is_some() => *r,
+            _ => self.running_thread(),
+        };
+        let is_main = co_ref.as_object().as_coroutine().unwrap().is_main;
+        self.place_results(result_base, num_results, &[Value::Boolean(!is_main)]);
+    }
+
+    /// Handle coroutine.close([co]).
+    fn handle_close(
+        &mut self,
+        args: &[Value],
+        result_base: usize,
+        num_results: i32,
+    ) -> Result<(), LuaError> {
+        let co_ref = match args.first() {
+            Some(Value::Object(r)) if r.as_object().as_coroutine().is_some() => *r,
+            _ => {
+                // Default = running coroutine. For now: cannot close running.
+                return Err(LuaError::new("cannot close a running coroutine"));
+            }
+        };
+
+        let status = co_ref.as_object().as_coroutine().unwrap().status;
+        match status {
+            CoroutineStatus::Dead => {
+                self.place_results(result_base, num_results, &[Value::Boolean(true)]);
+            }
+            CoroutineStatus::Suspended => {
+                // Close TBC variables in the suspended coroutine
+                // We need to temporarily load the coroutine's state to close its TBC vars
+                let resumer_ref = self.running_thread();
+                self.save_vm_to_thread(resumer_ref);
+
+                self.load_thread_to_vm(co_ref);
+                // Close all TBC vars and upvalues
+                if !self.frames.is_empty() {
+                    let _ = self.close_tbc_vars(0, None);
+                    self.close_upvalues(0);
+                }
+                self.frames.clear();
+                self.save_vm_to_thread(co_ref);
+                co_ref.as_object_mut().as_coroutine_mut().unwrap().status = CoroutineStatus::Dead;
+
+                self.load_thread_to_vm(resumer_ref);
+                self.place_results(result_base, num_results, &[Value::Boolean(true)]);
+            }
+            _ => {
+                let msg = format!("cannot close a {} coroutine", status.as_str());
+                let err_str = self.gc.new_string(msg.as_bytes());
+                self.place_results(
+                    result_base,
+                    num_results,
+                    &[Value::Boolean(false), Value::Object(err_str)],
+                );
+            }
+        }
+        Ok(())
     }
 
     // ── Source location & error annotation ─────────────────────────
@@ -2045,6 +2690,18 @@ impl Vm {
                 if self.frames.len() > saved_depth {
                     match self.execute_to_depth(saved_depth) {
                         Ok(()) => {
+                            // If a yield happened inside xpcall, save a guard.
+                            if self.yielded.is_some() {
+                                self.pcall_guards.push(PcallGuard {
+                                    frame_depth: saved_depth,
+                                    open_uv_len: saved_open_uv_len,
+                                    result_base,
+                                    num_results,
+                                    is_xpcall: true,
+                                    handler: msgh,
+                                });
+                                return Ok(());
+                            }
                             self.stack[result_base] = Value::Boolean(true);
                         }
                         Err(e) => {
@@ -2133,6 +2790,9 @@ impl Vm {
                     result.push_str("function '");
                     result.push_str(&nc.name);
                     result.push('\'');
+                }
+                Closure::WrapIterator(_) => {
+                    result.push_str("function 'wrap_iterator'");
                 }
             }
         }
@@ -2406,5 +3066,137 @@ mod tests {
             "#,
         )
         .unwrap();
+    }
+
+    // ── Coroutine tests ────────────────────────────────────────────
+
+    #[test]
+    fn test_coroutine_basic() {
+        run_lua(r#"
+            local co = coroutine.create(function(a, b) return a + b end)
+            local ok, result = coroutine.resume(co, 10, 20)
+            assert(ok == true)
+            assert(result == 30)
+        "#).unwrap();
+    }
+
+    #[test]
+    fn test_coroutine_yield() {
+        run_lua(r#"
+            local co = coroutine.create(function(x)
+                local y = coroutine.yield(x + 1)
+                return y + 2
+            end)
+            local ok1, v1 = coroutine.resume(co, 10)
+            assert(ok1 and v1 == 11)
+            local ok2, v2 = coroutine.resume(co, 100)
+            assert(ok2 and v2 == 102)
+        "#).unwrap();
+    }
+
+    #[test]
+    fn test_coroutine_status() {
+        run_lua(r#"
+            local co = coroutine.create(function() coroutine.yield() end)
+            assert(coroutine.status(co) == "suspended")
+            coroutine.resume(co)
+            assert(coroutine.status(co) == "suspended")
+            coroutine.resume(co)
+            assert(coroutine.status(co) == "dead")
+        "#).unwrap();
+    }
+
+    #[test]
+    fn test_coroutine_wrap() {
+        run_lua(r#"
+            local gen = coroutine.wrap(function()
+                coroutine.yield(10)
+                coroutine.yield(20)
+                return 30
+            end)
+            assert(gen() == 10)
+            assert(gen() == 20)
+            assert(gen() == 30)
+        "#).unwrap();
+    }
+
+    #[test]
+    fn test_coroutine_wrap_for() {
+        run_lua(r#"
+            local results = {}
+            local gen = coroutine.wrap(function()
+                for i = 1, 5 do coroutine.yield(i) end
+            end)
+            for v in gen do results[#results + 1] = v end
+            assert(#results == 5 and results[1] == 1 and results[5] == 5)
+        "#).unwrap();
+    }
+
+    #[test]
+    fn test_coroutine_yield_in_pcall() {
+        run_lua(r#"
+            local co = coroutine.create(function()
+                local ok = pcall(function()
+                    coroutine.yield(42)
+                end)
+                return ok, "done"
+            end)
+            local ok1, v1 = coroutine.resume(co)
+            assert(ok1 and v1 == 42)
+            local ok2, v2, v3 = coroutine.resume(co)
+            assert(ok2 and v2 == true and v3 == "done")
+        "#).unwrap();
+    }
+
+    #[test]
+    fn test_coroutine_error_in_pcall_after_yield() {
+        run_lua(r#"
+            local co = coroutine.create(function()
+                local ok, err = pcall(function()
+                    coroutine.yield()
+                    error("boom")
+                end)
+                return ok, err
+            end)
+            local ok1 = coroutine.resume(co)
+            assert(ok1)
+            local ok2, pcall_ok, pcall_err = coroutine.resume(co)
+            assert(ok2)
+            assert(pcall_ok == false)
+        "#).unwrap();
+    }
+
+    #[test]
+    fn test_coroutine_running() {
+        run_lua(r#"
+            local t, m = coroutine.running()
+            assert(type(t) == "thread" and m == true)
+            local co = coroutine.create(function()
+                local t2, m2 = coroutine.running()
+                assert(type(t2) == "thread" and m2 == false)
+            end)
+            coroutine.resume(co)
+        "#).unwrap();
+    }
+
+    #[test]
+    fn test_coroutine_isyieldable() {
+        run_lua(r#"
+            assert(coroutine.isyieldable() == false)
+            local co = coroutine.create(function()
+                assert(coroutine.isyieldable() == true)
+            end)
+            coroutine.resume(co)
+        "#).unwrap();
+    }
+
+    #[test]
+    fn test_coroutine_close() {
+        run_lua(r#"
+            local co = coroutine.create(function() coroutine.yield() end)
+            coroutine.resume(co)
+            assert(coroutine.close(co))
+            assert(coroutine.status(co) == "dead")
+        "#).unwrap();
     }
 }

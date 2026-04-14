@@ -5,7 +5,7 @@ use std::rc::Rc;
 
 use crate::bytecode::Proto;
 use crate::error::LuaError;
-use crate::gc::Gc;
+use crate::gc::{Gc, GcRef};
 use crate::value::Value;
 
 /// A native function: takes arguments + GC reference, returns results.
@@ -29,6 +29,8 @@ pub enum Closure {
     Native(NativeClosure),
     /// A native closure with captured state (e.g., iterators from gmatch).
     NativeDyn(NativeDynClosure),
+    /// A wrap-iterator: resumes the contained coroutine on each call.
+    WrapIterator(GcRef),
 }
 
 /// A compiled Lua function closure: bytecode prototype + runtime upvalues.

@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::ptr::NonNull;
 
 use crate::closure::{Closure, LuaClosure, Upvalue};
+use crate::coroutine::Coroutine;
 use crate::string::LuaString;
 use crate::table::Table;
 use crate::value::Value;
@@ -35,6 +36,7 @@ pub enum GcObjectKind {
     String(LuaString),
     Table(Table),
     Closure(Closure),
+    Thread(Coroutine),
 }
 
 /// A GC-managed object: header + data.
@@ -78,6 +80,20 @@ impl GcObject {
             _ => None,
         }
     }
+
+    pub fn as_coroutine(&self) -> Option<&Coroutine> {
+        match &self.kind {
+            GcObjectKind::Thread(co) => Some(co),
+            _ => None,
+        }
+    }
+
+    pub fn as_coroutine_mut(&mut self) -> Option<&mut Coroutine> {
+        match &mut self.kind {
+            GcObjectKind::Thread(co) => Some(co),
+            _ => None,
+        }
+    }
 }
 
 // ── GcRef ──────────────────────────────────────────────────────────
@@ -105,8 +121,8 @@ impl GcRef {
     /// # Safety invariant
     /// The caller must ensure no other references to this object exist.
     #[inline]
-    pub fn as_object_mut(&mut self) -> &mut GcObject {
-        unsafe { self.ptr.as_mut() }
+    pub fn as_object_mut(&self) -> &mut GcObject {
+        unsafe { &mut *self.ptr.as_ptr() }
     }
 
     /// Get the raw pointer value (for display purposes like "table: 0x...").
@@ -192,6 +208,11 @@ impl Gc {
         self.alloc(GcObjectKind::Closure(closure))
     }
 
+    /// Allocate a new coroutine (thread).
+    pub fn new_thread(&mut self, coroutine: Coroutine) -> GcRef {
+        self.alloc(GcObjectKind::Thread(coroutine))
+    }
+
     /// Returns true if bytes_allocated has exceeded the GC threshold.
     pub fn should_collect(&self) -> bool {
         self.bytes_allocated > self.gc_threshold
@@ -230,6 +251,9 @@ impl Gc {
                     + t.hash.capacity() * std::mem::size_of::<Option<(Value, Value)>>()
             }
             GcObjectKind::Closure(_) => base,
+            GcObjectKind::Thread(co) => {
+                base + co.stack.capacity() * std::mem::size_of::<Value>()
+            }
         }
     }
 
@@ -299,11 +323,55 @@ impl Gc {
                 }
             }
             GcObjectKind::Closure(c) => {
-                if let Closure::Lua(LuaClosure { upvalues, .. }) = c {
-                    for uv_ref in upvalues {
-                        if let Upvalue::Closed(Value::Object(r)) = &*uv_ref.borrow() {
+                match c {
+                    Closure::Lua(LuaClosure { upvalues, .. }) => {
+                        for uv_ref in upvalues {
+                            if let Upvalue::Closed(Value::Object(r)) = &*uv_ref.borrow() {
+                                self.mark_object(*r, gray);
+                            }
+                        }
+                    }
+                    Closure::WrapIterator(co_ref) => {
+                        self.mark_object(*co_ref, gray);
+                    }
+                    _ => {}
+                }
+            }
+            GcObjectKind::Thread(co) => {
+                // Trace stack values
+                for val in &co.stack[..co.top.min(co.stack.len())] {
+                    if let Value::Object(r) = val {
+                        self.mark_object(*r, gray);
+                    }
+                }
+                // Trace frame closures, varargs, and upvalues
+                for frame in &co.frames {
+                    self.mark_object(frame.closure, gray);
+                    for val in &frame.varargs {
+                        if let Value::Object(r) = val {
                             self.mark_object(*r, gray);
                         }
+                    }
+                    for uv in &frame.upvalues {
+                        if let Upvalue::Closed(Value::Object(r)) = &*uv.borrow() {
+                            self.mark_object(*r, gray);
+                        }
+                    }
+                }
+                // Trace open upvalues
+                for uv in &co.open_upvalues {
+                    if let Upvalue::Closed(Value::Object(r)) = &*uv.borrow() {
+                        self.mark_object(*r, gray);
+                    }
+                }
+                // Trace body function
+                if let Some(body) = co.body {
+                    self.mark_object(body, gray);
+                }
+                // Trace pcall guard handler values
+                for guard in &co.pcall_guards {
+                    if let Value::Object(r) = guard.handler {
+                        self.mark_object(r, gray);
                     }
                 }
             }

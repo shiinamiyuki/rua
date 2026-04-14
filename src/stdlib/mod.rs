@@ -1,5 +1,6 @@
 //! Standard library implementations.
 
+pub mod coroutine;
 pub mod math;
 pub mod string;
 pub mod table;

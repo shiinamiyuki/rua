@@ -33,6 +33,7 @@ impl Value {
                 GcObjectKind::String(_) => "string",
                 GcObjectKind::Table(_) => "table",
                 GcObjectKind::Closure(_) => "function",
+                GcObjectKind::Thread(_) => "thread",
             },
         }
     }
@@ -75,6 +76,11 @@ impl Value {
     #[inline]
     pub fn is_function(&self) -> bool {
         matches!(self, Value::Object(r) if r.as_object().as_closure().is_some())
+    }
+
+    #[inline]
+    pub fn is_thread(&self) -> bool {
+        matches!(self, Value::Object(r) if r.as_object().as_coroutine().is_some())
     }
 
     /// Lua "truthiness": everything is true except `nil` and `false`.
@@ -194,6 +200,9 @@ impl fmt::Display for Value {
                     }
                     GcObjectKind::Closure(_) => {
                         write!(f, "function: 0x{:x}", gc_ref.ptr_value())
+                    }
+                    GcObjectKind::Thread(_) => {
+                        write!(f, "thread: 0x{:x}", gc_ref.ptr_value())
                     }
                 }
             }
