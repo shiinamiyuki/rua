@@ -1,5 +1,9 @@
 //! Standard library implementations.
 
+pub mod math;
+pub mod string;
+pub mod table;
+
 use crate::error::LuaError;
 use crate::gc::{Gc, GcObjectKind};
 use crate::table::Table;

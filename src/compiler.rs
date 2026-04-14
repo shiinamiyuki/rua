@@ -842,20 +842,45 @@ fn compile_generic_for(
 ) -> Result<(), LuaError> {
     fs.enter_scope(true);
 
-    // Reserve registers: iter_fn, state, control, (tbc placeholder), var1, var2, ...
+    // Layout: R[base], R[base+1], R[base+2] = iter_fn, state, control
+    //         R[base+3] = TBC placeholder
+    //         R[base+4..] = loop variables
     let num_vars = names.len();
-    let base = fs.alloc_regs(3)?; // iter_fn, state, control
+    let base = fs.free_reg;
 
     // Compile iterator expressions into R[base], R[base+1], R[base+2]
+    let n_iter = iterators.len();
+    let mut filled = 0usize;
     for (i, iter_expr) in iterators.iter().enumerate() {
         if i >= 3 {
             break;
         }
-        compile_expr_to_reg(fs, iter_expr, base + i as u8)?;
+        let is_last = i == n_iter - 1;
+        if is_last && i < 2 && is_multi_value_expr(iter_expr) {
+            // Last expression is multi-value: expand to fill remaining slots
+            let wanted = (3 - i) as u8;
+            let reg = fs.alloc_reg()?;
+            compile_expr_multi(fs, iter_expr, reg, wanted)?;
+            // Ensure free_reg accounts for all 3 slots
+            let target = base + 3;
+            if fs.free_reg < target {
+                fs.free_reg = target;
+                if fs.free_reg > fs.proto.max_stack_size {
+                    fs.proto.max_stack_size = fs.free_reg;
+                }
+            }
+            filled = 3;
+            break;
+        }
+        let reg = fs.alloc_reg()?;
+        compile_expr_to_reg(fs, iter_expr, reg)?;
+        filled = i + 1;
     }
     // Fill remaining with nil if fewer than 3 iterator values
-    for i in iterators.len()..3 {
-        fs.emit_abc(OpCode::LoadNil, base + i as u8, 0, 0, line);
+    while filled < 3 {
+        let reg = fs.alloc_reg()?;
+        fs.emit_abc(OpCode::LoadNil, reg, 0, 0, line);
+        filled += 1;
     }
 
     // TBC variable placeholder register
@@ -893,9 +918,8 @@ fn compile_generic_for(
     fs.patch_sbx(tforprep_pc, tforloop_pc);
 
     // Patch TFORLOOP: the backward branch offset (encoded in the instruction itself)
-    // TForLoop is ABC format, so we need to encode the backward jump target differently.
-    // For now, we store the jump offset in B as a relative backward offset.
-    let back_offset = tforloop_pc - body_start;
+    // PC is already incremented before execution, so offset must account for that.
+    let back_offset = tforloop_pc + 1 - body_start;
     fs.proto.code[tforloop_pc] = encode_abc(
         OpCode::TForLoop,
         base,
@@ -1033,6 +1057,15 @@ fn compile_func_body(
     child_fs.enter_scope(false);
     for param in &body.params {
         child_fs.add_local(param.clone())?;
+    }
+
+    // Named vararg table: `... name` creates a read-only local
+    if let Some(ref va_name) = body.vararg_name {
+        let reg = child_fs.add_local(va_name.clone())?;
+        child_fs.proto.vararg_name_reg = Some(reg);
+        if let Some(local) = child_fs.locals.last_mut() {
+            local.is_const = true;
+        }
     }
 
     // Compile body
@@ -1180,6 +1213,16 @@ fn compile_func_body_with_parent(
     child_fs.enter_scope(false);
     for param in &body.params {
         child_fs.add_local(param.clone())?;
+    }
+
+    // Named vararg table: `... name` creates a read-only local
+    if let Some(ref va_name) = body.vararg_name {
+        let reg = child_fs.add_local(va_name.clone())?;
+        child_fs.proto.vararg_name_reg = Some(reg);
+        // Mark as const to prevent assignment
+        if let Some(local) = child_fs.locals.last_mut() {
+            local.is_const = true;
+        }
     }
 
     // Pre-resolve: collect all variable names referenced in the body (including
@@ -1801,6 +1844,11 @@ fn compile_funcall(
     compile_expr_to_reg(fs, &call.callee, base)?;
 
     let has_self = call.method.is_some();
+    let self_extra: u8 = if has_self { 1 } else { 0 };
+    let arg_start = if has_self { base + 2 } else { base + 1 };
+
+    // Save free_reg before any temporary allocations
+    let saved_free = fs.free_reg;
 
     // For method calls: obj:method(args) → obj.method(obj, args)
     // We need to load the method and put self as first arg
@@ -1822,7 +1870,11 @@ fn compile_funcall(
         let k = fs.string_constant(method_name.as_bytes());
         fs.emit_abx(OpCode::LoadK, key_reg, k, line);
         fs.emit_abc(OpCode::GetTable, base, self_reg, key_reg, line);
-        fs.free_reg_to(key_reg);
+        // Free temporaries and set free_reg to arg_start
+        fs.free_reg = arg_start;
+        if fs.free_reg > fs.proto.max_stack_size {
+            fs.proto.max_stack_size = fs.free_reg;
+        }
         // self_reg already has the object
     }
 
@@ -1845,11 +1897,8 @@ fn compile_funcall(
     };
 
     let nargs = args.len();
-    let arg_start = if has_self { base + 2 } else { base + 1 };
-    let self_extra: u8 = if has_self { 1 } else { 0 };
 
-    // Ensure we have registers allocated for args
-    let saved_free = fs.free_reg;
+    // Ensure we have registers allocated for args starting at arg_start
     if fs.free_reg < arg_start {
         fs.free_reg = arg_start;
         if fs.free_reg > fs.proto.max_stack_size {

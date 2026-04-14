@@ -76,8 +76,14 @@ pub struct Vm {
     top: usize,
     /// GcRef to the pcall closure (for special-case detection in CALL).
     pcall_ref: Option<GcRef>,
+    /// GcRef to the xpcall closure (for special-case detection in CALL).
+    xpcall_ref: Option<GcRef>,
+    /// GcRef to the error closure (for special-case detection in CALL).
+    error_ref: Option<GcRef>,
     /// Stack indices of to-be-closed variables (sorted ascending).
     tbc_slots: Vec<usize>,
+    /// Shared metatable for all string values.
+    string_metatable: Option<GcRef>,
 }
 
 impl Vm {
@@ -90,7 +96,10 @@ impl Vm {
             open_upvalues: Vec::new(),
             top: 0,
             pcall_ref: None,
+            xpcall_ref: None,
+            error_ref: None,
             tbc_slots: Vec::new(),
+            string_metatable: None,
         }
     }
 
@@ -144,7 +153,15 @@ impl Vm {
         self.register_native(&mut env, "tostring", crate::stdlib::lua_tostring);
         self.register_native(&mut env, "tonumber", crate::stdlib::lua_tonumber);
         self.register_native(&mut env, "assert", crate::stdlib::lua_assert);
-        self.register_native(&mut env, "error", crate::stdlib::lua_error);
+
+        // error is special: handled by the VM to add source:line info.
+        {
+            let error_closure = Closure::new_native("error", |_, _| Ok(vec![]));
+            let error_gc = self.gc.new_closure(error_closure);
+            self.error_ref = Some(error_gc);
+            let key = self.gc.new_string(b"error");
+            env.raw_set(Value::Object(key), Value::Object(error_gc));
+        }
 
         // pcall is special: handled by the VM directly, not as a regular native call.
         {
@@ -153,6 +170,15 @@ impl Vm {
             self.pcall_ref = Some(pcall_gc);
             let key = self.gc.new_string(b"pcall");
             env.raw_set(Value::Object(key), Value::Object(pcall_gc));
+        }
+
+        // xpcall is special: handled by the VM directly, like pcall.
+        {
+            let xpcall_closure = Closure::new_native("xpcall", |_, _| Ok(vec![]));
+            let xpcall_gc = self.gc.new_closure(xpcall_closure);
+            self.xpcall_ref = Some(xpcall_gc);
+            let key = self.gc.new_string(b"xpcall");
+            env.raw_set(Value::Object(key), Value::Object(xpcall_gc));
         }
 
         self.register_native(&mut env, "ipairs", crate::stdlib::lua_ipairs);
@@ -169,6 +195,44 @@ impl Vm {
         let version_str = self.gc.new_string(b"Lua 5.5");
         let version_key = self.gc.new_string(b"_VERSION");
         env.raw_set(Value::Object(version_key), Value::Object(version_str));
+
+        // math library
+        let mut math_table = Table::new();
+        for (name, func) in crate::stdlib::math::math_functions() {
+            self.register_native(&mut math_table, name, func);
+        }
+        for (name, val) in crate::stdlib::math::math_constants() {
+            let key = self.gc.new_string(name.as_bytes());
+            math_table.raw_set(Value::Object(key), val);
+        }
+        let math_ref = self.gc.new_table(math_table);
+        let math_key = self.gc.new_string(b"math");
+        env.raw_set(Value::Object(math_key), Value::Object(math_ref));
+
+        // string library
+        let mut string_table = Table::new();
+        for (name, func) in crate::stdlib::string::string_functions() {
+            self.register_native(&mut string_table, name, func);
+        }
+        let string_ref = self.gc.new_table(string_table);
+        let string_key = self.gc.new_string(b"string");
+        env.raw_set(Value::Object(string_key), Value::Object(string_ref));
+
+        // Set up string metatable: { __index = string }
+        let mut string_mt = Table::new();
+        let index_key = self.gc.new_string(MM_INDEX);
+        string_mt.raw_set(Value::Object(index_key), Value::Object(string_ref));
+        let string_mt_ref = self.gc.new_table(string_mt);
+        self.string_metatable = Some(string_mt_ref);
+
+        // table library
+        let mut table_table = Table::new();
+        for (name, func) in crate::stdlib::table::table_functions() {
+            self.register_native(&mut table_table, name, func);
+        }
+        let table_ref = self.gc.new_table(table_table);
+        let table_key = self.gc.new_string(b"table");
+        env.raw_set(Value::Object(table_key), Value::Object(table_ref));
 
         self.gc.new_table(env)
     }
@@ -290,8 +354,8 @@ impl Vm {
         match val {
             Value::Object(r) => match &r.as_object().kind {
                 GcObjectKind::Table(t) => t.metatable,
-                // Strings share a per-type metatable (set by string library, not yet)
-                _ => None,
+                GcObjectKind::Closure(_) => None,
+                GcObjectKind::String(_) => self.string_metatable,
             },
             _ => None,
         }
@@ -368,14 +432,19 @@ impl Vm {
         }
 
         let gc_ref = actual_func.as_gc_ref().unwrap();
-        let is_native = matches!(gc_ref.as_object().as_closure().unwrap(), Closure::Native(_));
+        let is_native = matches!(gc_ref.as_object().as_closure().unwrap(), Closure::Native(_) | Closure::NativeDyn(_));
 
         if is_native {
-            let func_ptr = match gc_ref.as_object().as_closure().unwrap() {
-                Closure::Native(nc) => nc.func,
+            // Intercept error() to add source:line annotation
+            if self.error_ref == Some(gc_ref) {
+                self.handle_error(args)?;
+                unreachable!();
+            }
+            return match gc_ref.as_object().as_closure().unwrap() {
+                Closure::Native(nc) => (nc.func)(args, &mut self.gc),
+                Closure::NativeDyn(nc) => (nc.func)(args, &mut self.gc),
                 _ => unreachable!(),
             };
-            return func_ptr(args, &mut self.gc);
         }
 
         // Lua function: push frame and execute
@@ -1410,8 +1479,7 @@ impl Vm {
                 }
 
                 OpCode::TForLoop => {
-                    // Call R[A](R[A+1], R[A+2]) -> results into R[A+4], ...
-                    // B = number of loop variables
+                    // A = base register, B = backward jump offset, C = number of loop variables
                     let iter = self.reg(base, a);
                     let state = self.reg(base, a + 1);
                     let control = self.reg(base, a + 2);
@@ -1423,15 +1491,15 @@ impl Vm {
                     self.stack[call_base + 1] = state;
                     self.stack[call_base + 2] = control;
 
-                    // Call with 2 args, B results
-                    self.call_function(call_base, 3, b as i32)?;
+                    // Call with 2 args, C results (C = num_vars)
+                    self.call_function(call_base, 3, c as i32)?;
 
                     // Check first result
                     let first_result = self.reg(base, a + 4);
                     if !first_result.is_nil() {
                         self.set_reg(base, a + 2, first_result);
-                        // Jump back
-                        let jump_offset = -(c as i64);
+                        // Jump back using B (backward offset)
+                        let jump_offset = -(b as i64);
                         self.frames[fi].pc =
                             (self.frames[fi].pc as i64 + jump_offset) as usize;
                     }
@@ -1464,26 +1532,58 @@ impl Vm {
 
                 OpCode::Call => {
                     let func_val = self.stack[base + a];
-                    let is_pcall = if let (Value::Object(r), Some(pcall_r)) = (func_val, self.pcall_ref) {
-                        r == pcall_r
-                    } else {
-                        false
-                    };
+                    // Detect VM-special functions by GcRef identity
+                    let special = if let Value::Object(r) = func_val {
+                        if self.pcall_ref == Some(r) { 1 }
+                        else if self.xpcall_ref == Some(r) { 2 }
+                        else if self.error_ref == Some(r) { 3 }
+                        else { 0 }
+                    } else { 0 };
 
-                    if is_pcall {
-                        let num_results = if c == 0 { -1 } else { c as i32 - 1 };
-                        let num_args = if b > 0 { b - 1 } else { self.top - (base + a) - 1 };
-                        let args: Vec<Value> = (0..num_args)
-                            .map(|i| self.stack[base + a + 1 + i])
-                            .collect();
-                        self.handle_pcall(&args, base + a, num_results)?;
-                    } else {
-                        self.call_function(base + a, b, if c == 0 { -1 } else { c as i32 - 1 })?;
+                    let num_results = if c == 0 { -1 } else { c as i32 - 1 };
+                    let num_args = if b > 0 { b - 1 } else { self.top - (base + a) - 1 };
+
+                    match special {
+                        1 => { // pcall
+                            let args: Vec<Value> = (0..num_args)
+                                .map(|i| self.stack[base + a + 1 + i])
+                                .collect();
+                            self.handle_pcall(&args, base + a, num_results)?;
+                        }
+                        2 => { // xpcall
+                            let args: Vec<Value> = (0..num_args)
+                                .map(|i| self.stack[base + a + 1 + i])
+                                .collect();
+                            self.handle_xpcall(&args, base + a, num_results)?;
+                        }
+                        3 => { // error
+                            let args: Vec<Value> = (0..num_args)
+                                .map(|i| self.stack[base + a + 1 + i])
+                                .collect();
+                            self.handle_error(&args)?;
+                        }
+                        _ => {
+                            self.call_function(base + a, b, num_results)?;
+                        }
                     }
                 }
 
                 OpCode::TailCall => {
                     let func_val = self.reg(base, a);
+
+                    // Intercept error() in tail position
+                    if let Value::Object(r) = func_val {
+                        if self.error_ref == Some(r) {
+                            let num_args = if b > 0 { b - 1 } else { self.top - (base + a) - 1 };
+                            let args: Vec<Value> = (0..num_args)
+                                .map(|i| self.stack[base + a + 1 + i])
+                                .collect();
+                            self.handle_error(&args)?;
+                            // handle_error always returns Err, so this is unreachable
+                            unreachable!();
+                        }
+                    }
+
                     let num_args = if b > 0 { b - 1 } else { self.top - (base + a) - 1 };
                     let args: Vec<Value> = (0..num_args)
                         .map(|i| self.stack[base + a + 1 + i])
@@ -1641,15 +1741,19 @@ impl Vm {
 
             let is_native = matches!(
                 gc_ref.as_object().as_closure().unwrap(),
-                Closure::Native(_)
+                Closure::Native(_) | Closure::NativeDyn(_)
             );
 
             if is_native {
-                let func = match gc_ref.as_object().as_closure().unwrap() {
-                    Closure::Native(nc) => nc.func,
+                // Intercept error() to add source:line annotation
+                if self.error_ref == Some(gc_ref) {
+                    return self.handle_error(&actual_args);
+                }
+                let results = match gc_ref.as_object().as_closure().unwrap() {
+                    Closure::Native(nc) => (nc.func)(&actual_args, &mut self.gc)?,
+                    Closure::NativeDyn(nc) => (nc.func)(&actual_args, &mut self.gc)?,
                     _ => unreachable!(),
                 };
-                let results = func(&actual_args, &mut self.gc)?;
                 self.place_results(result_base, num_results, &results);
             } else {
                 let (proto, upvalues) = match gc_ref.as_object().as_closure().unwrap() {
@@ -1680,14 +1784,26 @@ impl Vm {
 
                 self.frames.push(CallFrame {
                     closure: gc_ref,
-                    proto,
+                    proto: Rc::clone(&proto),
                     upvalues,
                     base: new_base,
                     pc: 0,
                     result_base,
                     num_results,
-                    varargs,
+                    varargs: varargs.clone(),
                 });
+
+                // Named vararg table: create table from varargs and store in register
+                if let Some(va_reg) = proto.vararg_name_reg {
+                    let mut t = Table::new();
+                    for (i, &val) in varargs.iter().enumerate() {
+                        t.raw_set(Value::Integer(i as i64 + 1), val);
+                    }
+                    let n_key = Value::Object(self.gc.new_string(b"n"));
+                    t.raw_set(n_key, Value::Integer(varargs.len() as i64));
+                    let tref = self.gc.new_table(t);
+                    self.stack[new_base + va_reg as usize] = Value::Object(tref);
+                }
             }
 
             return Ok(());
@@ -1822,6 +1938,205 @@ impl Vm {
         }
         // Trim any open upvalues that were created inside the failed call
         self.open_upvalues.truncate(saved_open_uv_len);
+    }
+
+    // ── Source location & error annotation ─────────────────────────
+
+    /// Get the source:line string for a given call stack level.
+    /// Level 0 = current frame, level 1 = caller, etc.
+    /// Returns None if the level is out of range or the frame is a native call.
+    fn get_source_line(&self, level: usize) -> Option<String> {
+        let num_frames = self.frames.len();
+        if level >= num_frames {
+            return None;
+        }
+        let frame = &self.frames[num_frames - 1 - level];
+        let pc = if frame.pc > 0 { frame.pc - 1 } else { 0 };
+        let line = frame.proto.line_info.get(pc).copied().unwrap_or(0);
+        let source = frame.proto.source.as_deref().unwrap_or("?");
+        // Strip leading '@' from source name (Lua convention for file names)
+        let source = source.strip_prefix('@').unwrap_or(source);
+        Some(format!("{}:{}", source, line))
+    }
+
+    /// Annotate a string error value with source:line prefix.
+    /// If the value is not a string, return it unchanged.
+    fn annotate_error(&mut self, err: Value, level: usize) -> Value {
+        // Only annotate string errors
+        if let Value::Object(r) = err {
+            if r.as_object().as_string().is_some() {
+                if level > 0 {
+                    // level 1 = where error() was called (frame below error's caller)
+                    // The current frame is inside the Call dispatch, so we need to
+                    // look at frames. Level 1 = the frame that called error().
+                    if let Some(loc) = self.get_source_line(level - 1) {
+                        let msg = r.as_object().as_string().unwrap();
+                        let msg_str = std::str::from_utf8(msg.as_bytes()).unwrap_or("?");
+                        let annotated = format!("{}: {}", loc, msg_str);
+                        let s = self.gc.new_string(annotated.as_bytes());
+                        return Value::Object(s);
+                    }
+                }
+            }
+        }
+        err
+    }
+
+    /// Handle error(msg [, level]).
+    /// Raises an error, annotating string messages with source:line based on level.
+    fn handle_error(&mut self, args: &[Value]) -> Result<(), LuaError> {
+        let msg = args.first().copied().unwrap_or(Value::Nil);
+        let level = match args.get(1) {
+            Some(Value::Integer(n)) => *n as usize,
+            Some(Value::Float(f)) => *f as usize,
+            None => 1,
+            _ => 0, // non-number level means no annotation
+        };
+
+        let annotated = self.annotate_error(msg, level);
+        Err(LuaError::with_value(annotated))
+    }
+
+    // ── xpcall ─────────────────────────────────────────────────────
+
+    /// Handle xpcall(f, msgh [, arg1, ...]).
+    fn handle_xpcall(
+        &mut self,
+        xpcall_args: &[Value],
+        result_base: usize,
+        num_results: i32,
+    ) -> Result<(), LuaError> {
+        let func = xpcall_args.first().copied().unwrap_or(Value::Nil);
+        let msgh = xpcall_args.get(1).copied().unwrap_or(Value::Nil);
+        let call_args: Vec<Value> = if xpcall_args.len() > 2 {
+            xpcall_args[2..].to_vec()
+        } else {
+            vec![]
+        };
+
+        let saved_depth = self.frames.len();
+        let saved_open_uv_len = self.open_upvalues.len();
+
+        let inner_result_base = result_base + 1;
+        let inner_num_results = if num_results < 0 {
+            -1
+        } else if num_results > 1 {
+            num_results - 1
+        } else {
+            0
+        };
+
+        self.ensure_stack(inner_result_base + call_args.len() + 1);
+        self.stack[inner_result_base] = func;
+        for (i, arg) in call_args.iter().enumerate() {
+            self.stack[inner_result_base + 1 + i] = *arg;
+        }
+
+        let call_result = self.do_call(
+            func,
+            inner_result_base,
+            &call_args,
+            inner_result_base,
+            inner_num_results,
+        );
+
+        match call_result {
+            Ok(()) => {
+                if self.frames.len() > saved_depth {
+                    match self.execute_to_depth(saved_depth) {
+                        Ok(()) => {
+                            self.stack[result_base] = Value::Boolean(true);
+                        }
+                        Err(e) => {
+                            let err_val = e.to_value(&mut self.gc);
+                            // Call message handler before unwinding
+                            let handled = self.call_message_handler(msgh, err_val);
+                            self.recover_from_error(saved_depth, saved_open_uv_len, Some(err_val));
+                            self.place_results(
+                                result_base,
+                                num_results,
+                                &[Value::Boolean(false), handled],
+                            );
+                        }
+                    }
+                } else {
+                    self.stack[result_base] = Value::Boolean(true);
+                }
+            }
+            Err(e) => {
+                let err_val = e.to_value(&mut self.gc);
+                let handled = self.call_message_handler(msgh, err_val);
+                self.recover_from_error(saved_depth, saved_open_uv_len, Some(err_val));
+                self.place_results(
+                    result_base,
+                    num_results,
+                    &[Value::Boolean(false), handled],
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Call a message handler for xpcall. If the handler itself errors,
+    /// return the original error.
+    fn call_message_handler(&mut self, msgh: Value, err_val: Value) -> Value {
+        // Try to call the handler; if it fails, return original error
+        match self.call_value(msgh, &[err_val]) {
+            Ok(results) => results.into_iter().next().unwrap_or(Value::Nil),
+            Err(_) => err_val, // handler failed, return original error
+        }
+    }
+
+    // ── Stack traceback ────────────────────────────────────────────
+
+    /// Build a stack traceback string.
+    fn traceback(&self, msg: Option<&str>, level: usize) -> String {
+        let mut result = String::new();
+        if let Some(msg) = msg {
+            result.push_str(msg);
+            result.push('\n');
+        }
+        result.push_str("stack traceback:");
+
+        let num_frames = self.frames.len();
+        let start = if level < num_frames { num_frames - level } else { 0 };
+
+        for i in (0..start).rev() {
+            let frame = &self.frames[i];
+            let pc = if frame.pc > 0 { frame.pc - 1 } else { 0 };
+            let line = frame.proto.line_info.get(pc).copied().unwrap_or(0);
+            let source = frame.proto.source.as_deref().unwrap_or("?");
+            let source = source.strip_prefix('@').unwrap_or(source);
+
+            result.push_str("\n\t");
+            result.push_str(source);
+            result.push(':');
+            result.push_str(&line.to_string());
+            result.push_str(": in ");
+
+            // Try to find function name
+            let closure = frame.closure.as_object().as_closure().unwrap();
+            match closure {
+                Closure::Lua(_) => {
+                    if i == 0 {
+                        result.push_str("main chunk");
+                    } else {
+                        result.push_str("local function");
+                    }
+                }
+                Closure::Native(nc) => {
+                    result.push_str("function '");
+                    result.push_str(&nc.name);
+                    result.push('\'');
+                }
+                Closure::NativeDyn(nc) => {
+                    result.push_str("function '");
+                    result.push_str(&nc.name);
+                    result.push('\'');
+                }
+            }
+        }
+        result
     }
 
     // ── For-loop helpers ───────────────────────────────────────────

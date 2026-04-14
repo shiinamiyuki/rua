@@ -27,6 +27,8 @@ pub type UpvalueRef = Rc<RefCell<Upvalue>>;
 pub enum Closure {
     Lua(LuaClosure),
     Native(NativeClosure),
+    /// A native closure with captured state (e.g., iterators from gmatch).
+    NativeDyn(NativeDynClosure),
 }
 
 /// A compiled Lua function closure: bytecode prototype + runtime upvalues.
@@ -41,6 +43,12 @@ pub struct NativeClosure {
     pub func: NativeFn,
 }
 
+/// A native closure with dynamic captured state.
+pub struct NativeDynClosure {
+    pub name: String,
+    pub func: Box<dyn Fn(&[Value], &mut Gc) -> Result<Vec<Value>, LuaError>>,
+}
+
 impl Closure {
     /// Create a new Lua closure.
     pub fn new_lua(proto: Rc<Proto>, upvalues: Vec<UpvalueRef>) -> Self {
@@ -50,6 +58,17 @@ impl Closure {
     /// Create a new native closure.
     pub fn new_native(name: &'static str, func: NativeFn) -> Self {
         Closure::Native(NativeClosure { name, func })
+    }
+
+    /// Create a new native closure with captured state.
+    pub fn new_native_dyn(
+        name: String,
+        func: impl Fn(&[Value], &mut Gc) -> Result<Vec<Value>, LuaError> + 'static,
+    ) -> Self {
+        Closure::NativeDyn(NativeDynClosure {
+            name,
+            func: Box::new(func),
+        })
     }
 
     /// Stub constructor for backward compatibility with tests.

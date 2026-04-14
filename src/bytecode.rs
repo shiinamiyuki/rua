@@ -250,6 +250,8 @@ pub struct Proto {
     pub is_vararg: bool,
     /// Maximum stack size (number of registers needed).
     pub max_stack_size: u8,
+    /// Register for named vararg table (`... name` syntax), if any.
+    pub vararg_name_reg: Option<u8>,
 }
 
 /// A constant in the constant pool.
@@ -327,6 +329,7 @@ impl Proto {
             num_params: 0,
             is_vararg: false,
             max_stack_size: 2, // minimum usable stack
+            vararg_name_reg: None,
         }
     }
 }
