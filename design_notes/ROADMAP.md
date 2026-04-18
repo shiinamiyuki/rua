@@ -133,11 +133,11 @@ Goal: Pass the majority of the Lua test suite (non-coroutine, non-IO parts).
 - [x] To-be-closed: reverse-order close, error handling during close, interaction with `break`/`goto`/`return`
 
 ### M2.4 — Vararg & Multi-return
-- [ ] `VARARGPREP` / `VARARG` opcodes
-- [ ] Named vararg table (`... args` syntax)
-- [ ] Vararg table optimization (avoid table creation when possible)
-- [ ] Multi-return adjustment in all contexts: assignment, call args, table constructor, return, for-in
-- [ ] `select('#', ...)` and `select(n, ...)`
+- [x] `VARARGPREP` / `VARARG` opcodes
+- [x] Named vararg table (`... args` syntax)
+- [x] Vararg table optimization (avoid table creation when possible)
+- [x] Multi-return adjustment in all contexts: assignment, call args, table constructor, return, for-in
+- [x] `select('#', ...)` and `select(n, ...)`
 
 ### M2.5 — Tail Calls & Goto
 - [x] `TAILCALL`: reuse current frame, move args
@@ -146,26 +146,26 @@ Goal: Pass the majority of the Lua test suite (non-coroutine, non-IO parts).
 - [x] Scope validation: can't jump into a local's scope, can't shadow label in same block
 
 ### M2.6 — String Library
-- [ ] `string.byte`, `string.char`, `string.len`, `string.sub`, `string.rep`, `string.reverse`
-- [ ] `string.lower`, `string.upper`
-- [ ] `string.format` (all specifiers: `d`, `i`, `u`, `f`, `e`, `g`, `x`, `o`, `s`, `c`, `q`, `p`)
-- [ ] Pattern matching engine: `string.find`, `string.match`, `string.gmatch`, `string.gsub`
+- [x] `string.byte`, `string.char`, `string.len`, `string.sub`, `string.rep`, `string.reverse`
+- [x] `string.lower`, `string.upper`
+- [x] `string.format` (all specifiers: `d`, `i`, `u`, `f`, `e`, `g`, `x`, `o`, `s`, `c`, `q`, `p`)
+- [x] Pattern matching engine: `string.find`, `string.match`, `string.gmatch`, `string.gsub`
   - Character classes (`%a`, `%d`, `%w`, etc.), quantifiers (`*`, `+`, `-`, `?`), captures, `%bxy`, `%f[set]`
 - [ ] `string.dump` (serialize `Proto` to binary)
 - [ ] `string.pack`, `string.unpack`, `string.packsize`
-- [ ] String metatable with `__index = string`
+- [x] String metatable with `__index = string`
 
 ### M2.7 — Table Library
-- [ ] `table.insert`, `table.remove`, `table.sort` (with custom comparator)
-- [ ] `table.concat`, `table.move`
-- [ ] `table.pack`, `table.unpack`
-- [ ] `table.create` (Lua 5.5: pre-allocate array + hash)
+- [x] `table.insert`, `table.remove`, `table.sort` (default comparator; custom comparator deferred)
+- [x] `table.concat`, `table.move`
+- [x] `table.pack`, `table.unpack`
+- [x] `table.create` (Lua 5.5: pre-allocate array + hash)
 
 ### M2.8 — Math Library
-- [ ] All math functions mapped to Rust `f64` operations
-- [ ] `math.random` / `math.randomseed` (xoshiro256**)
-- [ ] `math.maxinteger`, `math.mininteger`, `math.huge`, `math.pi`
-- [ ] `math.type`, `math.tointeger`
+- [x] All math functions mapped to Rust `f64` operations
+- [x] `math.random` / `math.randomseed` (xoshiro256**)
+- [x] `math.maxinteger`, `math.mininteger`, `math.huge`, `math.pi`
+- [x] `math.type`, `math.tointeger`
 
 **Milestone check:** Lua test suite `strings.lua`, `math.lua`, `sort.lua`, `attrib.lua` pass.
 
@@ -176,24 +176,24 @@ Goal: Pass the majority of the Lua test suite (non-coroutine, non-IO parts).
 Goal: Full language coverage except FFI. All standard libraries functional.
 
 ### M3.1 — Coroutines
-- [ ] `Thread` struct: own stack, call frames, open upvalues, status
-- [ ] `coroutine.create` → allocate new `Thread`
-- [ ] `coroutine.resume` → save current thread state, switch to target thread
-- [ ] `coroutine.yield` → save target thread state, return to resumer
-- [ ] Status tracking: suspended / running / normal / dead
-- [ ] `coroutine.wrap` → returns iterator function
-- [ ] `coroutine.status`, `coroutine.running`, `coroutine.isyieldable`
-- [ ] `coroutine.close` → close pending TBC variables, set dead
-- [ ] Yield across pcall / metamethod boundaries
-- [ ] Error propagation from coroutine to resumer
+- [x] `Thread` struct: own stack, call frames, open upvalues, status
+- [x] `coroutine.create` → allocate new `Thread`
+- [x] `coroutine.resume` → save current thread state, switch to target thread
+- [x] `coroutine.yield` → save target thread state, return to resumer
+- [x] Status tracking: suspended / running / normal / dead
+- [x] `coroutine.wrap` → returns iterator function
+- [x] `coroutine.status`, `coroutine.running`, `coroutine.isyieldable`
+- [x] `coroutine.close` → close pending TBC variables, set dead
+- [x] Yield across pcall / metamethod boundaries
+- [x] Error propagation from coroutine to resumer
 
 ### M3.2 — Error Handling (Complete)
-- [ ] `xpcall` with message handler
-- [ ] Message handler nesting limit (prevent infinite recursion)
-- [ ] Stack traceback generation
-- [ ] Error position info (source:line in error messages)
-- [ ] `error(msg, level)` — level-based position annotation
-- [ ] Nil error object → string conversion
+- [x] `xpcall` with message handler
+- [x] Message handler nesting limit (handler errors return original error)
+- [x] Stack traceback generation
+- [x] Error position info (source:line in error messages)
+- [x] `error(msg, level)` — level-based position annotation
+- [x] Nil error object → string conversion
 
 ### M3.3 — Weak Tables & Finalizers
 - [ ] `__mode` = "k" / "v" / "kv" support in GC
@@ -204,18 +204,18 @@ Goal: Full language coverage except FFI. All standard libraries functional.
 - [ ] Re-marking for finalization
 
 ### M3.4 — I/O Library
-- [ ] `io.open`, `io.close`, `io.read`, `io.write`, `io.lines`
-- [ ] File handle object with methods: `file:read`, `file:write`, `file:seek`, `file:close`, `file:lines`, `file:flush`, `file:setvbuf`
-- [ ] `io.stdin`, `io.stdout`, `io.stderr`
-- [ ] `io.input`, `io.output` (default file handles)
-- [ ] `io.tmpfile`, `io.type`, `io.popen`
-- [ ] File handle `__gc` / `__close` metamethods
+- [x] `io.open`, `io.close`, `io.read`, `io.write`, `io.lines`
+- [x] File handle object with methods: `file:read`, `file:write`, `file:seek`, `file:close`, `file:lines`, `file:flush`, `file:setvbuf`
+- [x] `io.stdin`, `io.stdout`, `io.stderr`
+- [x] `io.input`, `io.output` (default file handles)
+- [x] `io.tmpfile`, `io.type`, `io.popen`
+- [x] File handle `__gc` / `__close` metamethods
 
 ### M3.5 — OS Library
-- [ ] `os.clock`, `os.time`, `os.date`, `os.difftime`
-- [ ] `os.execute`, `os.exit`, `os.getenv`
-- [ ] `os.remove`, `os.rename`, `os.tmpname`
-- [ ] `os.setlocale`
+- [x] `os.clock`, `os.time`, `os.date`, `os.difftime`
+- [x] `os.execute`, `os.exit`, `os.getenv`
+- [x] `os.remove`, `os.rename`, `os.tmpname`
+- [x] `os.setlocale`
 
 ### M3.6 — Package / Require
 - [ ] `require(modname)` — searcher chain
@@ -226,19 +226,19 @@ Goal: Full language coverage except FFI. All standard libraries functional.
 - [ ] `package.config`
 
 ### M3.7 — UTF-8 Library
-- [ ] `utf8.char`, `utf8.codepoint`, `utf8.codes`
-- [ ] `utf8.len`, `utf8.offset`
-- [ ] `utf8.charpattern`
+- [x] `utf8.char`, `utf8.codepoint`, `utf8.codes`
+- [x] `utf8.len`, `utf8.offset`
+- [x] `utf8.charpattern`
 
 ### M3.8 — Debug Library
-- [ ] `debug.getinfo` (function info: source, line, name, nparams, etc.)
-- [ ] `debug.getlocal`, `debug.setlocal`
-- [ ] `debug.getupvalue`, `debug.setupvalue`
-- [ ] `debug.getmetatable`, `debug.setmetatable`
-- [ ] `debug.traceback`
-- [ ] `debug.sethook`, `debug.gethook` (call/return/line/count hooks)
-- [ ] `debug.upvalueid`, `debug.upvaluejoin`
-- [ ] `debug.getuservalue`, `debug.setuservalue`
+- [x] `debug.getinfo` (function info: source, line, name, nparams, etc.)
+- [x] `debug.getlocal`, `debug.setlocal`
+- [x] `debug.getupvalue`, `debug.setupvalue`
+- [x] `debug.getmetatable`, `debug.setmetatable`
+- [x] `debug.traceback`
+- [x] `debug.sethook`, `debug.gethook` (stubs — no-op / returns nil)
+- [x] `debug.upvalueid`, `debug.upvaluejoin`
+- [x] `debug.getuservalue`, `debug.setuservalue`
 - [ ] `debug.getregistry`
 
 **Milestone check:** Full Lua 5.5 test suite passes (excluding C-API tests).

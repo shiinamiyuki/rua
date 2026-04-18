@@ -302,10 +302,9 @@ impl FuncState {
         // Remove labels from this scope
         self.labels.truncate(scope.first_label);
 
-        // Remove locals from this scope
+        // Remove locals from this scope (drain preserves declaration order)
         let end_pc = self.proto.code.len() as u32;
-        while self.locals.len() > scope.first_local {
-            let local = self.locals.pop().unwrap();
+        for local in self.locals.drain(scope.first_local..) {
             self.proto.locals.push(LocalVarInfo {
                 name: local.name.clone(),
                 start_pc: local.start_pc,

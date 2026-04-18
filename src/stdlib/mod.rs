@@ -1,9 +1,13 @@
 //! Standard library implementations.
 
 pub mod coroutine;
+pub mod debug;
+pub mod io;
 pub mod math;
+pub mod os;
 pub mod string;
 pub mod table;
+pub mod utf8;
 
 use crate::error::LuaError;
 use crate::gc::{Gc, GcObjectKind};

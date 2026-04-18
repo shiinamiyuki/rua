@@ -231,4 +231,181 @@ All Phase 1 milestones (M1.1–M1.8) are now **complete**. Ready for Phase 2 (me
 - New test file: `tests/test_tailcall_goto_close.lua` — covers tail calls (deep recursion, mutual, multiple args), goto, `<const>`, `<close>` (scope exit, reverse order, nil/false, return, error via pcall), global declarations, tail call inhibited by `<close>
 
 
+### Session: M2.6 String Library + M2.7 Table Library
+
+**M2.6 — String Library (Complete)**
+- Created `src/stdlib/string.rs` (~600 lines) with full Lua 5.5 string library
+- Functions implemented: `byte`, `char`, `len`, `sub`, `rep`, `reverse`, `lower`, `upper`, `format`, `find`, `match`, `gmatch`, `gsub`
+- `string.format`: all specifiers (d, i, u, f, e, E, g, G, x, X, o, s, c, q, p, %%)
+- Pattern matching engine: character classes (%a, %d, %w, etc.), sets ([...], [^...]), quantifiers (*, +, -, ?), anchors (^, $), captures
+- `string.gmatch`: Returns stateful iterator via new `NativeDyn` closure variant
+- Added `NativeDynClosure` to `Closure` enum in closure.rs to support closures that capture state (needed for gmatch's iterator)
+- Updated VM to handle `Closure::NativeDyn` variant in both call sites (call_value and do_call)
+- String metatable: Added `string_metatable: Option<GcRef>` field to VM struct; created metatable with `__index = string` table. Updated `get_metatable()` to return string metatable for string values. Enables `s:upper()`, `s:find(...)` etc.
+- Registered string library in `create_global_env` as `_ENV.string`
+- 71 integration tests all passing (tests/test_string.lua)
+
+**Bug Fix: Method Call Register Allocation**
+- Discovered and fixed a bug in `compile_funcall` where method calls (`s:method()`) as non-last arguments would corrupt register allocation
+- Root cause: `saved_free` was captured AFTER the method call's temporary register allocations (self_reg, key_reg), causing subsequent argument registers to be allocated too high
+- Fix: Moved `saved_free` capture before method setup; after method setup, explicitly set `fs.free_reg = arg_start` to properly account for the method's R[base] (function) and R[base+1] (self) layout
+
+**M2.7 — Table Library (Complete)**
+- Created `src/stdlib/table.rs` (~260 lines)
+- Functions: `insert`, `remove`, `concat`, `move`, `pack`, `unpack`, `sort`, `create`
+- `table.insert(t, [pos,] value)`: append or insert at position
+- `table.remove(t [, pos])`: remove and return element
+- `table.concat(t [, sep [, i [, j]]])`: concatenate array elements
+- `table.move(a1, f, e, t [, a2])`: move elements between/within tables
+- `table.pack(...)`: create table from varargs with `n` field
+- `table.unpack(t [, i [, j]])`: multi-return array elements
+- `table.sort(t [, comp])`: default comparison sort (custom comparator deferred)
+- `table.create(narr [, nrec])`: pre-allocate array and hash parts
+- Registered in `create_global_env` as `_ENV.table`
+- 47 integration tests all passing (tests/test_table.lua)
+- All 158 unit tests pass, all integration suites pass
+
+
+### Session: M3.2 Error Handling (2026-04-13)
+
+**M3.2 — Error Handling (Complete)**
+- Made `error()` a VM-intercepted function (like `pcall`) so it can access call frames for source:line annotation
+- `error(msg, level)`: level 0 = no annotation, level 1 (default) = annotate with caller's location, level 2+ = walk up the call stack
+- String errors are annotated with `source:line: message` format; non-string errors pass through unchanged
+- Added `xpcall(f, msgh, ...)` as VM-intercepted function with full message handler support
+- Message handler is called before stack unwinding; if handler errors, original error is returned
+- Added `get_source_line(level)` helper that reads `proto.line_info[pc]` and `proto.source` from call frames
+- Added `traceback()` method that walks call frames to build stack traceback strings
+- Intercept `error()` in `do_call()` and `call_value()` as well as `OpCode::Call` and `OpCode::TailCall`, ensuring error annotation works when error is passed as argument (e.g., `pcall(error, "msg")`)
+- Added `error_ref`, `xpcall_ref` fields to VM struct for identity-based interception
+- Refactored `OpCode::Call` dispatch to use a unified special-function detection (pcall=1, xpcall=2, error=3)
+- 48 error handling tests all passing (tests/test_errors.lua)
+- All 158 unit tests pass, all integration suites pass
+
+**Known pre-existing issue**: `return pcall(...)` inside a function doesn't properly propagate pcall's multi-return values through the Return opcode when using variable-result mode. This is a pre-existing issue unrelated to error handling.
+
+## M3.1 — Coroutines (Complete)
+
+### Architecture
+- **Per-thread execution state**: Each coroutine owns its own stack, frames, open_upvalues, tbc_slots, top, and pcall_guards. The VM holds the active thread's state directly.
+- **State swap on resume/yield**: `save_vm_to_thread()` / `load_thread_to_vm()` swap all execution state via `std::mem::replace`/`take`.
+- **Yield mechanism**: `yielded: Option<Vec<Value>>` flag on Vm, checked at top of `execute_to_depth` loop. Propagates transparently through pcall/xpcall.
+- **Main thread**: Created in `execute_main()` as a Coroutine with `is_main: true`. Always exists as `main_thread` on Vm.
+
+### Coroutine Library Functions
+- `coroutine.create(f)` — Regular native function, creates Coroutine + Thread GC object
+- `coroutine.status(co)` — Regular native, returns status string
+- `coroutine.wrap(f)` — Regular native, creates Coroutine + WrapIterator closure
+- `coroutine.resume` — VM special (identity-matched GcRef in CALL dispatch)
+- `coroutine.yield` — VM special
+- `coroutine.running` — VM special, returns (thread, is_main)
+- `coroutine.isyieldable` — VM special
+- `coroutine.close` — VM special
+
+### Key Implementation Details
+
+**WrapIterator**: New `Closure::WrapIterator(GcRef)` variant. Detected as special case in CALL dispatch. Works like resume but without boolean prefix in results, and propagates errors directly.
+
+**PcallGuard mechanism** (yield-across-pcall):
+- When yield happens inside pcall/xpcall, a `PcallGuard` is pushed containing: frame_depth, open_uv_len, result_base, num_results, is_xpcall flag, handler value.
+- In RETURN opcode: after popping a frame, if `frames.len()` matches top guard's frame_depth, pop guard and write `true` at result_base.
+- In handle_resume/handle_wrap_call: retry loop catches errors → checks pcall_guards → if guard matches, recover_from_error + place (false, error), then re-enter execution.
+- Guards are saved/restored with coroutine state in save/load_thread_to_vm.
+- GC traces guard handler values (for xpcall).
+
+### Files Modified
+- `src/coroutine.rs`: Full Coroutine struct with CoroutineStatus enum, pcall_guards field
+- `src/gc.rs`: Thread variant, new_thread(), trace/size for Thread, as_object_mut(&self)
+- `src/value.rs`: type_name/Display/is_thread for Thread
+- `src/closure.rs`: WrapIterator(GcRef) variant
+- `src/vm.rs`: PcallGuard struct, Vm fields, CALL dispatch (9 special cases), all handler methods, pcall guard logic in RETURN, retry loop in resume/wrap
+- `src/stdlib/coroutine.rs`: New file — create, status, wrap native functions
+- `src/stdlib/mod.rs`: Added coroutine module
+
+### Test Results
+- 166 unit tests pass (156 original + 10 new coroutine tests)
+- External test file `tests/coroutine_basic.lua` covers 14 test scenarios including:
+  - Basic create/resume, yield/resume cycles, multiple yields, resume-dead-fails
+  - coroutine.wrap, wrap with for-in, wrap error propagation
+  - coroutine.running, coroutine.isyieldable, coroutine.close
+  - Yield inside pcall (with PcallGuard), multi-return from yield
+  - Error in coroutine
+
+## Session: M3.4 (I/O Library) & M3.5 (OS Library)
+
+### Changes Made
+
+**Userdata GC Infrastructure** (from prior session):
+- `GcObjectKind::Userdata(LuaUserdata)` with `Box<dyn Any>` + optional metatable
+- Accessor methods, GC tracing, size estimation
+- Value type_name "userdata", Display format
+
+**I/O Library** (`src/stdlib/io.rs`):
+- `LuaFile` struct with `FileKind` enum: Regular (BufReader<File>), Stdin, Stdout, Stderr, Closed
+- File methods: read (formats: l, L, a, n, bytes), write, close, seek, flush, lines, setvbuf (stub)
+- IO functions: open (full mode support: r/w/a/r+/w+/a+), close, read, write, flush, type, tmpfile, lines, input, output, popen (stub)
+- `file.__close` metamethod for TBC / cleanup
+- File metatable with `__index` pointing to method table
+- `io.stdin`, `io.stdout`, `io.stderr` as userdata file handles
+- Iterator closures for `io.lines(filename)` and `file:lines()` using NativeDynClosure
+
+**OS Library** (`src/stdlib/os.rs`):
+- `os.clock` — CPU time via `Instant::now()` with thread-local start time
+- `os.time` — Unix epoch seconds via `SystemTime`
+- `os.date` — Basic strftime formatting (%Y, %m, %d, %H, %M, %S, %A, %a, %B, %b, %c, %p, %X, %x, etc.)
+- `os.date("*t")` — Returns table with year/month/day/hour/min/sec/wday/yday/isdst
+- `os.difftime`, `os.execute`, `os.exit`, `os.getenv`, `os.remove`, `os.rename`, `os.tmpname`, `os.setlocale` (stub)
+
+**GC Changes**:
+- Added `file_metatable: Option<GcRef>` to `Gc` struct for native function access
+- Added `string_metatable` and `file_metatable` as explicit GC roots in `collect_garbage()`
+
+**Registration**:
+- io and os tables registered in `create_global_env()` with full method tables
+- File metatable created with `__index` and `__close` entries
+- `stdlib/mod.rs` updated with `pub mod io; pub mod os;`
+
+**Tests**: 167 total (166 prior + 1 new io_os_test.lua with ~25 test cases covering file I/O, seeking, lines iteration, os.clock/time/date/getenv/rename)
+
+### Design Notes
+- `io.read()`/`io.write()` directly use `std::io::stdin()`/`stdout()` rather than going through file handles, since native functions only receive `&mut Gc`, not VM state
+- `io.input()`/`io.output()` simplified: always return fresh stdin/stdout handles (no switching support)
+- `io.popen` returns error (not supported) — would need cross-platform process pipe management
+- `file:setvbuf` is a no-op stub — Rust manages its own buffering
+- Used `unsafe` raw pointer cast in `get_file_mut` to work around borrow checker lifetime issue with GcRef (which is a raw pointer wrapper)
+
+## Session: M3.7 (UTF-8 Library)
+
+Implemented `src/stdlib/utf8.rs`:
+- `utf8.char(···)` — codepoints to UTF-8 string
+- `utf8.codepoint(s, i, j)` — extract codepoints from byte range
+- `utf8.codes(s)` — iterator via NativeDynClosure returning (byte_pos, codepoint)
+- `utf8.len(s, i, j)` — count characters, returns nil+errpos on invalid UTF-8
+- `utf8.offset(s, n, i)` — byte position of n-th character (forward/backward)
+- `utf8.charpattern` — pattern constant `[\0-\x7F\xC2-\xFD][\x80-\xBF]*`
+
+168 tests passing.
+
+## M3.8 — Debug Library (2026-04-17)
+
+### Implemented
+- **debug.rs** (`src/stdlib/debug.rs`): NativeFn functions for `getmetatable`, `setmetatable`, `getuservalue`, `setuservalue`, `sethook` (stub), `gethook` (stub)
+- **VM-special debug functions**: `traceback`, `getinfo`, `getlocal`, `setlocal`, `getupvalue`, `setupvalue`, `upvalueid`, `upvaluejoin` — all special-cased in Call opcode dispatch (same pattern as pcall/xpcall/error/coroutine)
+- **LuaUserdata.user_values**: Added `Vec<Value>` for debug.getuservalue/setuservalue support
+- **Debug refs**: 8 GcRef fields on Vm struct for identity-based dispatch, all rooted for GC
+
+### Key Bugs Fixed
+1. **TailCall for C functions**: TailCall was unconditionally popping the caller's frame. In Lua, only Lua-to-Lua tail calls pop the frame; C functions keep the caller frame during execution. Fixed to only optimize tail calls targeting Lua closures.
+2. **Locals in reverse order**: `pop_scope` used `Vec::pop()` loop which reversed local ordering in `proto.locals`. Changed to `drain(scope.first_local..)` to preserve declaration order. This was critical for `debug.getlocal` returning correct names.
+3. **do_call missing debug interception**: Debug VM-special functions were only intercepted in the Call opcode's inline dispatch, but not in `do_call()` (used by TailCall and other call paths). Added all 8 debug function checks to `do_call`.
+
+### Architecture Notes
+- `_ENV` is always captured as upvalue[0] for every function (even if not used). This differs from PUC-Lua which only captures `_ENV` when needed. Tests account for this.
+- `debug.getregistry` not yet implemented (needs a persistent registry table).
+- `debug.sethook`/`debug.gethook` are no-op stubs.
+
+### Test Results
+- 169 tests passing (168 + 1 new debug library test)
+- Test file: `tests/debug_test.lua`
+
 ## APPEND HERE

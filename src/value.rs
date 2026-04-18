@@ -34,6 +34,7 @@ impl Value {
                 GcObjectKind::Table(_) => "table",
                 GcObjectKind::Closure(_) => "function",
                 GcObjectKind::Thread(_) => "thread",
+                GcObjectKind::Userdata(_) => "userdata",
             },
         }
     }
@@ -203,6 +204,9 @@ impl fmt::Display for Value {
                     }
                     GcObjectKind::Thread(_) => {
                         write!(f, "thread: 0x{:x}", gc_ref.ptr_value())
+                    }
+                    GcObjectKind::Userdata(_) => {
+                        write!(f, "userdata: 0x{:x}", gc_ref.ptr_value())
                     }
                 }
             }

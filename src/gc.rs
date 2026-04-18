@@ -7,6 +7,8 @@
 use std::collections::HashMap;
 use std::ptr::NonNull;
 
+use std::any::Any;
+
 use crate::closure::{Closure, LuaClosure, Upvalue};
 use crate::coroutine::Coroutine;
 use crate::string::LuaString;
@@ -37,6 +39,15 @@ pub enum GcObjectKind {
     Table(Table),
     Closure(Closure),
     Thread(Coroutine),
+    Userdata(LuaUserdata),
+}
+
+/// A GC-managed userdata: arbitrary Rust data + optional metatable.
+pub struct LuaUserdata {
+    pub data: Box<dyn Any>,
+    pub metatable: Option<GcRef>,
+    /// User-associated values (for debug.getuservalue / debug.setuservalue).
+    pub user_values: Vec<Value>,
 }
 
 /// A GC-managed object: header + data.
@@ -91,6 +102,20 @@ impl GcObject {
     pub fn as_coroutine_mut(&mut self) -> Option<&mut Coroutine> {
         match &mut self.kind {
             GcObjectKind::Thread(co) => Some(co),
+            _ => None,
+        }
+    }
+
+    pub fn as_userdata(&self) -> Option<&LuaUserdata> {
+        match &self.kind {
+            GcObjectKind::Userdata(ud) => Some(ud),
+            _ => None,
+        }
+    }
+
+    pub fn as_userdata_mut(&mut self) -> Option<&mut LuaUserdata> {
+        match &mut self.kind {
+            GcObjectKind::Userdata(ud) => Some(ud),
             _ => None,
         }
     }
@@ -160,6 +185,8 @@ pub struct Gc {
     bytes_allocated: usize,
     /// Next collection triggers when bytes_allocated exceeds this.
     pub gc_threshold: usize,
+    /// Shared metatable for file handles (userdata).
+    pub file_metatable: Option<GcRef>,
 }
 
 impl Gc {
@@ -171,6 +198,7 @@ impl Gc {
             string_pool: HashMap::new(),
             bytes_allocated: 0,
             gc_threshold: GC_INITIAL_THRESHOLD,
+            file_metatable: None,
         }
     }
 
@@ -211,6 +239,11 @@ impl Gc {
     /// Allocate a new coroutine (thread).
     pub fn new_thread(&mut self, coroutine: Coroutine) -> GcRef {
         self.alloc(GcObjectKind::Thread(coroutine))
+    }
+
+    /// Allocate a new userdata.
+    pub fn new_userdata(&mut self, data: Box<dyn Any>, metatable: Option<GcRef>) -> GcRef {
+        self.alloc(GcObjectKind::Userdata(LuaUserdata { data, metatable, user_values: Vec::new() }))
     }
 
     /// Returns true if bytes_allocated has exceeded the GC threshold.
@@ -254,6 +287,7 @@ impl Gc {
             GcObjectKind::Thread(co) => {
                 base + co.stack.capacity() * std::mem::size_of::<Value>()
             }
+            GcObjectKind::Userdata(_) => base + 64, // rough estimate
         }
     }
 
@@ -372,6 +406,16 @@ impl Gc {
                 for guard in &co.pcall_guards {
                     if let Value::Object(r) = guard.handler {
                         self.mark_object(r, gray);
+                    }
+                }
+            }
+            GcObjectKind::Userdata(ud) => {
+                if let Some(mt) = ud.metatable {
+                    self.mark_object(mt, gray);
+                }
+                for val in &ud.user_values {
+                    if let Value::Object(r) = val {
+                        self.mark_object(*r, gray);
                     }
                 }
             }
