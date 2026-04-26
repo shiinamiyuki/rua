@@ -26,6 +26,10 @@ pub struct Table {
     hash_log2: u8,
     /// Metatable (if any)
     pub(crate) metatable: Option<GcRef>,
+    /// True if this table has weak keys (`__mode` contains `'k'`).
+    pub(crate) weak_keys: bool,
+    /// True if this table has weak values (`__mode` contains `'v'`).
+    pub(crate) weak_values: bool,
 }
 
 impl Table {
@@ -37,6 +41,8 @@ impl Table {
             hash_used: 0,
             hash_log2: 0,
             metatable: None,
+            weak_keys: false,
+            weak_values: false,
         }
     }
 
@@ -55,7 +61,55 @@ impl Table {
             hash_used: 0,
             hash_log2,
             metatable: None,
+            weak_keys: false,
+            weak_values: false,
         }
+    }
+
+    /// Update weak-mode flags from a `__mode` string (typically read from a
+    /// metatable). `mode` is bytes from the `__mode` field; `None` clears.
+    pub fn set_weak_mode(&mut self, mode: Option<&[u8]>) {
+        self.weak_keys = false;
+        self.weak_values = false;
+        if let Some(s) = mode {
+            for &b in s {
+                match b {
+                    b'k' => self.weak_keys = true,
+                    b'v' => self.weak_values = true,
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    /// Iterate over (key, value) pairs in the array part (with their integer keys)
+    /// and the hash part. Used by GC for ephemeron / weak processing.
+    pub(crate) fn entries(&self) -> impl Iterator<Item = (Value, Value)> + '_ {
+        let array_iter = self
+            .array
+            .iter()
+            .enumerate()
+            .map(|(i, v)| (Value::Integer(i as i64 + 1), *v));
+        let hash_iter = self
+            .hash
+            .iter()
+            .filter_map(|e| e.as_ref().map(|e| (e.key, e.val)));
+        array_iter.chain(hash_iter)
+    }
+
+    /// Set the value at the given key in the hash part to nil (i.e., remove).
+    /// Used by GC to clear dead weak entries. Public to crate.
+    pub(crate) fn raw_remove(&mut self, key: &Value) {
+        // Array part: replace with nil rather than re-shape, so length and
+        // iteration order are preserved (caller is GC, not user code).
+        if let Value::Integer(i) = key {
+            let idx = *i as usize;
+            if idx >= 1 && idx <= self.array.len() {
+                self.array[idx - 1] = Value::Nil;
+                return;
+            }
+        }
+        self.hash_remove(key);
     }
 
     /// Normalize a key: canonicalize float-integer keys, reject nil/NaN.

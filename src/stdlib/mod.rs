@@ -5,6 +5,7 @@ pub mod debug;
 pub mod io;
 pub mod math;
 pub mod os;
+pub mod package;
 pub mod string;
 pub mod table;
 pub mod utf8;
@@ -252,7 +253,7 @@ pub fn lua_setmetatable(args: &[Value], _gc: &mut Gc) -> Result<Vec<Value>, LuaE
     let table = args.first().copied().unwrap_or(Value::Nil);
     let mt = args.get(1).copied().unwrap_or(Value::Nil);
     match table {
-        Value::Object(mut r) if r.as_object().as_table().is_some() => {
+        Value::Object(r) if r.as_object().as_table().is_some() => {
             // Check __metatable protection on existing metatable
             if let Some(existing_mt) = r.as_object().as_table().unwrap().metatable {
                 if let Some(mt_table) = existing_mt.as_object().as_table() {
@@ -272,6 +273,34 @@ pub fn lua_setmetatable(args: &[Value], _gc: &mut Gc) -> Result<Vec<Value>, LuaE
                 _ => return Err(LuaError::new("bad argument #2 to 'setmetatable'")),
             };
             r.as_object_mut().as_table_mut().unwrap().metatable = mt_ref;
+
+            // Update weak-mode flags from `__mode`.
+            let mode_bytes: Option<Vec<u8>> = mt_ref.and_then(|mt_ref| {
+                let mt_table = mt_ref.as_object().as_table()?;
+                let mode_key = _gc.new_string(b"__mode");
+                let v = mt_table.raw_get(&Value::Object(mode_key));
+                if let Value::Object(sr) = v {
+                    sr.as_object().as_string().map(|s| s.as_bytes().to_vec())
+                } else {
+                    None
+                }
+            });
+            r.as_object_mut()
+                .as_table_mut()
+                .unwrap()
+                .set_weak_mode(mode_bytes.as_deref());
+
+            // Register `__gc` finalizer if present and non-nil.
+            if let Some(mt_ref_v) = mt_ref {
+                if let Some(mt_table) = mt_ref_v.as_object().as_table() {
+                    let gc_key = _gc.new_string(b"__gc");
+                    let gc_val = mt_table.raw_get(&Value::Object(gc_key));
+                    if !gc_val.is_nil() {
+                        _gc.register_finalizer(r);
+                    }
+                }
+            }
+
             Ok(vec![table])
         }
         _ => Err(LuaError::new(

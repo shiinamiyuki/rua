@@ -31,6 +31,10 @@ pub struct GcHeader {
     next: Option<NonNull<GcObject>>,
     /// Marked flag for mark-and-sweep.
     pub marked: bool,
+    /// True if this object has a `__gc` finalizer pending the next GC cycle.
+    /// Cleared after the finalizer runs (or when the object is removed from
+    /// the finalizable list).
+    pub has_finalizer: bool,
 }
 
 /// The kind of data stored in a GC-managed object.
@@ -187,6 +191,13 @@ pub struct Gc {
     pub gc_threshold: usize,
     /// Shared metatable for file handles (userdata).
     pub file_metatable: Option<GcRef>,
+    /// Tables and userdata that have a `__gc` finalizer registered. Each
+    /// object appears at most once. Removed when its finalizer runs (so it
+    /// runs at most once) or when the object is swept.
+    finalizable: Vec<GcRef>,
+    /// Objects that became unreachable but had a finalizer; their `__gc` is
+    /// pending. The VM drains this between GC cycles.
+    pending_finalizers: Vec<GcRef>,
 }
 
 impl Gc {
@@ -199,7 +210,45 @@ impl Gc {
             bytes_allocated: 0,
             gc_threshold: GC_INITIAL_THRESHOLD,
             file_metatable: None,
+            finalizable: Vec::new(),
+            pending_finalizers: Vec::new(),
         }
+    }
+
+    /// Mark an object as having a `__gc` finalizer pending. Idempotent.
+    /// Only meaningful for tables and userdata. Tables/userdata get their
+    /// finalizer called once, on the GC cycle in which they become
+    /// unreachable (with a one-cycle resurrection).
+    pub fn register_finalizer(&mut self, obj: GcRef) {
+        let header = unsafe { &mut (*obj.ptr.as_ptr()).header };
+        if header.has_finalizer {
+            return;
+        }
+        header.has_finalizer = true;
+        self.finalizable.push(obj);
+    }
+
+    /// Drain the queue of objects whose `__gc` is pending.
+    pub fn take_pending_finalizers(&mut self) -> Vec<GcRef> {
+        std::mem::take(&mut self.pending_finalizers)
+    }
+
+    /// Whether there are pending finalizers waiting to be run.
+    pub fn has_pending_finalizers(&self) -> bool {
+        !self.pending_finalizers.is_empty()
+    }
+
+    /// Push an object back onto the pending-finalizer queue. Used by the VM
+    /// while it iterates the previously-drained queue, to keep not-yet-run
+    /// finalizers rooted across re-entrant collections.
+    pub fn requeue_pending_finalizer(&mut self, obj: GcRef) {
+        self.pending_finalizers.push(obj);
+    }
+
+    /// Pop one pending finalizer from the queue (LIFO: most-recently
+    /// resurrected finalizes first). Returns None if the queue is empty.
+    pub fn pop_pending_finalizer(&mut self) -> Option<GcRef> {
+        self.pending_finalizers.pop()
     }
 
     /// Allocate a new string. Short strings (≤40 bytes) are automatically interned.
@@ -251,6 +300,11 @@ impl Gc {
         self.bytes_allocated > self.gc_threshold
     }
 
+    /// Approximate number of live bytes under GC management.
+    pub fn bytes_allocated_approx(&self) -> usize {
+        self.bytes_allocated
+    }
+
     /// Internal: allocate a GcObject, prepend to intrusive linked list.
     fn alloc(&mut self, kind: GcObjectKind) -> GcRef {
         let size = Self::object_size(&kind);
@@ -261,6 +315,7 @@ impl Gc {
             header: GcHeader {
                 next: self.all_objects,
                 marked: false,
+                has_finalizer: false,
             },
             kind,
         });
@@ -296,21 +351,216 @@ impl Gc {
     /// Run a full mark-and-sweep GC cycle.
     /// `roots` are the GcRefs directly reachable from the VM (stack, frames, etc.).
     pub fn collect(&mut self, roots: &[GcRef]) {
-        // Mark phase: trace from roots using a gray worklist
+        // 1. Refresh weak-mode flags from each table's `__mode` metafield. A
+        //    table's `__mode` may have been mutated since its metatable was
+        //    set, so we re-read it here for correctness.
+        self.refresh_weak_modes();
+
+        // 2. Mark phase. Tables encountered here are traced respecting their
+        //    weak flags (weak refs are NOT followed, except for ephemeron
+        //    propagation handled below). Each weak table is recorded in
+        //    `weak_tables` so we can clear dead entries afterwards.
         let mut gray: Vec<GcRef> = Vec::with_capacity(roots.len());
+        let mut weak_tables: Vec<GcRef> = Vec::new();
+
+        // Add pending finalizers as roots so the previously-resurrected
+        // objects survive at least until their finalizer has run.
+        for &r in &self.pending_finalizers {
+            self.mark_object(r, &mut gray);
+        }
+
         for &root in roots {
             self.mark_object(root, &mut gray);
         }
         while let Some(obj_ref) = gray.pop() {
-            self.trace_object(obj_ref, &mut gray);
+            self.trace_object(obj_ref, &mut gray, &mut weak_tables);
         }
 
-        // Sweep string interning pool: remove dead entries
+        // 3. Ephemeron fixed-point. For tables with weak keys, an entry's
+        //    value is reachable only if its key is reachable. Repeat until
+        //    no new marks happen.
+        let mut changed = true;
+        while changed {
+            changed = false;
+            for &t_ref in &weak_tables {
+                let t = match t_ref.as_object().as_table() {
+                    Some(t) => t,
+                    None => continue,
+                };
+                if !t.weak_keys || t.weak_values {
+                    // Weak-keys-only tables are ephemerons. (Weak-values-only
+                    // and full-weak tables don't propagate marks at all.)
+                    continue;
+                }
+                for (k, v) in t.entries() {
+                    if let Value::Object(kr) = k {
+                        if Self::is_marked(kr) {
+                            // Key is alive; mark the value.
+                            if let Value::Object(vr) = v {
+                                if !Self::is_marked(vr) {
+                                    self.mark_object(vr, &mut gray);
+                                    changed = true;
+                                }
+                            }
+                        }
+                    } else {
+                        // Non-object keys (numbers, booleans) are always
+                        // "alive"; treat their values as reachable.
+                        if let Value::Object(vr) = v {
+                            if !Self::is_marked(vr) {
+                                self.mark_object(vr, &mut gray);
+                                changed = true;
+                            }
+                        }
+                    }
+                }
+            }
+            // Drain any new gray nodes produced by ephemeron propagation.
+            while let Some(obj_ref) = gray.pop() {
+                self.trace_object(obj_ref, &mut gray, &mut weak_tables);
+            }
+        }
+
+        // 4. Finalizers: any registered finalizable object that is still
+        //    unmarked becomes pending; resurrect it (mark + trace) so its
+        //    finalizer can safely run. Each object is finalized at most once.
+        let mut to_finalize: Vec<GcRef> = Vec::new();
+        let mut still_finalizable: Vec<GcRef> = Vec::with_capacity(self.finalizable.len());
+        let finalizable = std::mem::take(&mut self.finalizable);
+        for obj in finalizable {
+            if Self::is_marked(obj) {
+                still_finalizable.push(obj);
+            } else {
+                // Resurrect: mark + trace so it stays alive for finalization.
+                self.mark_object(obj, &mut gray);
+                while let Some(g) = gray.pop() {
+                    self.trace_object(g, &mut gray, &mut weak_tables);
+                }
+                // Clear its has_finalizer so subsequent collections sweep it.
+                let header = unsafe { &mut (*obj.ptr.as_ptr()).header };
+                header.has_finalizer = false;
+                to_finalize.push(obj);
+            }
+        }
+        self.finalizable = still_finalizable;
+        // Re-run ephemeron propagation in case finalizer-resurrection
+        // exposed more reachability.
+        if !to_finalize.is_empty() {
+            let mut changed = true;
+            while changed {
+                changed = false;
+                for &t_ref in &weak_tables {
+                    let t = match t_ref.as_object().as_table() {
+                        Some(t) => t,
+                        None => continue,
+                    };
+                    if !t.weak_keys || t.weak_values {
+                        continue;
+                    }
+                    for (k, v) in t.entries() {
+                        let key_alive = match k {
+                            Value::Object(kr) => Self::is_marked(kr),
+                            Value::Nil => false,
+                            _ => true,
+                        };
+                        if key_alive {
+                            if let Value::Object(vr) = v {
+                                if !Self::is_marked(vr) {
+                                    self.mark_object(vr, &mut gray);
+                                    changed = true;
+                                }
+                            }
+                        }
+                    }
+                }
+                while let Some(g) = gray.pop() {
+                    self.trace_object(g, &mut gray, &mut weak_tables);
+                }
+            }
+        }
+        self.pending_finalizers.extend(to_finalize);
+
+        // 5. Clear dead entries from weak tables.
+        for t_ref in weak_tables {
+            self.clear_weak_entries(t_ref);
+        }
+
+        // 6. Sweep string interning pool: remove dead entries.
         self.string_pool
             .retain(|_, gc_ref| unsafe { gc_ref.ptr.as_ref().header.marked });
 
-        // Sweep phase: walk the intrusive list, free unmarked objects
+        // 7. Sweep phase: walk the intrusive list, free unmarked objects.
         self.sweep();
+    }
+
+    /// Re-scan all live tables and refresh their weak_keys/weak_values flags
+    /// from their metatables' `__mode` field.
+    fn refresh_weak_modes(&mut self) {
+        let mut cur = self.all_objects;
+        unsafe {
+            while let Some(ptr) = cur {
+                let obj = &mut *ptr.as_ptr();
+                if let GcObjectKind::Table(_) = &obj.kind {
+                    let mt = obj.as_table().unwrap().metatable;
+                    let mode_bytes = mt
+                        .and_then(|mt_ref| {
+                            let mt_table = mt_ref.as_object().as_table()?;
+                            // Find the interned __mode key, if any
+                            let mode_key = self.string_pool.get(b"__mode".as_slice()).copied()?;
+                            let v = mt_table.raw_get(&Value::Object(mode_key));
+                            if let Value::Object(r) = v {
+                                let s = r.as_object().as_string()?;
+                                Some(s.as_bytes().to_vec())
+                            } else {
+                                None
+                            }
+                        });
+                    obj.as_table_mut()
+                        .unwrap()
+                        .set_weak_mode(mode_bytes.as_deref());
+                }
+                cur = obj.header.next;
+            }
+        }
+    }
+
+    /// Test if a GcRef points to a marked object.
+    #[inline]
+    fn is_marked(r: GcRef) -> bool {
+        unsafe { r.ptr.as_ref().header.marked }
+    }
+
+    /// Remove entries from a weak table whose key or value is dead.
+    fn clear_weak_entries(&self, t_ref: GcRef) {
+        let weak_keys;
+        let weak_values;
+        let mut to_remove: Vec<Value> = Vec::new();
+        {
+            let t = match t_ref.as_object().as_table() {
+                Some(t) => t,
+                None => return,
+            };
+            weak_keys = t.weak_keys;
+            weak_values = t.weak_values;
+            for (k, v) in t.entries() {
+                if v.is_nil() {
+                    continue;
+                }
+                let dead_key = weak_keys
+                    && matches!(k, Value::Object(r) if !Self::is_marked(r));
+                let dead_val = weak_values
+                    && matches!(v, Value::Object(r) if !Self::is_marked(r));
+                if dead_key || dead_val {
+                    to_remove.push(k);
+                }
+            }
+        }
+        if !to_remove.is_empty() {
+            let t_mut = t_ref.as_object_mut().as_table_mut().unwrap();
+            for k in to_remove {
+                t_mut.raw_remove(&k);
+            }
+        }
     }
 
     /// Mark a single GcRef as reachable and push it to the gray worklist.
@@ -326,34 +576,65 @@ impl Gc {
         }
     }
 
-    /// Trace outgoing references from a marked object.
-    fn trace_object(&mut self, gc_ref: GcRef, gray: &mut Vec<GcRef>) {
+    /// Trace outgoing references from a marked object. Tables with weak
+    /// flags are recorded in `weak_tables` and have their weak refs skipped.
+    fn trace_object(
+        &mut self,
+        gc_ref: GcRef,
+        gray: &mut Vec<GcRef>,
+        weak_tables: &mut Vec<GcRef>,
+    ) {
         let obj = unsafe { gc_ref.ptr.as_ref() };
         match &obj.kind {
             GcObjectKind::String(_) => {
                 // Strings are leaf objects — no outgoing references
             }
             GcObjectKind::Table(t) => {
-                // Trace array values
-                for val in &t.array {
-                    if let Value::Object(r) = val {
-                        self.mark_object(*r, gray);
-                    }
+                let weak_keys = t.weak_keys;
+                let weak_values = t.weak_values;
+                if weak_keys || weak_values {
+                    weak_tables.push(gc_ref);
                 }
-                // Trace hash keys and values
-                for entry in &t.hash {
-                    if let Some(e) = entry {
-                        if let Value::Object(r) = e.key {
-                            self.mark_object(r, gray);
-                        }
-                        if let Value::Object(r) = e.val {
-                            self.mark_object(r, gray);
-                        }
-                    }
-                }
-                // Trace metatable
+                // Trace metatable always.
                 if let Some(mt) = t.metatable {
                     self.mark_object(mt, gray);
+                }
+
+                // For weak-key tables, the value is only reachable if the
+                // key is reachable (ephemeron semantics). We therefore skip
+                // marking values here; the ephemeron fixed-point loop in
+                // `collect` handles them.
+                //
+                // Array entries are always under integer keys, which are
+                // value-typed and hence "alive"; so array values follow the
+                // weak_values flag only.
+                let trace_array_vals = !weak_values;
+                let trace_hash_keys = !weak_keys;
+                // Hash values: marked here only if BOTH keys and values are
+                // strong. Weak-key tables defer value marking to the
+                // ephemeron loop; weak-value tables obviously skip them.
+                let trace_hash_vals = !weak_keys && !weak_values;
+
+                if trace_array_vals {
+                    for val in &t.array {
+                        if let Value::Object(r) = val {
+                            self.mark_object(*r, gray);
+                        }
+                    }
+                }
+                for entry in &t.hash {
+                    if let Some(e) = entry {
+                        if trace_hash_keys {
+                            if let Value::Object(r) = e.key {
+                                self.mark_object(r, gray);
+                            }
+                        }
+                        if trace_hash_vals {
+                            if let Value::Object(r) = e.val {
+                                self.mark_object(r, gray);
+                            }
+                        }
+                    }
                 }
             }
             GcObjectKind::Closure(c) => {

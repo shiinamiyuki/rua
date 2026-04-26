@@ -196,12 +196,15 @@ Goal: Full language coverage except FFI. All standard libraries functional.
 - [x] Nil error object → string conversion
 
 ### M3.3 — Weak Tables & Finalizers
-- [ ] `__mode` = "k" / "v" / "kv" support in GC
-- [ ] Ephemeron table semantics (key-reachability determines value-reachability)
-- [ ] Clear dead entries during sweep
-- [ ] `__gc` finalizer: finalization queue, reverse-order execution
-- [ ] Resurrection: finalized objects survive one cycle
-- [ ] Re-marking for finalization
+- [x] `__mode` = "k" / "v" / "kv" support in GC
+- [x] Ephemeron table semantics (key-reachability determines value-reachability)
+- [x] Clear dead entries during sweep
+- [x] `__gc` finalizer: finalization queue, reverse-order execution
+- [x] Resurrection: finalized objects survive one cycle
+- [x] Re-marking for finalization
+- [x] `collectgarbage` core options (`"collect"`, `"count"`, `"stop"`, `"restart"`, `"isrunning"`, `"step"`)
+- [x] Precise GC stack rooting via `Proto::nactvar_at` + `CallFrame.runtime_top`
+      (so weak references actually become collectable)
 
 ### M3.4 — I/O Library
 - [x] `io.open`, `io.close`, `io.read`, `io.write`, `io.lines`
@@ -218,12 +221,14 @@ Goal: Full language coverage except FFI. All standard libraries functional.
 - [x] `os.setlocale`
 
 ### M3.6 — Package / Require
-- [ ] `require(modname)` — searcher chain
-- [ ] `package.loaded`, `package.preload`, `package.path`
-- [ ] `package.searchpath`
-- [ ] `package.searchers`: preload searcher + Lua file searcher
-- [ ] No C module loading (by design — no FFI)
-- [ ] `package.config`
+- [x] `require(modname)` — searcher chain
+- [x] `package.loaded`, `package.preload`, `package.path`
+- [x] `package.searchpath`
+- [x] `package.searchers`: preload searcher + Lua file searcher
+- [x] No C module loading (by design — no FFI)
+- [x] `package.config`
+- [x] Companion loaders: `load`, `loadfile`, `dofile` (VM-special so chunks
+      get a fresh `_ENV` upvalue)
 
 ### M3.7 — UTF-8 Library
 - [x] `utf8.char`, `utf8.codepoint`, `utf8.codes`

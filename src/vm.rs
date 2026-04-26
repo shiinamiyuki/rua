@@ -38,6 +38,8 @@ const MM_CALL: &[u8] = b"__call";
 const MM_TOSTRING: &[u8] = b"__tostring";
 const MM_METATABLE: &[u8] = b"__metatable";
 const MM_CLOSE: &[u8] = b"__close";
+const MM_GC: &[u8] = b"__gc";
+const MM_MODE: &[u8] = b"__mode";
 
 // ── Call frame ─────────────────────────────────────────────────────
 
@@ -59,6 +61,11 @@ pub(crate) struct CallFrame {
     pub(crate) num_results: i32,
     /// Vararg values for this frame.
     pub(crate) varargs: Vec<Value>,
+    /// Absolute stack index one past the highest currently in-use register.
+    /// Updated by instructions that stage arguments/operands in temporaries
+    /// above the active-locals region (notably Call and Concat). The GC
+    /// uses this to include in-flight temps as roots.
+    pub(crate) runtime_top: usize,
 }
 
 /// Saved pcall/xpcall context for yield-across-pcall support.
@@ -134,6 +141,24 @@ pub struct Vm {
     debug_setupvalue_ref: Option<GcRef>,
     debug_upvalueid_ref: Option<GcRef>,
     debug_upvaluejoin_ref: Option<GcRef>,
+
+    // ── Package / require support ──────────────────────────────────
+    require_ref: Option<GcRef>,
+    load_ref: Option<GcRef>,
+    loadfile_ref: Option<GcRef>,
+    dofile_ref: Option<GcRef>,
+    preload_searcher_ref: Option<GcRef>,
+    file_searcher_ref: Option<GcRef>,
+    /// The `package` library table (for quick access to loaded/preload/searchers/path).
+    package_ref: Option<GcRef>,
+    /// The global environment `_ENV` table.
+    globals_ref: Option<GcRef>,
+
+    /// `collectgarbage` (VM-special, runs a real mark-and-sweep).
+    collectgarbage_ref: Option<GcRef>,
+
+    /// Re-entrancy guard for `__gc` finalizer dispatch.
+    in_finalizer: bool,
 }
 
 impl Vm {
@@ -169,6 +194,16 @@ impl Vm {
             debug_setupvalue_ref: None,
             debug_upvalueid_ref: None,
             debug_upvaluejoin_ref: None,
+            require_ref: None,
+            load_ref: None,
+            loadfile_ref: None,
+            dofile_ref: None,
+            preload_searcher_ref: None,
+            file_searcher_ref: None,
+            package_ref: None,
+            globals_ref: None,
+            collectgarbage_ref: None,
+            in_finalizer: false,
         }
     }
 
@@ -213,6 +248,7 @@ impl Vm {
             result_base: 0,
             num_results: 0,
             varargs: Vec::new(),
+            runtime_top: base,
         });
 
         self.execute()
@@ -228,7 +264,7 @@ impl Vm {
             MM_BAND, MM_BOR, MM_BXOR, MM_BNOT, MM_SHL, MM_SHR,
             MM_CONCAT, MM_LEN, MM_EQ, MM_LT, MM_LE,
             MM_INDEX, MM_NEWINDEX, MM_CALL, MM_TOSTRING, MM_METATABLE,
-            MM_CLOSE,
+            MM_CLOSE, MM_GC, MM_MODE,
         ] {
             self.gc.new_string(name);
         }
@@ -247,6 +283,16 @@ impl Vm {
             self.error_ref = Some(error_gc);
             let key = self.gc.new_string(b"error");
             env.raw_set(Value::Object(key), Value::Object(error_gc));
+        }
+
+        // collectgarbage is special: it triggers a real mark-and-sweep cycle
+        // which needs full VM context (stack, frames) for roots.
+        {
+            let cg_closure = Closure::new_native("collectgarbage", |_, _| Ok(vec![]));
+            let cg_gc = self.gc.new_closure(cg_closure);
+            self.collectgarbage_ref = Some(cg_gc);
+            let key = self.gc.new_string(b"collectgarbage");
+            env.raw_set(Value::Object(key), Value::Object(cg_gc));
         }
 
         // pcall is special: handled by the VM directly, not as a regular native call.
@@ -518,7 +564,110 @@ impl Vm {
         let debug_key = self.gc.new_string(b"debug");
         env.raw_set(Value::Object(debug_key), Value::Object(debug_ref));
 
-        self.gc.new_table(env)
+        // ── package library ────────────────────────────────────────
+
+        // Stubs for VM-special functions (dispatch by GcRef identity).
+        let preload_searcher_stub = Closure::new_native("preload_searcher", |_, _| Ok(vec![]));
+        let preload_searcher_ref = self.gc.new_closure(preload_searcher_stub);
+        self.preload_searcher_ref = Some(preload_searcher_ref);
+
+        let file_searcher_stub = Closure::new_native("lua_searcher", |_, _| Ok(vec![]));
+        let file_searcher_ref = self.gc.new_closure(file_searcher_stub);
+        self.file_searcher_ref = Some(file_searcher_ref);
+
+        // package.loaded, package.preload
+        let loaded_ref = self.gc.new_table(Table::new());
+        let preload_ref = self.gc.new_table(Table::new());
+
+        // package.searchers = { preload_searcher, file_searcher }
+        let mut searchers_tbl = Table::new();
+        searchers_tbl.raw_set(Value::Integer(1), Value::Object(preload_searcher_ref));
+        searchers_tbl.raw_set(Value::Integer(2), Value::Object(file_searcher_ref));
+        let searchers_ref = self.gc.new_table(searchers_tbl);
+
+        // package.searchpath (pure native)
+        let searchpath_closure =
+            Closure::new_native("searchpath", crate::stdlib::package::lua_searchpath);
+        let searchpath_ref = self.gc.new_closure(searchpath_closure);
+
+        // Build the package table itself
+        let mut package_tbl = Table::new();
+        {
+            let k = self.gc.new_string(b"loaded");
+            package_tbl.raw_set(Value::Object(k), Value::Object(loaded_ref));
+        }
+        {
+            let k = self.gc.new_string(b"preload");
+            package_tbl.raw_set(Value::Object(k), Value::Object(preload_ref));
+        }
+        {
+            let k = self.gc.new_string(b"searchers");
+            package_tbl.raw_set(Value::Object(k), Value::Object(searchers_ref));
+        }
+        {
+            let k = self.gc.new_string(b"searchpath");
+            package_tbl.raw_set(Value::Object(k), Value::Object(searchpath_ref));
+        }
+        {
+            let k = self.gc.new_string(b"path");
+            let path_str = crate::stdlib::package::default_path();
+            let v = self.gc.new_string(path_str.as_bytes());
+            package_tbl.raw_set(Value::Object(k), Value::Object(v));
+        }
+        {
+            let k = self.gc.new_string(b"config");
+            let v = self.gc.new_string(crate::stdlib::package::PACKAGE_CONFIG.as_bytes());
+            package_tbl.raw_set(Value::Object(k), Value::Object(v));
+        }
+        let package_ref = self.gc.new_table(package_tbl);
+        self.package_ref = Some(package_ref);
+        let package_key = self.gc.new_string(b"package");
+        env.raw_set(Value::Object(package_key), Value::Object(package_ref));
+
+        // require, load, loadfile, dofile — VM-special by GcRef identity.
+        {
+            let c = Closure::new_native("require", |_, _| Ok(vec![]));
+            let r = self.gc.new_closure(c);
+            self.require_ref = Some(r);
+            let k = self.gc.new_string(b"require");
+            env.raw_set(Value::Object(k), Value::Object(r));
+        }
+        {
+            let c = Closure::new_native("load", |_, _| Ok(vec![]));
+            let r = self.gc.new_closure(c);
+            self.load_ref = Some(r);
+            let k = self.gc.new_string(b"load");
+            env.raw_set(Value::Object(k), Value::Object(r));
+        }
+        {
+            let c = Closure::new_native("loadfile", |_, _| Ok(vec![]));
+            let r = self.gc.new_closure(c);
+            self.loadfile_ref = Some(r);
+            let k = self.gc.new_string(b"loadfile");
+            env.raw_set(Value::Object(k), Value::Object(r));
+        }
+        {
+            let c = Closure::new_native("dofile", |_, _| Ok(vec![]));
+            let r = self.gc.new_closure(c);
+            self.dofile_ref = Some(r);
+            let k = self.gc.new_string(b"dofile");
+            env.raw_set(Value::Object(k), Value::Object(r));
+        }
+
+        let env_ref = self.gc.new_table(env);
+        self.globals_ref = Some(env_ref);
+
+        // Expose globals as `_G` (bound to the same table).
+        {
+            let g_key = self.gc.new_string(b"_G");
+            env_ref
+                .as_object_mut()
+                .as_table_mut()
+                .unwrap()
+                .raw_set(Value::Object(g_key), Value::Object(env_ref));
+        }
+
+        env_ref
     }
 
     /// Register a native function in a table.
@@ -1342,21 +1491,12 @@ impl Vm {
     fn collect_garbage(&mut self) {
         let mut roots = Vec::new();
 
-        // Root: stack values (only up to the active region)
-        let stack_limit = if self.frames.is_empty() {
-            self.top
-        } else {
-            let last = &self.frames[self.frames.len() - 1];
-            let frame_top = last.base + last.proto.max_stack_size as usize;
-            self.top.max(frame_top)
-        };
-        for val in &self.stack[..stack_limit.min(self.stack.len())] {
-            if let Value::Object(r) = val {
-                roots.push(*r);
-            }
-        }
-
-        // Root: each call frame's closure, varargs, and closed upvalues
+        // Root: stack values. For each frame we scan only the *active*
+        // register window — from `base` through `base + nactvar_at(pc)`.
+        // Beyond that are temporaries that the compiler has already "freed"
+        // (even though the slots still hold their last values); treating
+        // them as roots would defeat weak-table collection. Duplicate roots
+        // are harmless because `mark_object` is idempotent.
         for frame in &self.frames {
             roots.push(frame.closure);
             for val in &frame.varargs {
@@ -1369,7 +1509,25 @@ impl Vm {
                     roots.push(*r);
                 }
             }
+
+            let nactvar = frame.proto.nactvar_at(frame.pc as u32) as usize;
+            let start = frame.base.min(self.stack.len());
+            let by_nactvar = (frame.base + nactvar).min(self.stack.len());
+            let by_runtime = frame.runtime_top.min(self.stack.len());
+            let end = by_nactvar.max(by_runtime);
+            for val in &self.stack[start..end] {
+                if let Value::Object(r) = val {
+                    roots.push(*r);
+                }
+            }
         }
+        // Note: we deliberately do NOT scan [0..self.top] here. `self.top`
+        // is a stale high-water mark set by Vararg / Call / etc. and is not
+        // reset between instructions, so including it would spuriously root
+        // temporaries from long-ago operations — defeating weak-table and
+        // finalizer semantics. Per-frame `runtime_top` (widened by Call and
+        // Concat before GC points) already covers legitimate in-flight
+        // temporaries.
 
         // Root: closed values in open_upvalues (open ones point into stack, already covered)
         for uv in &self.open_upvalues {
@@ -1423,7 +1581,57 @@ impl Vm {
             roots.push(r);
         }
 
+        // Root: package / require special refs, package table, and globals.
+        for r in [
+            self.require_ref,
+            self.load_ref,
+            self.loadfile_ref,
+            self.dofile_ref,
+            self.preload_searcher_ref,
+            self.file_searcher_ref,
+            self.package_ref,
+            self.globals_ref,
+            self.collectgarbage_ref,
+        ] {
+            if let Some(r) = r {
+                roots.push(r);
+            }
+        }
+
         self.gc.collect(&roots);
+        self.run_pending_finalizers();
+    }
+
+    /// Drain `__gc` finalizers queued by the most recent collection. Each
+    /// finalizer is called with the object as its sole argument; errors are
+    /// reported to stderr and do not propagate (matches Lua's warning
+    /// semantics for finalizers). Finalizers run LIFO: the most-recently
+    /// registered runs first.
+    fn run_pending_finalizers(&mut self) {
+        // Re-entrancy guard: if a finalizer triggers another collect that
+        // queues new finalizers, the outer loop will pick them up.
+        if self.in_finalizer {
+            return;
+        }
+        self.in_finalizer = true;
+        while let Some(obj_ref) = self.gc.pop_pending_finalizer() {
+            let val = Value::Object(obj_ref);
+            // The obj_ref is no longer rooted via gc.pending_finalizers, but
+            // we pass it as an argument to call_value (placed on the VM stack)
+            // so it stays alive across any GC triggered by the finalizer.
+            let mm = match obj_ref.as_object().kind {
+                GcObjectKind::Table(_) | GcObjectKind::Userdata(_) => {
+                    self.get_metamethod(val, MM_GC)
+                }
+                _ => None,
+            };
+            if let Some(mm) = mm {
+                if let Err(e) = self.call_value(mm, &[val]) {
+                    eprintln!("Lua warning: error in __gc finalizer: {e}");
+                }
+            }
+        }
+        self.in_finalizer = false;
     }
 
     /// Check if GC should run and trigger it if so.
@@ -1456,6 +1664,11 @@ impl Vm {
             let base = self.frames[fi].base;
             let inst = self.frames[fi].proto.code[pc];
             self.frames[fi].pc += 1;
+            // Between instructions, no temporaries are "in flight" — the
+            // active-locals region is the only live root in this frame.
+            // Individual opcodes that spill values into temps above locals
+            // (Call, Concat) will widen `runtime_top` before a GC point.
+            self.frames[fi].runtime_top = base;
 
             let op = OpCode::from_u8(decode_op(inst))
                 .ok_or_else(|| LuaError::new(format!("invalid opcode: {}", decode_op(inst))))?;
@@ -1686,6 +1899,9 @@ impl Vm {
 
                 // ── String / Length ────────────────────────────────
                 OpCode::Concat => {
+                    // Concat operands live in [b..=c], which may be above
+                    // the active-locals window. Root them before GC.
+                    self.frames[fi].runtime_top = base + c as usize + 1;
                     self.maybe_collect();
                     let result = self.concat_values(base, b, c)?;
                     self.set_reg(base, a, result);
@@ -1887,11 +2103,21 @@ impl Vm {
                         else if self.debug_setupvalue_ref == Some(r) { 15 }
                         else if self.debug_upvalueid_ref == Some(r) { 16 }
                         else if self.debug_upvaluejoin_ref == Some(r) { 17 }
+                        else if self.require_ref == Some(r) { 18 }
+                        else if self.load_ref == Some(r) { 19 }
+                        else if self.loadfile_ref == Some(r) { 20 }
+                        else if self.dofile_ref == Some(r) { 21 }
+                        else if self.collectgarbage_ref == Some(r) { 22 }
                         else { 0 }
                     } else { 0 };
 
                     let num_results = if c == 0 { -1 } else { c as i32 - 1 };
                     let num_args = if b > 0 { b - 1 } else { self.top - (base + a) - 1 };
+
+                    // Keep the function and its arguments as roots while the
+                    // call is in flight (a native may trigger GC, and these
+                    // slots are above the caller's active-locals window).
+                    self.frames[fi].runtime_top = base + a + num_args + 1;
 
                     match special {
                         1 => { // pcall
@@ -2000,6 +2226,36 @@ impl Vm {
                                 .collect();
                             self.handle_debug_upvaluejoin(&args, base + a, num_results)?;
                         }
+                        18 => { // require
+                            let args: Vec<Value> = (0..num_args)
+                                .map(|i| self.stack[base + a + 1 + i])
+                                .collect();
+                            self.handle_require(&args, base + a, num_results)?;
+                        }
+                        19 => { // load
+                            let args: Vec<Value> = (0..num_args)
+                                .map(|i| self.stack[base + a + 1 + i])
+                                .collect();
+                            self.handle_load(&args, base + a, num_results)?;
+                        }
+                        20 => { // loadfile
+                            let args: Vec<Value> = (0..num_args)
+                                .map(|i| self.stack[base + a + 1 + i])
+                                .collect();
+                            self.handle_loadfile(&args, base + a, num_results)?;
+                        }
+                        21 => { // dofile
+                            let args: Vec<Value> = (0..num_args)
+                                .map(|i| self.stack[base + a + 1 + i])
+                                .collect();
+                            self.handle_dofile(&args, base + a, num_results)?;
+                        }
+                        22 => { // collectgarbage
+                            let args: Vec<Value> = (0..num_args)
+                                .map(|i| self.stack[base + a + 1 + i])
+                                .collect();
+                            self.handle_collectgarbage(&args, base + a, num_results)?;
+                        }
                         _ => {
                             self.call_function(base + a, b, num_results)?;
                         }
@@ -2033,6 +2289,8 @@ impl Vm {
                     let args: Vec<Value> = (0..num_args)
                         .map(|i| self.stack[base + a + 1 + i])
                         .collect();
+
+                    self.frames[fi].runtime_top = base + a + num_args + 1;
 
                     // Check if the target is a Lua function for tail call optimization
                     let is_lua_closure = matches!(func_val,
@@ -2256,6 +2514,21 @@ impl Vm {
                 if self.debug_upvaluejoin_ref == Some(gc_ref) {
                     return self.handle_debug_upvaluejoin(&actual_args, result_base, num_results);
                 }
+                if self.require_ref == Some(gc_ref) {
+                    return self.handle_require(&actual_args, result_base, num_results);
+                }
+                if self.load_ref == Some(gc_ref) {
+                    return self.handle_load(&actual_args, result_base, num_results);
+                }
+                if self.loadfile_ref == Some(gc_ref) {
+                    return self.handle_loadfile(&actual_args, result_base, num_results);
+                }
+                if self.dofile_ref == Some(gc_ref) {
+                    return self.handle_dofile(&actual_args, result_base, num_results);
+                }
+                if self.collectgarbage_ref == Some(gc_ref) {
+                    return self.handle_collectgarbage(&actual_args, result_base, num_results);
+                }
                 let results = match gc_ref.as_object().as_closure().unwrap() {
                     Closure::Native(nc) => (nc.func)(&actual_args, &mut self.gc)?,
                     Closure::NativeDyn(nc) => (nc.func)(&actual_args, &mut self.gc)?,
@@ -2302,6 +2575,7 @@ impl Vm {
                     result_base,
                     num_results,
                     varargs: varargs.clone(),
+                    runtime_top: new_base,
                 });
 
                 // Named vararg table: create table from varargs and store in register
@@ -3675,6 +3949,459 @@ impl Vm {
         }
 
         self.place_results(result_base, num_results, &[]);
+        Ok(())
+    }
+
+    // ── Package / require helpers ──────────────────────────────────
+
+    /// Compile Lua source into a closure with `_ENV` bound to the given table.
+    fn compile_chunk(
+        &mut self,
+        source: &[u8],
+        chunk_name: &str,
+        env: GcRef,
+    ) -> Result<GcRef, LuaError> {
+        let mut lexer = crate::lexer::Lexer::new(source, chunk_name);
+        let tokens = lexer
+            .tokenize()
+            .map_err(|e| LuaError::new(format!("{e}")))?;
+        let mut parser = crate::parser::Parser::new(tokens);
+        let block = parser
+            .parse_chunk()
+            .map_err(|e| LuaError::new(format!("{e}")))?;
+        let proto = crate::compiler::compile(&block, Some(chunk_name.to_string()))?;
+
+        let proto_rc = Rc::new(proto);
+        let env_upvalue = Rc::new(RefCell::new(Upvalue::Closed(Value::Object(env))));
+        let closure = Closure::new_lua(proto_rc, vec![env_upvalue]);
+        Ok(self.gc.new_closure(closure))
+    }
+
+    /// Read a table field by string key using raw_get.
+    fn table_raw_get_str(&mut self, table: GcRef, key: &[u8]) -> Value {
+        let key_ref = self.gc.new_string(key);
+        table
+            .as_object()
+            .as_table()
+            .map(|t| t.raw_get(&Value::Object(key_ref)))
+            .unwrap_or(Value::Nil)
+    }
+
+    /// Call a searcher value with a single string argument (modname).
+    /// Dispatches to built-in preload/file searcher handlers when the
+    /// searcher matches; otherwise uses the normal call machinery.
+    fn call_searcher(&mut self, searcher: Value, modname: Value) -> Result<Vec<Value>, LuaError> {
+        if let Value::Object(r) = searcher {
+            if self.preload_searcher_ref == Some(r) {
+                return self.run_preload_searcher(modname);
+            }
+            if self.file_searcher_ref == Some(r) {
+                return self.run_file_searcher(modname);
+            }
+        }
+        self.call_value(searcher, &[modname])
+    }
+
+    /// The preload searcher: look up `package.preload[modname]`.
+    fn run_preload_searcher(&mut self, modname: Value) -> Result<Vec<Value>, LuaError> {
+        let pkg = match self.package_ref {
+            Some(r) => r,
+            None => return Ok(vec![Value::Nil]),
+        };
+        let preload = self.table_raw_get_str(pkg, b"preload");
+        let loader = match preload {
+            Value::Object(r) if r.as_object().as_table().is_some() => {
+                r.as_object().as_table().unwrap().raw_get(&modname)
+            }
+            _ => Value::Nil,
+        };
+        if loader.is_nil() {
+            let name_str = modname
+                .as_str_bytes()
+                .map(|b| String::from_utf8_lossy(b).to_string())
+                .unwrap_or_default();
+            let msg = format!("\n\tno field package.preload['{name_str}']");
+            Ok(vec![Value::Object(self.gc.new_string(msg.as_bytes()))])
+        } else {
+            let data = Value::Object(self.gc.new_string(b":preload:"));
+            Ok(vec![loader, data])
+        }
+    }
+
+    /// The default Lua file searcher: look up the module using `package.path`,
+    /// read and compile it, return the loader closure plus filename.
+    fn run_file_searcher(&mut self, modname: Value) -> Result<Vec<Value>, LuaError> {
+        let pkg = match self.package_ref {
+            Some(r) => r,
+            None => return Ok(vec![Value::Nil]),
+        };
+        let name_bytes = match modname.as_str_bytes() {
+            Some(b) => b.to_vec(),
+            None => return Err(LuaError::new("bad argument to searcher (string expected)")),
+        };
+        let name = match std::str::from_utf8(&name_bytes) {
+            Ok(s) => s.to_string(),
+            Err(_) => {
+                return Err(LuaError::new("bad argument to searcher (invalid utf-8)"));
+            }
+        };
+        let path_val = self.table_raw_get_str(pkg, b"path");
+        let path = match path_val.as_str_bytes() {
+            Some(b) => String::from_utf8_lossy(b).to_string(),
+            None => return Err(LuaError::new("'package.path' must be a string")),
+        };
+
+        let filename = match crate::stdlib::package::searchpath(
+            &name,
+            &path,
+            ".",
+            crate::stdlib::package::DIRECTORY_SEP,
+        ) {
+            Ok(f) => f,
+            Err(msg) => {
+                return Ok(vec![Value::Object(self.gc.new_string(msg.as_bytes()))]);
+            }
+        };
+
+        let source = match std::fs::read(&filename) {
+            Ok(s) => s,
+            Err(e) => {
+                let msg = format!("\n\tcannot open '{filename}': {e}");
+                return Ok(vec![Value::Object(self.gc.new_string(msg.as_bytes()))]);
+            }
+        };
+
+        let env = self.globals_ref.expect("globals ref not set");
+        let chunk_name = format!("@{filename}");
+        let closure_ref = self.compile_chunk(&source, &chunk_name, env)?;
+        let fname_val = Value::Object(self.gc.new_string(filename.as_bytes()));
+        Ok(vec![Value::Object(closure_ref), fname_val])
+    }
+
+    /// Handle `require(modname)`.
+    fn handle_require(
+        &mut self,
+        args: &[Value],
+        result_base: usize,
+        num_results: i32,
+    ) -> Result<(), LuaError> {
+        let modname = args.first().copied().unwrap_or(Value::Nil);
+        let modname_bytes = match modname.as_str_bytes() {
+            Some(b) => b.to_vec(),
+            None => {
+                return Err(LuaError::new(
+                    "bad argument #1 to 'require' (string expected)",
+                ));
+            }
+        };
+
+        let pkg = self
+            .package_ref
+            .ok_or_else(|| LuaError::new("package library not initialized"))?;
+
+        // 1. Check package.loaded[modname]
+        let loaded = match self.table_raw_get_str(pkg, b"loaded") {
+            Value::Object(r) if r.as_object().as_table().is_some() => r,
+            _ => {
+                return Err(LuaError::new("'package.loaded' must be a table"));
+            }
+        };
+        let cached = loaded.as_object().as_table().unwrap().raw_get(&modname);
+        if !cached.is_nil() {
+            self.place_results(result_base, num_results, &[cached]);
+            return Ok(());
+        }
+
+        // 2. Iterate package.searchers
+        let searchers = match self.table_raw_get_str(pkg, b"searchers") {
+            Value::Object(r) if r.as_object().as_table().is_some() => r,
+            _ => {
+                return Err(LuaError::new("'package.searchers' must be a table"));
+            }
+        };
+
+        let mut messages = String::new();
+        let mut loader: Option<(Value, Value)> = None;
+        for i in 1..i64::MAX {
+            let searcher = searchers
+                .as_object()
+                .as_table()
+                .unwrap()
+                .raw_get(&Value::Integer(i));
+            if searcher.is_nil() {
+                break;
+            }
+            let results = self.call_searcher(searcher, modname)?;
+            match results.first().copied() {
+                Some(v) if v.is_function() => {
+                    loader = Some((v, results.get(1).copied().unwrap_or(Value::Nil)));
+                    break;
+                }
+                Some(Value::Object(r)) if r.as_object().as_string().is_some() => {
+                    messages.push_str(&String::from_utf8_lossy(
+                        r.as_object().as_string().unwrap().as_bytes(),
+                    ));
+                }
+                _ => {}
+            }
+        }
+
+        let (loader_fn, loader_data) = match loader {
+            Some(pair) => pair,
+            None => {
+                let name = String::from_utf8_lossy(&modname_bytes);
+                return Err(LuaError::new(format!(
+                    "module '{name}' not found:{messages}"
+                )));
+            }
+        };
+
+        // 3. Call loader(modname, loader_data)
+        let results = self.call_value(loader_fn, &[modname, loader_data])?;
+        let loader_result = results.into_iter().next().unwrap_or(Value::Nil);
+
+        // 4. Decide final value: prefer what loader set in package.loaded, then
+        //    what it returned, else `true`.
+        let after = loaded.as_object().as_table().unwrap().raw_get(&modname);
+        let final_val = if !after.is_nil() {
+            after
+        } else if !loader_result.is_nil() {
+            loader_result
+        } else {
+            Value::Boolean(true)
+        };
+
+        // 5. Store and place.
+        loaded
+            .as_object_mut()
+            .as_table_mut()
+            .unwrap()
+            .raw_set(modname, final_val);
+
+        self.place_results(result_base, num_results, &[final_val, loader_data]);
+        Ok(())
+    }
+
+    /// Handle `load(chunk [, chunkname [, mode [, env]]])`.
+    /// Only the string-chunk form is supported (function-reader form is TODO).
+    fn handle_load(
+        &mut self,
+        args: &[Value],
+        result_base: usize,
+        num_results: i32,
+    ) -> Result<(), LuaError> {
+        let chunk = args.first().copied().unwrap_or(Value::Nil);
+        let chunk_bytes = match chunk.as_str_bytes() {
+            Some(b) => b.to_vec(),
+            None => {
+                // Function-reader form not yet supported
+                let err = self.gc.new_string(
+                    b"bad argument #1 to 'load' (string expected; function reader not supported)",
+                );
+                self.place_results(
+                    result_base,
+                    num_results,
+                    &[Value::Nil, Value::Object(err)],
+                );
+                return Ok(());
+            }
+        };
+
+        let chunkname = args
+            .get(1)
+            .and_then(|v| v.as_str_bytes())
+            .map(|b| String::from_utf8_lossy(b).to_string())
+            .unwrap_or_else(|| "=(load)".to_string());
+
+        // args[2] (mode) is accepted but not enforced for now.
+
+        let env = match args.get(3).copied() {
+            Some(Value::Object(r)) if r.as_object().as_table().is_some() => r,
+            Some(Value::Nil) | None => self.globals_ref.expect("globals ref not set"),
+            _ => {
+                let err = self
+                    .gc
+                    .new_string(b"bad argument #4 to 'load' (table expected)");
+                self.place_results(
+                    result_base,
+                    num_results,
+                    &[Value::Nil, Value::Object(err)],
+                );
+                return Ok(());
+            }
+        };
+
+        match self.compile_chunk(&chunk_bytes, &chunkname, env) {
+            Ok(closure_ref) => {
+                self.place_results(result_base, num_results, &[Value::Object(closure_ref)]);
+            }
+            Err(e) => {
+                let msg = self.gc.new_string(e.message.as_bytes());
+                self.place_results(
+                    result_base,
+                    num_results,
+                    &[Value::Nil, Value::Object(msg)],
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Handle `loadfile([filename [, mode [, env]]])`.
+    fn handle_loadfile(
+        &mut self,
+        args: &[Value],
+        result_base: usize,
+        num_results: i32,
+    ) -> Result<(), LuaError> {
+        let filename = match args.first() {
+            Some(v) if !v.is_nil() => match v.as_str_bytes() {
+                Some(b) => String::from_utf8_lossy(b).to_string(),
+                None => {
+                    return Err(LuaError::new(
+                        "bad argument #1 to 'loadfile' (string expected)",
+                    ));
+                }
+            },
+            _ => {
+                // stdin not supported
+                let err = self
+                    .gc
+                    .new_string(b"loadfile: reading from stdin is not supported");
+                self.place_results(
+                    result_base,
+                    num_results,
+                    &[Value::Nil, Value::Object(err)],
+                );
+                return Ok(());
+            }
+        };
+
+        let source = match std::fs::read(&filename) {
+            Ok(s) => s,
+            Err(e) => {
+                let msg = format!("cannot open {filename}: {e}");
+                let err = self.gc.new_string(msg.as_bytes());
+                self.place_results(
+                    result_base,
+                    num_results,
+                    &[Value::Nil, Value::Object(err)],
+                );
+                return Ok(());
+            }
+        };
+
+        let env = match args.get(2).copied() {
+            Some(Value::Object(r)) if r.as_object().as_table().is_some() => r,
+            Some(Value::Nil) | None => self.globals_ref.expect("globals ref not set"),
+            _ => {
+                return Err(LuaError::new(
+                    "bad argument #3 to 'loadfile' (table expected)",
+                ));
+            }
+        };
+
+        let chunk_name = format!("@{filename}");
+        match self.compile_chunk(&source, &chunk_name, env) {
+            Ok(closure_ref) => {
+                self.place_results(result_base, num_results, &[Value::Object(closure_ref)]);
+            }
+            Err(e) => {
+                let msg = self.gc.new_string(e.message.as_bytes());
+                self.place_results(
+                    result_base,
+                    num_results,
+                    &[Value::Nil, Value::Object(msg)],
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Handle `dofile([filename])`.
+    fn handle_dofile(
+        &mut self,
+        args: &[Value],
+        result_base: usize,
+        num_results: i32,
+    ) -> Result<(), LuaError> {
+        let filename = match args.first() {
+            Some(v) if !v.is_nil() => match v.as_str_bytes() {
+                Some(b) => String::from_utf8_lossy(b).to_string(),
+                None => {
+                    return Err(LuaError::new(
+                        "bad argument #1 to 'dofile' (string expected)",
+                    ));
+                }
+            },
+            _ => {
+                return Err(LuaError::new(
+                    "dofile: reading from stdin is not supported",
+                ));
+            }
+        };
+
+        let source = std::fs::read(&filename)
+            .map_err(|e| LuaError::new(format!("cannot open {filename}: {e}")))?;
+
+        let env = self.globals_ref.expect("globals ref not set");
+        let chunk_name = format!("@{filename}");
+        let closure_ref = self.compile_chunk(&source, &chunk_name, env)?;
+
+        let results = self.call_value(Value::Object(closure_ref), &[])?;
+        self.place_results(result_base, num_results, &results);
+        Ok(())
+    }
+
+    /// `collectgarbage([opt [, arg]])`. Implements the subset of options the
+    /// VM actually needs:
+    ///   - `"collect"` (default): run a full mark-and-sweep cycle and any
+    ///                            queued `__gc` finalizers; returns 0.
+    ///   - `"count"`            : returns memory in KB (float) and remainder
+    ///                            in bytes (integer), matching Lua 5.5.
+    ///   - `"stop"`/`"restart"` : no-ops (we don't implement incremental GC);
+    ///                            returns the (fake) previous memory count.
+    ///   - `"isrunning"`        : returns true (always running).
+    ///   - `"step"`             : runs a full cycle and returns true.
+    ///   - other                : returns 0 (best-effort no-op).
+    fn handle_collectgarbage(
+        &mut self,
+        args: &[Value],
+        result_base: usize,
+        num_results: i32,
+    ) -> Result<(), LuaError> {
+        let opt = args
+            .first()
+            .and_then(|v| v.as_str_bytes())
+            .map(|b| b.to_vec())
+            .unwrap_or_else(|| b"collect".to_vec());
+
+        let results: Vec<Value> = match opt.as_slice() {
+            b"collect" | b"step" => {
+                self.collect_garbage();
+                if opt.as_slice() == b"step" {
+                    vec![Value::Boolean(true)]
+                } else {
+                    vec![Value::Integer(0)]
+                }
+            }
+            b"count" => {
+                let bytes = self.gc.bytes_allocated_approx();
+                let kb = (bytes as f64) / 1024.0;
+                let rem = (bytes % 1024) as i64;
+                vec![Value::Float(kb), Value::Integer(rem)]
+            }
+            b"stop" | b"restart" | b"isrunning" => {
+                if opt.as_slice() == b"isrunning" {
+                    vec![Value::Boolean(true)]
+                } else {
+                    vec![Value::Integer(0)]
+                }
+            }
+            _ => vec![Value::Integer(0)],
+        };
+
+        self.place_results(result_base, num_results, &results);
         Ok(())
     }
 

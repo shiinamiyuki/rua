@@ -64,19 +64,47 @@ pub fn debug_setmetatable(args: &[Value], _gc: &mut Gc) -> Result<Vec<Value>, Lu
     };
     match val {
         Value::Object(r) => {
-            let obj = r.as_object_mut();
-            match &mut obj.kind {
-                GcObjectKind::Table(t) => {
-                    t.metatable = mt;
+            {
+                let obj = r.as_object_mut();
+                match &mut obj.kind {
+                    GcObjectKind::Table(t) => {
+                        t.metatable = mt;
+                    }
+                    GcObjectKind::Userdata(ud) => {
+                        ud.metatable = mt;
+                    }
+                    _ => {
+                        return Err(LuaError::new(
+                            "bad argument #1 to 'setmetatable' (table or userdata expected)",
+                        ));
+                    }
                 }
-                GcObjectKind::Userdata(ud) => {
-                    ud.metatable = mt;
+            }
+
+            // Refresh weak-mode flags (tables only) and register __gc finalizer.
+            if let Some(mt_ref) = mt {
+                if let Some(mt_table) = mt_ref.as_object().as_table() {
+                    if r.as_object().as_table().is_some() {
+                        let mode_key = _gc.new_string(b"__mode");
+                        let mode_val = mt_table.raw_get(&Value::Object(mode_key));
+                        let mode_bytes = if let Value::Object(sr) = mode_val {
+                            sr.as_object().as_string().map(|s| s.as_bytes().to_vec())
+                        } else {
+                            None
+                        };
+                        r.as_object_mut()
+                            .as_table_mut()
+                            .unwrap()
+                            .set_weak_mode(mode_bytes.as_deref());
+                    }
+                    let gc_key = _gc.new_string(b"__gc");
+                    let gc_val = mt_table.raw_get(&Value::Object(gc_key));
+                    if !gc_val.is_nil() {
+                        _gc.register_finalizer(r);
+                    }
                 }
-                _ => {
-                    return Err(LuaError::new(
-                        "bad argument #1 to 'setmetatable' (table or userdata expected)",
-                    ));
-                }
+            } else if r.as_object().as_table().is_some() {
+                r.as_object_mut().as_table_mut().unwrap().set_weak_mode(None);
             }
         }
         _ => {

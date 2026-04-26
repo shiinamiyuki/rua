@@ -408,4 +408,158 @@ Implemented `src/stdlib/utf8.rs`:
 - 169 tests passing (168 + 1 new debug library test)
 - Test file: `tests/debug_test.lua`
 
+## Session — M3.3 (Weak Tables & Finalizers) and M3.6 (Package / Require)
+
+Implemented two roadmap milestones in one session and reworked the GC's
+stack rooting so that weak references actually become collectable.
+
+### M3.6 — Package / Require
+
+- New module `src/stdlib/package.rs`:
+  - `PACKAGE_CONFIG`, `DIRECTORY_SEP`, `default_path()` (reads
+    `LUA_PATH_5_5` / `LUA_PATH`, with a sane fallback).
+  - `searchpath()` core logic and `lua_searchpath()` native binding
+    used as `package.searchpath`.
+- VM-side wiring (`src/vm.rs`):
+  - New per-VM `Option<GcRef>` slots: `require_ref`, `load_ref`,
+    `loadfile_ref`, `dofile_ref`, `preload_searcher_ref`,
+    `file_searcher_ref`, `package_ref`, `globals_ref`. All added as
+    GC roots.
+  - `create_global_env` builds the `package` table with `loaded`,
+    `preload`, `searchers = { preload, file_searcher }`, `path`,
+    `config`, and registers `require` / `load` / `loadfile` / `dofile`
+    as VM-special functions (need `&mut Vm` for compile + `_ENV`
+    binding).
+  - Helpers: `compile_chunk` (lex/parse/compile and bind a fresh `_ENV`
+    upvalue to the global env), `table_raw_get_str`, `call_searcher`
+    (dispatches built-in or generic), `run_preload_searcher`,
+    `run_file_searcher`.
+  - VM-special handlers: `handle_require`, `handle_load`,
+    `handle_loadfile`, `handle_dofile`. `OpCode::Call` and
+    `do_call`/`TailCall` now intercept these GcRefs.
+- Tests in `tests/require_test.lua` plus `tests/require_test_modules/`
+  (mymod.lua, sub/inner.lua) cover: package table shape,
+  `package.preload` searcher, file searcher with dotted names,
+  `package.searchpath`, `load`/`dofile`, caching in `package.loaded`.
+
+### M3.3 — Weak Tables, Finalizers, collectgarbage
+
+#### Weak tables
+
+- `Table` gained `pub(crate) weak_keys: bool` and `weak_values: bool`,
+  plus `set_weak_mode(mode: Option<&[u8]>)` to parse `__mode` (`k`,
+  `v`, `kv`, `vk`).
+- `set_weak_mode` is now invoked from both `lua_setmetatable` and
+  `debug.setmetatable` whenever the new metatable changes.
+- `Gc::collect` was rewritten as a multi-phase cycle:
+  1. `refresh_weak_modes()` re-reads `__mode` for every table (handles
+     mutating the metatable after the fact).
+  2. Primary mark pass — for weak tables, **defer** marking values
+     (and for full-weak tables, also keys) so they don't get rooted
+     trivially.
+  3. Ephemeron fixed-point: for weak-keys tables, propagate
+     `key marked → value marked` until no change. This makes
+     `__mode = "k"` give true ephemeron semantics: `t[k] = v` keeps
+     `v` alive only while `k` is reachable via some other path.
+  4. Finalizer resurrection (see below).
+  5. `clear_weak_entries(t_ref)` removes hash/array entries whose
+     surviving partner is dead.
+  6. Sweep the string-intern pool, then sweep the main object list.
+- `trace_object` was generalized to take a `weak_tables: &mut Vec<GcRef>`
+  out-parameter. Crucially, for `weak_keys && !weak_values` tables we
+  do NOT mark hash values during the primary pass — that's the bug
+  fix that made the ephemeron self-cycle test (`t[k] = v` where
+  `v.ref = k`) actually collect.
+
+#### Finalizers (`__gc`)
+
+- Added `pub has_finalizer: bool` to `GcHeader`.
+- `Gc` got `finalizable: Vec<GcRef>` and `pending_finalizers:
+  Vec<GcRef>` plus the API to manage them: `register_finalizer`,
+  `take_pending_finalizers`, `has_pending_finalizers`,
+  `requeue_pending_finalizer`, `pop_pending_finalizer`.
+- `register_finalizer` is called from both `setmetatable` paths
+  whenever the new metatable has a non-nil `__gc` field.
+- During collection, any `finalizable` object that wasn't marked is
+  **resurrected** (mark + trace), has `has_finalizer` cleared, and
+  goes onto `pending_finalizers`. After resurrection we run another
+  ephemeron fixed-point to propagate any newly-reachable values.
+- `pending_finalizers` itself is rooted at the start of every cycle
+  so finalizers never execute on freed memory.
+- `Vm::run_pending_finalizers` (called once GC returns to the VM)
+  drains the queue in **LIFO** order, calls each `__gc` metamethod
+  via `call_value`, and prints a Lua-warning-style diagnostic to
+  stderr on error (matching reference Lua's "warn" semantics).
+- Re-entrancy guard `Vm::in_finalizer` prevents infinite recursion if
+  a finalizer triggers another GC.
+
+#### `collectgarbage`
+
+- Registered as a VM-special function (needs `&mut Vm` to invoke a
+  full collection synchronously).
+- `Vm::handle_collectgarbage` supports `"collect"`, `"count"`,
+  `"stop"` / `"restart"` / `"isrunning"`, and `"step"`.
+- `Gc::bytes_allocated_approx()` provides the kilobyte figure for
+  `collectgarbage("count")`.
+
+### The big GC stack-scan rework
+
+This was the hardest part of the milestone. With the old "scan
+`[base..base + max_stack_size]`" rule, register-VM temporaries kept
+weak values alive forever and finalizers never fired, because dead
+temps in registers above the locals window were treated as roots.
+
+Three coordinated changes finally made things behave:
+
+1. **Per-frame `runtime_top: usize`** on `CallFrame`. It is the
+   absolute stack index one past the highest in-use temporary right
+   now. Reset to `frame.base` at the top of every dispatch iteration
+   (between instructions there are no in-flight temps), then widened
+   by individual opcodes that stage values above the active locals:
+   - `OpCode::Call` and `OpCode::TailCall` set
+     `runtime_top = base + a + num_args + 1` *before* invoking, so
+     the function and its arguments stay rooted across any GC the
+     callee triggers (this is what was crashing the io/os suite — a
+     freshly-opened file userdata was being collected during a
+     `f:write(...)` because the temp slot wasn't a root).
+   - `OpCode::Concat` sets `runtime_top = base + c + 1` before its
+     internal `maybe_collect`.
+2. **`Proto::nactvar_at(pc) -> u32`** (in `src/bytecode.rs`). Counts
+   locals whose `[start_pc, end_pc)` range covers the current pc.
+   This is the principled way to know which registers actually
+   contain *live locals* at a given GC point.
+3. **`Vm::collect_garbage`** stack scan for each frame is now
+   `[frame.base .. max(frame.base + nactvar, runtime_top)]`. We also
+   stopped scanning `[0..self.top]`: `self.top` is a stale
+   high-water mark set by `Vararg` / `Call` and is never reset, so
+   including it spuriously rooted long-dead temps.
+
+The combined effect: between instructions, only true locals plus
+upvalues plus the per-VM root set are reachable; *during* a Call /
+Concat / native invocation, the in-flight operands are also rooted —
+but they stop being rooted the moment the next instruction begins.
+
+### Test surface added
+
+- `tests/weak_tables_test.lua` — weak-v, weak-k, weak-kv, primitive
+  values, `__mode` flipped after the fact, ephemeron self-cycle.
+- `tests/finalizers_test.lua` — single-fire, finalizer-receives-self,
+  errors-don't-kill-vm, LIFO order, resurrection, `collectgarbage("count")`.
+- `tests/require_test.lua` plus the `require_test_modules/` fixtures
+  — covered above.
+- `tests/debug_test.lua` — recreated after an accidental delete:
+  `traceback`, `getinfo` (level / function / C-function / oob),
+  `getlocal` / `setlocal`, `getupvalue` / `setupvalue` /
+  `upvalueid` / `upvaluejoin`, `debug.getmetatable` /
+  `debug.setmetatable` (including `__metatable` bypass), `sethook` /
+  `gethook` stubs.
+
+### Status
+
+`cargo test --release -- --test-threads=1`: 169 passed, 0 failed.
+All four new Lua suites pass: `weak_tables_test.lua`,
+`finalizers_test.lua`, `require_test.lua`, `debug_test.lua`,
+plus the existing `io_os_test.lua` which had been crashing earlier
+due to the stack-scan bug.
+
 ## APPEND HERE

@@ -332,6 +332,19 @@ impl Proto {
             vararg_name_reg: None,
         }
     }
+
+    /// Number of locals active at the given pc. Locals are allocated in
+    /// register-order (0, 1, 2, ...) so the active count also equals the
+    /// first free register index — suitable as a GC scan boundary.
+    ///
+    /// `end_pc` is interpreted as exclusive (variable is active on
+    /// instructions `[start_pc, end_pc)`).
+    pub fn nactvar_at(&self, pc: u32) -> u32 {
+        self.locals
+            .iter()
+            .filter(|l| l.start_pc <= pc && pc < l.end_pc)
+            .count() as u32
+    }
 }
 
 // ── Disassembler ───────────────────────────────────────────────────
