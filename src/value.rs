@@ -1,330 +1,415 @@
-use std::{
-    any::Any,
-    cell::{Cell, RefCell},
-    collections::HashMap,
-    hash::Hash,
-    rc::Rc,
-};
+//! Lua value representation.
 
-use ordered_float::OrderedFloat;
-use smallvec::SmallVec;
+use std::fmt;
 
-use crate::{
-    bytecode::ByteCodeModule,
-    closure::{Callable, Closure},
-    gc::{Gc, GcState, Traceable},
-    runtime::Value,
-    state::State,
-    table::Table,
-};
+use crate::gc::{GcObjectKind, GcRef};
 
-pub struct Managed<T: 'static + Any> {
-    pub data: T,
-    metatable: Cell<RawValue>,
-}
-pub type LightUserData<T> = Managed<T>;
-impl<T> Managed<T> {
-    pub fn new(data: T) -> Self {
-        Self {
-            data,
-            metatable: Cell::new(RawValue::Nil),
-        }
-    }
-}
-impl<T> Traceable for Managed<T> {
-    fn trace(&self, gc: &GcState) {
-        gc.trace(&self.metatable.get());
-    }
-}
-
-pub type ManagedCell<T> = Managed<RefCell<T>>;
-
-pub trait UserData: Traceable + Any {
-    fn as_traceable(&self) -> &dyn Traceable;
-    fn as_any(&self) -> &dyn Any;
-    fn type_name(&self) -> &'static str;
-    fn set_metatable(&self, v: Value<'_>);
-    fn get_metatable<'a>(&'a self) -> Value<'a>;
-}
-impl<T> UserData for Managed<T>
-where
-    T: Any,
-{
-    fn as_traceable(&self) -> &dyn Traceable {
-        self
-    }
-    fn as_any(&self) -> &dyn Any {
-        &self.data
-    }
-    fn type_name(&self) -> &'static str {
-        std::any::type_name::<T>()
-    }
-
-    fn set_metatable(&self, v: Value<'_>) {
-        self.metatable.set(v.value);
-    }
-
-    fn get_metatable<'a>(&'a self) -> Value<'a> {
-        Value::new(self.metatable.get())
-        // ValueRef::new(Value::Nil)
-    }
-}
-impl Traceable for Box<dyn UserData> {
-    fn trace(&self, gc: &GcState) {
-        self.as_ref().trace(gc)
-    }
-}
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(u8)]
-pub(crate) enum TupleFlag {
-    Empty,
-    VarArgs,
-}
-
-pub struct Tuple {
-    pub(crate) values: RefCell<SmallVec<[RawValue; 8]>>,
-    pub(crate) metatable: Cell<RawValue>,
-    pub(crate) flag: TupleFlag,
-}
-impl Traceable for Tuple {
-    fn trace(&self, gc: &GcState) {
-        let values = self.values.borrow();
-        for v in values.iter() {
-            gc.trace(v);
-        }
-        gc.trace(&self.metatable.get());
-    }
-}
-
-pub(crate) enum RawValue {
+/// A Lua value.
+///
+/// All Lua values are represented by this enum. GC-managed objects (strings,
+/// tables, closures) are referenced through [`GcRef`].
+#[derive(Clone, Copy, Debug)]
+pub enum Value {
+    /// The nil value.
     Nil,
-    Bool(bool),
-    Number(OrderedFloat<f64>),
-    Table(Gc<RefCell<Table>>),
-    String(Gc<Managed<String>>),
-    Closure(Gc<Closure>),
-    Callable(Gc<Box<dyn Callable>>),
-    Tuple(Gc<Tuple>),
-    UserData(Gc<Box<dyn UserData>>),
+    /// A boolean value.
+    Boolean(bool),
+    /// A 64-bit integer.
+    Integer(i64),
+    /// A 64-bit floating-point number.
+    Float(f64),
+    /// A reference to a GC-managed object (string, table, closure, etc.).
+    Object(GcRef),
 }
-impl Copy for RawValue {}
-impl Clone for RawValue {
-    fn clone(&self) -> Self {
-        *self
+
+impl Value {
+    /// Returns the Lua type name of this value.
+    pub fn type_name(&self) -> &'static str {
+        match self {
+            Value::Nil => "nil",
+            Value::Boolean(_) => "boolean",
+            Value::Integer(_) | Value::Float(_) => "number",
+            Value::Object(gc_ref) => match &gc_ref.as_object().kind {
+                GcObjectKind::String(_) => "string",
+                GcObjectKind::Table(_) => "table",
+                GcObjectKind::Closure(_) => "function",
+                GcObjectKind::Thread(_) => "thread",
+                GcObjectKind::Userdata(_) => "userdata",
+            },
+        }
+    }
+
+    #[inline]
+    pub fn is_nil(&self) -> bool {
+        matches!(self, Value::Nil)
+    }
+
+    #[inline]
+    pub fn is_boolean(&self) -> bool {
+        matches!(self, Value::Boolean(_))
+    }
+
+    #[inline]
+    pub fn is_integer(&self) -> bool {
+        matches!(self, Value::Integer(_))
+    }
+
+    #[inline]
+    pub fn is_float(&self) -> bool {
+        matches!(self, Value::Float(_))
+    }
+
+    #[inline]
+    pub fn is_number(&self) -> bool {
+        matches!(self, Value::Integer(_) | Value::Float(_))
+    }
+
+    #[inline]
+    pub fn is_string(&self) -> bool {
+        matches!(self, Value::Object(r) if r.as_object().as_string().is_some())
+    }
+
+    #[inline]
+    pub fn is_table(&self) -> bool {
+        matches!(self, Value::Object(r) if r.as_object().as_table().is_some())
+    }
+
+    #[inline]
+    pub fn is_function(&self) -> bool {
+        matches!(self, Value::Object(r) if r.as_object().as_closure().is_some())
+    }
+
+    #[inline]
+    pub fn is_thread(&self) -> bool {
+        matches!(self, Value::Object(r) if r.as_object().as_coroutine().is_some())
+    }
+
+    /// Lua "truthiness": everything is true except `nil` and `false`.
+    #[inline]
+    pub fn is_truthy(&self) -> bool {
+        !matches!(self, Value::Nil | Value::Boolean(false))
+    }
+
+    #[inline]
+    pub fn as_boolean(&self) -> Option<bool> {
+        match self {
+            Value::Boolean(b) => Some(*b),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    pub fn as_integer(&self) -> Option<i64> {
+        match self {
+            Value::Integer(n) => Some(*n),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    pub fn as_float(&self) -> Option<f64> {
+        match self {
+            Value::Float(n) => Some(*n),
+            _ => None,
+        }
+    }
+
+    /// Get the value as a number (f64), converting integers to floats.
+    pub fn as_number(&self) -> Option<f64> {
+        match self {
+            Value::Integer(n) => Some(*n as f64),
+            Value::Float(n) => Some(*n),
+            _ => None,
+        }
+    }
+
+    #[inline]
+    pub fn as_gc_ref(&self) -> Option<GcRef> {
+        match self {
+            Value::Object(r) => Some(*r),
+            _ => None,
+        }
+    }
+
+    /// Get the string bytes, if this is a string value.
+    pub fn as_str_bytes(&self) -> Option<&[u8]> {
+        match self {
+            Value::Object(r) => r.as_object().as_string().map(|s| s.as_bytes()),
+            _ => None,
+        }
     }
 }
-impl PartialEq for RawValue {
+
+impl PartialEq for Value {
+    /// Structural equality for Value.
+    ///
+    /// Note: This is Rust-level equality, not full Lua equality
+    /// (which involves metamethods). Full Lua semantics are in the VM.
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
-            (RawValue::Nil, RawValue::Nil) => true,
-            (RawValue::Bool(a), RawValue::Bool(b)) => a == b,
-            (RawValue::Number(a), RawValue::Number(b)) => a == b,
-            (RawValue::Table(a), RawValue::Table(b)) => a.ptr_eq(b),
-            (RawValue::Callable(a), RawValue::Callable(b)) => a.ptr_eq(b),
-            (RawValue::Closure(a), RawValue::Closure(b)) => a.ptr_eq(b),
-            (RawValue::String(a), RawValue::String(b)) => {
-                if a.ptr_eq(b) {
+            (Value::Nil, Value::Nil) => true,
+            (Value::Boolean(a), Value::Boolean(b)) => a == b,
+            (Value::Integer(a), Value::Integer(b)) => a == b,
+            (Value::Float(a), Value::Float(b)) => a == b,
+            // Lua: 1 == 1.0 is true
+            (Value::Integer(i), Value::Float(f)) | (Value::Float(f), Value::Integer(i)) => {
+                (*i as f64) == *f
+            }
+            (Value::Object(a), Value::Object(b)) => {
+                // Pointer equality (fast path for interned strings)
+                if a == b {
                     return true;
                 }
+                // Content comparison for strings
+                match (&a.as_object().kind, &b.as_object().kind) {
+                    (GcObjectKind::String(sa), GcObjectKind::String(sb)) => sa == sb,
+                    // Tables and closures are equal only by identity
+                    _ => false,
+                }
+            }
+            _ => false,
+        }
+    }
+}
+
+impl fmt::Display for Value {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Value::Nil => write!(f, "nil"),
+            Value::Boolean(b) => write!(f, "{b}"),
+            Value::Integer(n) => write!(f, "{n}"),
+            Value::Float(n) => {
+                // Ensure floats display with a decimal point to distinguish from integers
+                let s = format!("{n}");
+                if s.contains('.')
+                    || s.contains('e')
+                    || s.contains('E')
+                    || s.contains("nan")
+                    || s.contains("inf")
                 {
-                    let a = &(*a).data;
-                    let b = &(*b).data;
-                    a == b
-                }
-            }
-            _ => false,
-        }
-    }
-}
-
-impl Hash for RawValue {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        match self {
-            RawValue::Nil => ().hash(state),
-            RawValue::Bool(x) => x.hash(state),
-            RawValue::Number(x) => x.hash(state),
-            RawValue::Table(x) => std::ptr::hash(x.as_ptr(), state),
-            RawValue::String(x) => {
-                let s = &(*x).data;
-                s.hash(state)
-            }
-            RawValue::Closure(x) => std::ptr::hash(x.as_ptr(), state),
-            RawValue::Callable(x) => std::ptr::hash(x.as_ptr(), state),
-            RawValue::Tuple(x) => std::ptr::hash(x.as_ptr(), state),
-            RawValue::UserData(x) => std::ptr::hash(x.as_ptr(), state),
-        }
-    }
-}
-impl Eq for RawValue {}
-// impl Hash for Value {
-//     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-//         self.data.hash(state);
-//         std::ptr::hash(self.metatable.as_ptr(), state);
-//     }
-// }
-// impl PartialEq for Value {
-//     fn eq(&self, other: &Self) -> bool {
-//         self.data == other.data && self.metatable.ptr_eq(&other.metatable)
-//     }
-// }
-// impl Eq for Value {}
-impl Traceable for RawValue {
-    fn trace(&self, gc: &GcState) {
-        match self {
-            RawValue::Table(x) => gc.trace_ptr(*x),
-            RawValue::String(x) => gc.trace_ptr(*x),
-            RawValue::Closure(x) => gc.trace_ptr(*x),
-            RawValue::Callable(x) => gc.trace_ptr(*x),
-            RawValue::Tuple(x) => gc.trace_ptr(*x),
-            _ => {}
-        }
-    }
-}
-
-impl RawValue {
-    pub(crate) fn is_nil(&self) -> bool {
-        match self {
-            RawValue::Nil => true,
-            _ => false,
-        }
-    }
-    pub(crate) fn nil() -> Self {
-        Default::default()
-    }
-    pub(crate) fn from_bool(x: bool) -> Self {
-        RawValue::Bool(x)
-    }
-    pub(crate) fn from_number(x: f64) -> Self {
-        RawValue::Number(OrderedFloat(x))
-    }
-    pub(crate) fn number(&self) -> Option<f64> {
-        match self {
-            RawValue::Number(x) => Some(x.0),
-            RawValue::String(s) => {
-                if let Ok(x) = (*s).data.parse::<f64>() {
-                    Some(x)
+                    write!(f, "{s}")
                 } else {
-                    None
+                    write!(f, "{s}.0")
                 }
             }
-            _ => None,
-        }
-    }
-    pub(crate) fn as_f64(&self) -> Option<&f64> {
-        match &self {
-            RawValue::Number(x) => Some(&x.0),
-            _ => None,
-        }
-    }
-    pub(crate) fn as_bool(&self) -> Option<&bool> {
-        match &self {
-            RawValue::Bool(x) => Some(x),
-            _ => None,
-        }
-    }
-    pub(crate) fn to_bool(&self) -> bool {
-        match self {
-            RawValue::Number(x) => *x != 0.0,
-            RawValue::Bool(x) => *x,
-            RawValue::Nil => false,
-            _ => true,
-        }
-    }
-    pub(crate) fn as_string<'a>(&'a self) -> Option<&'a String> {
-        match self {
-            RawValue::String(s) => unsafe { Some(&(*s.as_ptr()).data) },
-            _ => None,
-        }
-    }
-    pub(crate) fn as_table<'a>(&'a self) -> Option<&'a RefCell<Table>> {
-        match self {
-            RawValue::Table(t) => unsafe { Some(&(*t.as_ptr())) },
-            _ => None,
-        }
-    }
-    pub(crate) fn as_closure<'a>(&'a self) -> Option<&'a Closure> {
-        match self {
-            RawValue::Closure(t) => unsafe { Some(&(*t.as_ptr())) },
-            _ => None,
-        }
-    }
-    pub(crate) fn as_callable<'a>(&'a self) -> Option<&'a Box<dyn Callable>> {
-        match self {
-            RawValue::Callable(t) => unsafe { Some(&(*t.as_ptr())) },
-            _ => None,
-        }
-    }
-    pub(crate) fn as_userdata<'a>(&'a self) -> Option<&'a dyn UserData> {
-        match self {
-            RawValue::UserData(t) => unsafe { Some(&(**t.as_ptr())) },
-            _ => None,
-        }
-    }
-    pub(crate) fn as_i64(&self) -> Option<i64> {
-        let x = self.number()?;
-        let fract = x.fract();
-        if fract == 0.0 {
-            Some(x.trunc() as i64)
-        } else {
-            None
-        }
-    }
-
-    pub(crate) fn type_of(&self) -> &'static str {
-        match self {
-            RawValue::Nil => "nil",
-            RawValue::Bool(_) => "boolean",
-            RawValue::Number(_) => "number",
-            RawValue::Table(_) => "table",
-            RawValue::String(_) => "string",
-            RawValue::Closure(_) => "function",
-            RawValue::Callable(_) => "function",
-            RawValue::Tuple(_) => "tuple",
-            RawValue::UserData(x) => x.type_name(),
-        }
-    }
-    pub(crate) fn print(&self) -> String {
-        match self {
-            RawValue::Nil => String::from("nil"),
-            RawValue::Bool(t) => {
-                if *t {
-                    String::from("true")
-                } else {
-                    String::from("false")
-                }
-            }
-            RawValue::Number(x) => x.to_string(),
-            RawValue::Table(table) => {
-                format!("table: 0x{:0x}", table.as_ptr() as u64)
-            }
-            RawValue::String(s) => (*s).data.clone(),
-            RawValue::Closure(closure) => {
-                format!("function: 0x{:0x}", closure.as_ptr() as u64)
-            }
-            RawValue::Callable(callable) => {
-                format!("function: 0x{:0x}", callable.as_ptr() as u64)
-            }
-            RawValue::UserData(p) => {
-                format!("userdata: 0x{:0x}", p.as_ptr() as u64)
-            }
-            RawValue::Tuple(tuple) => {
-                let mut s = String::from("(");
-                let values = tuple.values.borrow();
-                for (i, v) in values.iter().enumerate() {
-                    if i > 0 {
-                        s.push(',');
+            Value::Object(gc_ref) => {
+                let obj = gc_ref.as_object();
+                match &obj.kind {
+                    GcObjectKind::String(s) => write!(f, "{s}"),
+                    GcObjectKind::Table(_) => {
+                        write!(f, "table: 0x{:x}", gc_ref.ptr_value())
                     }
-                    s.push_str(&format!("{}", v.print()));
+                    GcObjectKind::Closure(_) => {
+                        write!(f, "function: 0x{:x}", gc_ref.ptr_value())
+                    }
+                    GcObjectKind::Thread(_) => {
+                        write!(f, "thread: 0x{:x}", gc_ref.ptr_value())
+                    }
+                    GcObjectKind::Userdata(_) => {
+                        write!(f, "userdata: 0x{:x}", gc_ref.ptr_value())
+                    }
                 }
-                s.push(')');
-                s
             }
         }
     }
 }
 
-impl Default for RawValue {
-    fn default() -> Self {
-        RawValue::Nil
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::gc::Gc;
+
+    #[test]
+    fn test_nil() {
+        let v = Value::Nil;
+        assert!(v.is_nil());
+        assert!(!v.is_truthy());
+        assert_eq!(v.type_name(), "nil");
+        assert_eq!(format!("{v}"), "nil");
+    }
+
+    #[test]
+    fn test_boolean() {
+        let t = Value::Boolean(true);
+        let f = Value::Boolean(false);
+        assert!(t.is_boolean());
+        assert!(t.is_truthy());
+        assert!(!f.is_truthy());
+        assert_eq!(t.as_boolean(), Some(true));
+        assert_eq!(f.as_boolean(), Some(false));
+        assert_eq!(t.type_name(), "boolean");
+        assert_eq!(format!("{t}"), "true");
+        assert_eq!(format!("{f}"), "false");
+    }
+
+    #[test]
+    fn test_integer() {
+        let v = Value::Integer(42);
+        assert!(v.is_integer());
+        assert!(v.is_number());
+        assert!(v.is_truthy());
+        assert_eq!(v.as_integer(), Some(42));
+        assert_eq!(v.as_number(), Some(42.0));
+        assert_eq!(v.type_name(), "number");
+        assert_eq!(format!("{v}"), "42");
+    }
+
+    #[test]
+    fn test_float() {
+        let v = Value::Float(3.14);
+        assert!(v.is_float());
+        assert!(v.is_number());
+        assert!(v.is_truthy());
+        assert_eq!(v.as_float(), Some(3.14));
+        assert_eq!(v.type_name(), "number");
+    }
+
+    #[test]
+    fn test_float_display_whole() {
+        // Whole-number floats should show ".0"
+        let v = Value::Float(42.0);
+        let s = format!("{v}");
+        assert!(s.contains('.'), "expected decimal point in '{s}'");
+    }
+
+    #[test]
+    fn test_string() {
+        let mut gc = Gc::new();
+        let r = gc.new_string(b"hello");
+        let v = Value::Object(r);
+        assert!(v.is_string());
+        assert!(!v.is_table());
+        assert!(!v.is_function());
+        assert!(v.is_truthy());
+        assert_eq!(v.type_name(), "string");
+        assert_eq!(v.as_str_bytes(), Some(b"hello".as_slice()));
+        assert_eq!(format!("{v}"), "hello");
+    }
+
+    #[test]
+    fn test_table_value() {
+        let mut gc = Gc::new();
+        let r = gc.new_table(crate::table::Table::new());
+        let v = Value::Object(r);
+        assert!(v.is_table());
+        assert_eq!(v.type_name(), "table");
+        let s = format!("{v}");
+        assert!(s.starts_with("table: 0x"));
+    }
+
+    #[test]
+    fn test_closure_value() {
+        let mut gc = Gc::new();
+        let r = gc.new_closure(crate::closure::Closure::new());
+        let v = Value::Object(r);
+        assert!(v.is_function());
+        assert_eq!(v.type_name(), "function");
+        let s = format!("{v}");
+        assert!(s.starts_with("function: 0x"));
+    }
+
+    #[test]
+    fn test_equality_nil() {
+        assert_eq!(Value::Nil, Value::Nil);
+    }
+
+    #[test]
+    fn test_equality_boolean() {
+        assert_eq!(Value::Boolean(true), Value::Boolean(true));
+        assert_ne!(Value::Boolean(true), Value::Boolean(false));
+    }
+
+    #[test]
+    fn test_equality_integer() {
+        assert_eq!(Value::Integer(42), Value::Integer(42));
+        assert_ne!(Value::Integer(42), Value::Integer(43));
+    }
+
+    #[test]
+    fn test_equality_float() {
+        assert_eq!(Value::Float(1.5), Value::Float(1.5));
+        assert_ne!(Value::Float(1.5), Value::Float(2.5));
+    }
+
+    #[test]
+    fn test_equality_integer_float() {
+        // Lua: 1 == 1.0 → true
+        assert_eq!(Value::Integer(42), Value::Float(42.0));
+        assert_eq!(Value::Float(42.0), Value::Integer(42));
+        assert_ne!(Value::Integer(42), Value::Float(42.5));
+    }
+
+    #[test]
+    fn test_equality_different_types() {
+        assert_ne!(Value::Nil, Value::Boolean(false));
+        assert_ne!(Value::Integer(0), Value::Boolean(false));
+        assert_ne!(Value::Integer(0), Value::Nil);
+    }
+
+    #[test]
+    fn test_equality_interned_strings() {
+        let mut gc = Gc::new();
+        let r1 = gc.new_string(b"hello");
+        let r2 = gc.new_string(b"hello");
+        assert_eq!(Value::Object(r1), Value::Object(r2));
+
+        let r3 = gc.new_string(b"world");
+        assert_ne!(Value::Object(r1), Value::Object(r3));
+    }
+
+    #[test]
+    fn test_equality_non_interned_strings() {
+        let mut gc = Gc::new();
+        let long = vec![b'a'; 50];
+        let r1 = gc.new_string(&long);
+        let r2 = gc.new_string(&long);
+        // Different GcRefs, but content-equals for strings
+        assert_ne!(r1, r2);
+        assert_eq!(Value::Object(r1), Value::Object(r2));
+    }
+
+    #[test]
+    fn test_equality_tables_by_identity() {
+        let mut gc = Gc::new();
+        let r1 = gc.new_table(crate::table::Table::new());
+        let r2 = gc.new_table(crate::table::Table::new());
+        // Tables are equal only by identity
+        assert_ne!(Value::Object(r1), Value::Object(r2));
+        assert_eq!(Value::Object(r1), Value::Object(r1));
+    }
+
+    #[test]
+    fn test_truthiness() {
+        assert!(!Value::Nil.is_truthy());
+        assert!(!Value::Boolean(false).is_truthy());
+        assert!(Value::Boolean(true).is_truthy());
+        assert!(Value::Integer(0).is_truthy()); // 0 is truthy in Lua!
+        assert!(Value::Float(0.0).is_truthy()); // 0.0 is truthy in Lua!
+
+        let mut gc = Gc::new();
+        let r = gc.new_string(b"");
+        assert!(Value::Object(r).is_truthy()); // "" is truthy in Lua!
+    }
+
+    #[test]
+    fn test_special_floats() {
+        let nan = Value::Float(f64::NAN);
+        assert!(nan.is_float());
+        // NaN != NaN in both Rust and Lua
+        assert_ne!(nan, nan);
+
+        let inf = Value::Float(f64::INFINITY);
+        assert!(inf.is_float());
+        assert_eq!(inf, Value::Float(f64::INFINITY));
+
+        let neg_inf = Value::Float(f64::NEG_INFINITY);
+        assert_ne!(inf, neg_inf);
+    }
+
+    #[test]
+    fn test_negative_zero() {
+        // -0.0 == 0.0 in IEEE 754 (and Lua)
+        assert_eq!(Value::Float(-0.0), Value::Float(0.0));
+        assert_eq!(Value::Float(-0.0), Value::Integer(0));
     }
 }

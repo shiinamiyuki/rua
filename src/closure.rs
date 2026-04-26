@@ -1,147 +1,89 @@
-use std::{
-    borrow::Borrow,
-    cell::{Cell, RefCell},
-    collections::HashMap,
-    rc::Rc,
-};
+//! Lua closure (function + upvalues).
 
-use crate::{
-    bytecode::ByteCodeModule,
-    compile::UpValueInfo,
-    debug_println,
-    gc::{GcState, Traceable},
-    runtime::RuntimeError,
-    state::CallContext,
-    value::RawValue,
-};
+use std::cell::RefCell;
+use std::rc::Rc;
 
-pub trait Callable: Traceable {
-    fn call<'a>(&self, ctx: &CallContext<'a>) -> Result<(), RuntimeError>;
-}
-impl Traceable for Box<dyn Callable> {
-    fn trace(&self, gc: &GcState) {
-        self.as_ref().trace(gc)
-    }
-}
-pub struct NativeFunction {
-    func: Box<dyn Fn(&CallContext<'_>) -> Result<(), RuntimeError>>,
-}
-impl NativeFunction {
-    pub fn new<F: Fn(&CallContext<'_>) -> Result<(), RuntimeError> + 'static>(f: F) -> Self {
-        Self { func: Box::new(f) }
-    }
-}
-impl Traceable for NativeFunction {
-    fn trace(&self, _gc: &GcState) {}
-}
-impl Callable for NativeFunction {
-    fn call<'a>(&self, ctx: &CallContext<'_>) -> Result<(), RuntimeError> {
-        (self.func)(ctx)
-    }
+use crate::bytecode::Proto;
+use crate::error::LuaError;
+use crate::gc::{Gc, GcRef};
+use crate::value::Value;
+
+/// A native function: takes arguments + GC reference, returns results.
+pub type NativeFn = fn(&[Value], &mut Gc) -> Result<Vec<Value>, LuaError>;
+
+/// Runtime upvalue: may be open (on stack) or closed (captured).
+#[derive(Debug)]
+pub enum Upvalue {
+    /// Points to a stack slot (still on the stack).
+    Open(usize),
+    /// Value has been captured off the stack.
+    Closed(Value),
 }
 
-#[derive(Clone, Copy)]
-pub(crate) enum UpValueInner {
-    Empty,
-    Open(*mut RawValue),
-    Closed(RawValue),
+/// Shared reference to an upvalue.
+pub type UpvalueRef = Rc<RefCell<Upvalue>>;
+
+/// A Lua closure: either a compiled Lua function or a native Rust function.
+pub enum Closure {
+    Lua(LuaClosure),
+    Native(NativeClosure),
+    /// A native closure with captured state (e.g., iterators from gmatch).
+    NativeDyn(NativeDynClosure),
+    /// A wrap-iterator: resumes the contained coroutine on each call.
+    WrapIterator(GcRef),
 }
 
-#[derive(Clone)]
-pub(crate) struct UpValue {
-    pub(crate) inner: RefCell<Rc<Cell<UpValueInner>>>, // Rc or Gc?
+/// A compiled Lua function closure: bytecode prototype + runtime upvalues.
+pub struct LuaClosure {
+    pub proto: Rc<Proto>,
+    pub upvalues: Vec<UpvalueRef>,
 }
 
-impl std::fmt::Display for UpValue {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self.inner.borrow().get() {
-            UpValueInner::Empty => unreachable!(),
-            UpValueInner::Open(p) => unsafe { write!(f, "UpValue::Open({})", (*p).print()) },
-            UpValueInner::Closed(v) => write!(f, "UpValue::Closed({})", v.print()),
-        }
-    }
+/// A native (Rust) function closure.
+pub struct NativeClosure {
+    pub name: &'static str,
+    pub func: NativeFn,
 }
-#[derive(Clone, Debug)]
-pub struct ClosurePrototype {
-    pub(crate) entry: usize,
-    pub(crate) n_args: usize,
-    pub(crate) has_varargs: bool,
-    // pub(crate) n_locals: usize,
-    pub(crate) upvalues: Vec<UpValueInfo>,
+
+/// A native closure with dynamic captured state.
+pub struct NativeDynClosure {
+    pub name: String,
+    pub func: Box<dyn Fn(&[Value], &mut Gc) -> Result<Vec<Value>, LuaError>>,
 }
-pub struct Closure {
-    pub(crate) proto_idx: usize,
-    pub(crate) called: Cell<bool>,
-    pub(crate) entry: usize,
-    pub(crate) n_args: usize,
-    pub(crate) has_varargs: bool,
-    // pub(crate) n_locals: usize,
-    pub(crate) module: Rc<ByteCodeModule>,
-    pub(crate) upvalues: Vec<UpValue>,
-    // pub(crate) upvalues: HashMap<u32, UpValue>,
-}
+
 impl Closure {
-    pub(crate) fn set_upvalue(&self, i: u32, value: RawValue) {
-        unsafe {
-            debug_println!(
-                "store upvalue {} {:?}, {}",
-                i,
-                Rc::as_ptr(&self.upvalues[i as usize].inner.borrow()),
-                self.upvalues[i as usize]
-            );
-            let v = self.upvalues[i as usize].inner.borrow();
-            match (**v).get() {
-                UpValueInner::Open(p) => {
-                    *p.as_mut().unwrap() = value;
-                }
-                UpValueInner::Closed(_) => (**v).set(UpValueInner::Closed(value)),
-                UpValueInner::Empty => {
-                    unreachable!()
-                }
-            }
-        }
+    /// Create a new Lua closure.
+    pub fn new_lua(proto: Rc<Proto>, upvalues: Vec<UpvalueRef>) -> Self {
+        Closure::Lua(LuaClosure { proto, upvalues })
     }
-    // pub(crate) fn insert_upvalue(&self, i: u32, value: Value) {
-    //     unsafe {
-    //         if let Some(p) = self.upvalues.as_ref() {
-    //             p.insert(i, value)
-    //         } else {
-    //             unreachable!()
-    //         }
-    //     }
-    // }
-    pub(crate) fn get_upvalue(&self, i: u32) -> RawValue {
-        unsafe {
-            // let v = (*self.upvalues[i as usize].inner).borrow();
-            debug_println!(
-                "load upvalue {} {:?}, {}",
-                i,
-                Rc::as_ptr(&self.upvalues[i as usize].inner.borrow()),
-                self.upvalues[i as usize]
-            );
-            let v = self.upvalues[i as usize].inner.borrow();
 
-            match (**v).get() {
-                UpValueInner::Open(p) => *p.as_ref().unwrap(),
-                UpValueInner::Closed(c) => c,
-                UpValueInner::Empty => {
-                    unreachable!()
-                }
-            }
-        }
+    /// Create a new native closure.
+    pub fn new_native(name: &'static str, func: NativeFn) -> Self {
+        Closure::Native(NativeClosure { name, func })
+    }
+
+    /// Create a new native closure with captured state.
+    pub fn new_native_dyn(
+        name: String,
+        func: impl Fn(&[Value], &mut Gc) -> Result<Vec<Value>, LuaError> + 'static,
+    ) -> Self {
+        Closure::NativeDyn(NativeDynClosure {
+            name,
+            func: Box::new(func),
+        })
+    }
+
+    /// Stub constructor for backward compatibility with tests.
+    pub fn new() -> Self {
+        Self::default()
     }
 }
-impl Traceable for Closure {
-    fn trace(&self, gc: &GcState) {
-        for v in &self.upvalues {
-            let v = v.inner.borrow();
-            match (**v).get() {
-                UpValueInner::Open(p) => gc.trace(unsafe { &*p }),
-                UpValueInner::Closed(v) => {
-                    gc.trace(&v);
-                }
-                UpValueInner::Empty => {}
-            }
-        }
+
+impl Default for Closure {
+    fn default() -> Self {
+        Closure::Native(NativeClosure {
+            name: "<default>",
+            func: |_, _| Ok(vec![]),
+        })
     }
 }
