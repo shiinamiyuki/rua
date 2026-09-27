@@ -781,4 +781,63 @@ with >250 values), `closure` goto scope check, `constructs` `select`,
 `coroutine`. Reference Lua 5.5.0 is built at `/tmp/opencode/lua-5.5.0`
 for differential testing.
 
+## Session — M3 finish, part 3 (2026-09-27, cont.)
+
+Curated upstream suite now: **8/21 pass** (`bwcoercion`, `calls`,
+`code`, `constructs`, `events`, `files`, `tpack`, `verybig`).
+
+Fixes in this part:
+
+- **Assignment order / lazy `_ENV`** (from part 2) plus `_ENV` in
+  dumped/loaded functions: upvalue order now matches PUC; `load` env
+  semantics (absent → globals, explicit nil → nil).
+- **Generic `for` (Lua 5.5 layout)**: 4 control slots with a TFORPREP
+  swap, the closing value marked to-be-closed, `"(for state)"` debug
+  locals (3rd is the TBC one), CLOSE emitted on loop exit and breaks
+  patched onto it. `io.lines(filename)` returns 4 values so loops close
+  files.
+- **`string.dump` format**: reference-5.5 header (signature/version/
+  format/LUAC_DATA/check values), same-source inheritance to dedup
+  strings (calls.lua dump tests pass); upvalue const flag serialized.
+- **`table` constructors**: register limit raised to 255 / locals 200
+  ("too many registers"/"too many local variables"); >254 returns error.
+- **Exact int/float comparison** (Lua 5.5): equality and `<`/`<=` use
+  the float-to-integer exact algorithms; `maxint == maxint + 0.0` is
+  false.
+- **io**: buffered output + `setvbuf` (`full`/`line`/`no`), pushback for
+  `read("n")` (new scanner ported from `liolib.c`), Lua numeral parsing
+  (hex floats), `read(0)` EOF test, `filresult`-style `nil,msg,errno`
+  returns, `file:close`/`seek`/`flush` error semantics, `__gc`/`__close`/
+  `__tostring` on file handles, `io.lines`/`file:lines` formats,
+  read/write direction errors, `os.tmpname` uniqueness.
+- **os**: real `os.time(table)` (field validation/defaults/out-of-bound,
+  mktime-style normalization + field write-back), `os.date` specifier
+  validation (invalid specifier errors), C99 formatting, `os.rename`
+  errors, `setlocale` semantics.
+- **Misc**: `next` global; stable `ipairs`/`pairs` iterators;
+  `coroutine.resume` argument validation; native tail-call return values
+  from coroutines; `call_value` stack slice guard; `loadfile` BOM and
+  `#`-comment skipping; `type`/`tostring`/`tonumber`/`rawlen` require
+  arguments; `string.gsub` table replacement; `math.modf(±inf)`; integer
+  `//`/`%` wrapping.
+
+Remaining first failures (13 files):
+- `closure`: goto into local scope check too strict for the PUC pattern.
+- `coroutine`: 77 (multi-yield/resume args).
+- `errors`: 40 (syntax-error message format `[string "..."]:line: ... near`).
+- `goto`: label scope rules (`no visible label 'l3'`).
+- `literals`: 40 (`\z` line counting via `load`).
+- `locals`: 170 (`local _ENV` behavior).
+- `math`: 66 (needs bitwise float→int coercion with `number has no
+  integer representation`, "divide by zero", and varinfo hints).
+- `nextvar`: 326 (`ipairs` overflow wrap with mininteger keys).
+- `pm`/`strings`: pattern-engine edge cases (UTF-8 patterns, `find` init).
+- `sort`: `table.move` out-of-range argument errors.
+- `utf8`: continuation-byte validation.
+- `vararg`: named vararg table vs `...` aliasing semantics.
+
+Suggested next order: varinfo error hints (math/errors), goto/label
+scope rules (goto/closure), utf8 validation, pattern fixes (pm/strings),
+named vararg semantics (vararg), syntax-error formatting (errors).
+
 ## APPEND HERE
