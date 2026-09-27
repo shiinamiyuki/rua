@@ -307,27 +307,36 @@ pub fn lua_select(args: &[Value], _gc: &mut Gc) -> Result<Vec<Value>, LuaError> 
             "bad argument #1 to 'select' (number or string expected, got no value)",
         ));
     }
+    let total = args.len() as i64;
     let index = &args[0];
     // select('#', ...) returns count of remaining args
     if let Value::Object(r) = index {
         if let Some(s) = r.as_object().as_string() {
-            if s.as_bytes() == b"#" {
-                return Ok(vec![Value::Integer(args.len() as i64 - 1)]);
+            if s.as_bytes().first() == Some(&b'#') {
+                return Ok(vec![Value::Integer(total - 1)]);
             }
         }
     }
-    let n = match index.as_integer() {
-        Some(n) => n,
-        None => {
+    let mut i = match index {
+        Value::Integer(n) => *n,
+        Value::Float(f) if f.floor() == *f => *f as i64,
+        _ => {
             return Err(LuaError::new(
-                "bad argument #1 to 'select' (number or string expected)",
+                "bad argument #1 to 'select' (number expected)",
             ))
         }
     };
-    if n < 1 || n as usize > args.len() - 1 {
-        return Err(LuaError::new("bad argument #1 to 'select' (index out of range)"));
+    if i < 0 {
+        i = total + i;
+    } else if i > total {
+        i = total;
     }
-    Ok(args[n as usize..].to_vec())
+    if i < 1 {
+        return Err(LuaError::new(
+            "bad argument #1 to 'select' (index out of range)",
+        ));
+    }
+    Ok(args[i as usize..].to_vec())
 }
 
 /// setmetatable(table, metatable) — Set metatable.

@@ -107,6 +107,9 @@ struct FuncState {
     scopes: Vec<BlockScope>,
     /// Next available register.
     free_reg: u8,
+    /// Const global declarations visible in the current scope:
+    /// (scope depth, name).
+    const_globals: Vec<(usize, String)>,
     /// Pending goto statements that haven't been resolved yet.
     pending_gotos: Vec<PendingGoto>,
     /// Labels defined in the function.
@@ -124,6 +127,7 @@ impl FuncState {
             locals: Vec::new(),
             scopes: Vec::new(),
             free_reg: 0,
+            const_globals: Vec::new(),
             pending_gotos: Vec::new(),
             labels: Vec::new(),
             enclosing,
@@ -298,6 +302,8 @@ impl FuncState {
     /// and return the list of break jumps to be patched by the caller.
     fn leave_scope_unpatched(&mut self, line: u32) -> Result<Vec<usize>, LuaError> {
         let scope = self.scopes.pop().expect("unbalanced scopes");
+        let depth = self.scopes.len() + 1;
+        self.const_globals.retain(|(d, _)| *d < depth);
 
         // Check if any locals in this scope are <close> or capture upvalues
         let has_close = self.locals[scope.first_local..]
@@ -700,6 +706,18 @@ fn compile_assign(
                         key: None,
                     });
                 } else {
+                    if fs
+                        .const_globals
+                        .iter()
+                        .rev()
+                        .any(|(_, n)| n == name)
+                    {
+                        return Err(LuaError::new(format!(
+                            "{}:{}: attempt to assign to const variable '{name}'",
+                            fs.proto.source.as_deref().unwrap_or("?"),
+                            line
+                        )));
+                    }
                     let env = env_upvalue(fs)?;
                     let k = fs.string_constant(name.as_bytes());
                     prepared.push(Prepared::Name {
@@ -1471,6 +1489,7 @@ fn compile_func_body_with_parent(
         locals: parent_fs.locals.clone(),
         scopes: Vec::new(), // dummy — not used for scope tracking
         free_reg: parent_fs.free_reg,
+        const_globals: parent_fs.const_globals.clone(),
         pending_gotos: Vec::new(),
         labels: Vec::new(),
         enclosing: None, // We only go one level deep here
@@ -1774,6 +1793,12 @@ fn compile_local_decl(
     let nnames = names.len();
     let nvalues = values.len();
     let base = fs.free_reg;
+    let depth = fs.scopes.len();
+    for att_name in names {
+        if att_name.attrib.as_deref() == Some("const") {
+            fs.const_globals.push((depth, att_name.name.clone()));
+        }
+    }
 
     // Evaluate values
     for (i, val) in values.iter().enumerate() {
@@ -1840,6 +1865,12 @@ fn compile_global_decl(
     let nnames = names.len();
     let nvalues = values.len();
     let base = fs.free_reg;
+    let depth = fs.scopes.len();
+    for att_name in names {
+        if att_name.attrib.as_deref() == Some("const") {
+            fs.const_globals.push((depth, att_name.name.clone()));
+        }
+    }
 
     // Evaluate values into temp registers
     for (i, val) in values.iter().enumerate() {

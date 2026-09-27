@@ -3140,19 +3140,82 @@ impl Vm {
                 }
 
                 OpCode::VarArg => {
-                    let varargs = self.frames[fi].varargs.clone();
-                    if c == 0 {
-                        for (i, &val) in varargs.iter().enumerate() {
-                            self.ensure_stack(base + a + i);
-                            self.stack[base + a + i] = val;
+                    if let Some(va_reg) =
+                        self.frames[fi].proto.vararg_name_reg
+                    {
+                        // Named varargs: `...` reads through the table.
+                        let table_val = self.stack[base + va_reg as usize];
+                        let table_ref = match table_val {
+                            Value::Object(r) => Some(r),
+                            _ => None,
+                        };
+                        let table = table_ref
+                            .as_ref()
+                            .and_then(|r| r.as_object().as_table());
+                        let n: u64 = match table {
+                            Some(t) => {
+                                let key = match self.gc.find_string(b"n") {
+                                    Some(k) => k,
+                                    None => self.gc.new_string(b"n"),
+                                };
+                                match t.raw_get(&Value::Object(key)) {
+                                    Value::Integer(i)
+                                        if i >= 0
+                                            && (i as u64) <= (i32::MAX as u64) / 2 =>
+                                    {
+                                        i as u64
+                                    }
+                                    _ => {
+                                        return Err(LuaError::new(
+                                            "vararg table has no proper 'n'",
+                                        ));
+                                    }
+                                }
+                            }
+                            None => 0,
+                        };
+                        let get = |t: &Option<&Table>, i: u64| -> Value {
+                            match t {
+                                Some(tab) => {
+                                    tab.raw_get(&Value::Integer(i as i64))
+                                }
+                                None => Value::Nil,
+                            }
+                        };
+                        if c == 0 {
+                            for i in 0..n {
+                                self.ensure_stack(base + a + i as usize);
+                                self.stack[base + a + i as usize] =
+                                    get(&table, i + 1);
+                            }
+                            self.top = base + a + n as usize;
+                        } else {
+                            let want = (c - 1) as u64;
+                            for i in 0..want {
+                                self.ensure_stack(base + a + i as usize);
+                                let v = if i < n {
+                                    get(&table, i + 1)
+                                } else {
+                                    Value::Nil
+                                };
+                                self.stack[base + a + i as usize] = v;
+                            }
                         }
-                        self.top = base + a + varargs.len();
                     } else {
-                        let n = c - 1;
-                        for i in 0..n {
-                            self.ensure_stack(base + a + i);
-                            self.stack[base + a + i] =
-                                varargs.get(i).copied().unwrap_or(Value::Nil);
+                        let varargs = self.frames[fi].varargs.clone();
+                        if c == 0 {
+                            for (i, &val) in varargs.iter().enumerate() {
+                                self.ensure_stack(base + a + i);
+                                self.stack[base + a + i] = val;
+                            }
+                            self.top = base + a + varargs.len();
+                        } else {
+                            let n = c - 1;
+                            for i in 0..n {
+                                self.ensure_stack(base + a + i);
+                                self.stack[base + a + i] =
+                                    varargs.get(i).copied().unwrap_or(Value::Nil);
+                            }
                         }
                     }
                 }
@@ -4672,8 +4735,12 @@ impl Vm {
             }
         }
         let list = args.first().copied().unwrap_or(Value::Nil);
-        let i = if args.len() > 1 { check_int(args, 1)? } else { 1 };
-        let e = if args.len() > 2 {
+        let i = if args.len() > 1 && !args[1].is_nil() {
+            check_int(args, 1)?
+        } else {
+            1
+        };
+        let e = if args.len() > 2 && !args[2].is_nil() {
             check_int(args, 2)?
         } else {
             let l = self.value_length(list)?;
@@ -4831,7 +4898,7 @@ impl Vm {
         let t = args.first().copied().unwrap_or(Value::Nil);
         self.check_move_table_rw(t, 1)?;
         let size = self.lua_len_integer(t)?;
-        let pos = if args.len() > 1 {
+        let pos = if args.len() > 1 && !args[1].is_nil() {
             match args[1] {
                 Value::Integer(i) => i,
                 Value::Float(f) if f.floor() == f => f as i64,
@@ -4899,8 +4966,12 @@ impl Vm {
                 )));
             }
         };
-        let i = if args.len() > 2 { check_int(args, 2)? } else { 1 };
-        if args.len() > 3 {
+        let i = if args.len() > 2 && !args[2].is_nil() {
+            check_int(args, 2)?
+        } else {
+            1
+        };
+        if args.len() > 3 && !args[3].is_nil() {
             last = check_int(args, 3)?;
         }
         let mut out: Vec<u8> = Vec::new();
@@ -6999,6 +7070,9 @@ impl Vm {
                 }
             }
             b"count" => {
+                // Reference Lua's `count` returns live memory; run a cycle
+                // first so garbage created since the last one is not counted.
+                self.collect_garbage();
                 let bytes = self.gc.bytes_allocated_approx();
                 let kb = (bytes as f64) / 1024.0;
                 let rem = (bytes % 1024) as i64;
