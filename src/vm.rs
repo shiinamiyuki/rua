@@ -3569,6 +3569,7 @@ impl Vm {
                 if self.debug_gethook_ref == Some(gc_ref) {
                     return self.handle_debug_gethook(&actual_args, result_base, num_results);
                 }
+                let depth_before = self.frames.len();
                 let results = match gc_ref.as_object().as_closure().unwrap() {
                     Closure::Native(nc) => (nc.func)(&actual_args, &mut self.gc)?,
                     Closure::NativeDyn(nc) => (nc.func)(&actual_args, &mut self.gc)?,
@@ -3578,6 +3579,11 @@ impl Vm {
                     }
                     _ => unreachable!(),
                 };
+                if self.frames.len() > depth_before {
+                    // The native deferred its results to a newly pushed Lua
+                    // frame (e.g. `dofile`): that frame will place them.
+                    return Ok(());
+                }
                 self.place_results(result_base, num_results, &results);
                 self.fire_return_hook(None)?;
             } else {
@@ -3923,32 +3929,6 @@ impl Vm {
 
     /// Handle coroutine.resume(co [, val1, ...]).
 
-    /// True when the closure is implemented natively (cannot yield).
-    fn is_native_closure_ref(r: GcRef) -> bool {
-        matches!(
-            r.as_object().as_closure(),
-            Some(Closure::Native(_)) | Some(Closure::NativeDyn(_)) | Some(Closure::WrapIterator(_))
-        )
-    }
-
-    /// Run a coroutine whose body is a native function: call it directly
-    /// and leave the coroutine dead. Returns Ok(results) or the error.
-    fn run_native_coroutine_body(
-        &mut self,
-        co_ref: GcRef,
-        args: &[Value],
-    ) -> Result<Vec<Value>, LuaError> {
-        let body = co_ref
-            .as_object_mut()
-            .as_coroutine_mut()
-            .unwrap()
-            .body
-            .take()
-            .unwrap();
-        let outcome = self.call_value(Value::Object(body), args);
-        co_ref.as_object_mut().as_coroutine_mut().unwrap().status = CoroutineStatus::Dead;
-        outcome
-    }
 
     fn handle_resume(
         &mut self,
@@ -3988,37 +3968,6 @@ impl Vm {
 
         let is_first_resume = co_ref.as_object().as_coroutine().unwrap().body.is_some();
 
-        // A native body cannot yield: run it in place of the resumer.
-        if is_first_resume {
-            let body_ref = *co_ref
-                .as_object()
-                .as_coroutine()
-                .unwrap()
-                .body
-                .as_ref()
-                .unwrap();
-            if Self::is_native_closure_ref(body_ref) {
-                match self.run_native_coroutine_body(co_ref, &resume_args) {
-                    Ok(vals) => {
-                        let mut results = Vec::with_capacity(1 + vals.len());
-                        results.push(Value::Boolean(true));
-                        results.extend(vals);
-                        self.place_results(result_base, num_results, &results);
-                    }
-                    Err(e) => {
-                        let e = self.position_error(e);
-                        let err_val = e.to_value(&mut self.gc);
-                        self.place_results(
-                            result_base,
-                            num_results,
-                            &[Value::Boolean(false), err_val],
-                        );
-                    }
-                }
-                return Ok(());
-            }
-        }
-
         // Save the current (resumer) thread state
         let resumer_ref = self.running_thread();
         self.save_vm_to_thread(resumer_ref);
@@ -4043,7 +3992,13 @@ impl Vm {
             for (i, &arg) in resume_args.iter().enumerate() {
                 self.stack[call_base + 1 + i] = arg;
             }
-            self.do_call(Value::Object(body), call_base, &resume_args, call_base, -1)?;
+            let depth_before = self.frames.len();
+            self.call_function(call_base, resume_args.len() + 1, -1)?;
+            if self.frames.len() == depth_before {
+                // Native body finished synchronously.
+                self.last_return_values =
+                    self.stack[call_base..self.top.max(call_base)].to_vec();
+            }
         } else {
             // Resumed after yield: deliver resume args as yield's return values
             let yr_base = co_ref.as_object().as_coroutine().unwrap().yield_result_base;
@@ -4196,27 +4151,6 @@ impl Vm {
         }
 
         let is_first = co_ref.as_object().as_coroutine().unwrap().body.is_some();
-        if is_first {
-            let body_ref = *co_ref
-                .as_object()
-                .as_coroutine()
-                .unwrap()
-                .body
-                .as_ref()
-                .unwrap();
-            if Self::is_native_closure_ref(body_ref) {
-                match self.run_native_coroutine_body(co_ref, args) {
-                    Ok(vals) => {
-                        self.place_results(result_base, num_results, &vals);
-                    }
-                    Err(e) => {
-                        let e = self.position_error(e);
-                        return Err(e);
-                    }
-                }
-                return Ok(());
-            }
-        }
         let resumer_ref = self.running_thread();
         self.save_vm_to_thread(resumer_ref);
         resumer_ref.as_object_mut().as_coroutine_mut().unwrap().status = CoroutineStatus::Normal;
@@ -4235,13 +4169,19 @@ impl Vm {
             for (i, &arg) in args.iter().enumerate() {
                 self.stack[call_base + 1 + i] = arg;
             }
-            if let Err(e) = self.do_call(Value::Object(body), call_base, args, call_base, -1) {
+            let depth_before = self.frames.len();
+            if let Err(e) = self.call_function(call_base, args.len() + 1, -1) {
                 co_ref.as_object_mut().as_coroutine_mut().unwrap().status = CoroutineStatus::Dead;
                 self.save_vm_to_thread(co_ref);
                 self.load_thread_to_vm(resumer_ref);
                 resumer_ref.as_object_mut().as_coroutine_mut().unwrap().status = CoroutineStatus::Running;
                 self.current_thread = if resumer_ref == self.main_thread.unwrap() { None } else { Some(resumer_ref) };
                 return Err(e);
+            }
+            if self.frames.len() == depth_before {
+                // Native body finished synchronously: its results are ready.
+                self.last_return_values = self.stack[call_base..self.top.max(call_base)]
+                    .to_vec();
             }
         } else {
             let yr_base = co_ref.as_object().as_coroutine().unwrap().yield_result_base;
@@ -7057,8 +6997,11 @@ impl Vm {
         let text = Self::skip_bom_and_comment(&source);
         let closure_ref = self.load_chunk(&text, &chunk_name, "bt", env)?;
 
-        let results = self.call_value(Value::Object(closure_ref), &[])?;
-        self.place_results(result_base, num_results, &results);
+        // Run the chunk as a regular call (from this call site) so that it
+        // can yield; results are placed at `result_base` when it returns.
+        self.ensure_stack(result_base + 1);
+        self.stack[result_base] = Value::Object(closure_ref);
+        self.call_function(result_base, 1, num_results)?;
         Ok(())
     }
 
