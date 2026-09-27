@@ -559,8 +559,15 @@ pub fn parse_lua_number(token: &[u8]) -> Option<Value> {
         return None;
     }
     if !digits.contains('.') && !digits.contains('e') && !digits.contains('E') {
-        if let Ok(i) = digits.parse::<i64>() {
-            return Some(Value::Integer(if neg { -i } else { i }));
+        if let Ok(u) = digits.parse::<u64>() {
+            if neg {
+                // -2^63 is representable as a Lua integer.
+                if u <= (i64::MAX as u64) + 1 {
+                    return Some(Value::Integer((u as i64).wrapping_neg()));
+                }
+            } else if u <= i64::MAX as u64 {
+                return Some(Value::Integer(u as i64));
+            }
         }
     }
     digits

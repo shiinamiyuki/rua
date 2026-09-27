@@ -58,10 +58,17 @@ pub fn lua_tonumber(args: &[Value], _gc: &mut Gc) -> Result<Vec<Value>, LuaError
         ));
     }
     let v = args.first().copied().unwrap_or(Value::Nil);
+    let explicit_base = args.get(1).map_or(false, |b| !b.is_nil());
     let base = args
         .get(1)
         .and_then(|b| b.as_integer())
-        .unwrap_or(10) as u32;
+        .unwrap_or(10);
+    if explicit_base && !(2..=36).contains(&base) {
+        return Err(LuaError::new(
+            "bad argument #2 to 'tonumber' (base out of range)",
+        ));
+    }
+    let base = base as u32;
 
     match v {
         Value::Integer(_) => Ok(vec![v]),
@@ -70,28 +77,50 @@ pub fn lua_tonumber(args: &[Value], _gc: &mut Gc) -> Result<Vec<Value>, LuaError
             let s = r.as_object().as_string().unwrap();
             let text = std::str::from_utf8(s.as_bytes()).unwrap_or("");
             let text = text.trim();
-            if base == 10 {
-                // Try integer first, then float
-                if let Ok(n) = text.parse::<i64>() {
-                    return Ok(vec![Value::Integer(n)]);
+            if !explicit_base {
+                // Full Lua numeral grammar (hex wraps, decimal overflow
+                // becomes a float, hex floats supported).
+                if let Some(v) = crate::stdlib::io::parse_lua_number(s.as_bytes()) {
+                    return Ok(vec![v]);
                 }
-                if let Ok(n) = text.parse::<f64>() {
-                    return Ok(vec![Value::Float(n)]);
-                }
-                // Try hex notation
-                if let Some(hex) = text.strip_prefix("0x").or_else(|| text.strip_prefix("0X")) {
-                    if let Ok(n) = i64::from_str_radix(hex, 16) {
-                        return Ok(vec![Value::Integer(n)]);
-                    }
-                }
-            } else {
-                if let Ok(n) = i64::from_str_radix(text, base) {
-                    return Ok(vec![Value::Integer(n)]);
-                }
+            } else if let Some(n) = parse_base_integer(text, base) {
+                return Ok(vec![Value::Integer(n)]);
             }
             Ok(vec![Value::Nil])
         }
         _ => Ok(vec![Value::Nil]),
+    }
+}
+
+/// Strict base-N integer parsing for `tonumber(s, base)`: optional sign
+/// and surrounding spaces, digits valid for the base, overflow -> None.
+fn parse_base_integer(text: &str, base: u32) -> Option<i64> {
+    let text = text.trim();
+    let (neg, body) = if let Some(rest) = text.strip_prefix('-') {
+        (true, rest)
+    } else if let Some(rest) = text.strip_prefix('+') {
+        (false, rest)
+    } else {
+        (false, text)
+    };
+    if body.is_empty() {
+        return None;
+    }
+    let mut acc: u64 = 0;
+    for c in body.chars() {
+        let d = c.to_digit(base)?;
+        acc = acc.checked_mul(base as u64)?.checked_add(d as u64)?;
+    }
+    if neg {
+        if acc <= (i64::MAX as u64) + 1 {
+            Some((acc as i64).wrapping_neg())
+        } else {
+            None
+        }
+    } else if acc <= i64::MAX as u64 {
+        Some(acc as i64)
+    } else {
+        None
     }
 }
 
@@ -226,6 +255,9 @@ pub fn lua_rawset(args: &[Value], _gc: &mut Gc) -> Result<Vec<Value>, LuaError> 
     let table = args.first().copied().unwrap_or(Value::Nil);
     let key = args.get(1).copied().unwrap_or(Value::Nil);
     let val = args.get(2).copied().unwrap_or(Value::Nil);
+    if matches!(key, Value::Float(f) if f.is_nan()) {
+        return Err(LuaError::new("table index is NaN"));
+    }
     match table {
         Value::Object(mut r) if r.as_object().as_table().is_some() => {
             r.as_object_mut().as_table_mut().unwrap().raw_set(key, val);

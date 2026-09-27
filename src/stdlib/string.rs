@@ -7,7 +7,7 @@ use crate::value::Value;
 type NativeFn = fn(&[Value], &mut Gc) -> Result<Vec<Value>, LuaError>;
 
 /// Extract string bytes from a Value.
-fn check_string(args: &[Value], idx: usize, fname: &str) -> Result<Vec<u8>, LuaError> {
+pub(crate) fn check_string(args: &[Value], idx: usize, fname: &str) -> Result<Vec<u8>, LuaError> {
     let v = args.get(idx).copied().unwrap_or(Value::Nil);
     match v {
         Value::Object(r) if r.as_object().as_string().is_some() => {
@@ -463,7 +463,7 @@ fn format_g(f: f64, prec: usize, upper: bool) -> String {
 // ── Pattern matching engine ────────────────────────────────────────
 
 /// Lua pattern match state.
-struct MatchState<'a> {
+pub(crate) struct MatchState<'a> {
     source: &'a [u8],
     pattern: &'a [u8],
     captures: Vec<Capture>,
@@ -484,7 +484,7 @@ enum CaptureLen {
 }
 
 impl<'a> MatchState<'a> {
-    fn new(source: &'a [u8], pattern: &'a [u8]) -> Self {
+    pub(crate) fn new(source: &'a [u8], pattern: &'a [u8]) -> Self {
         MatchState {
             source,
             pattern,
@@ -495,7 +495,7 @@ impl<'a> MatchState<'a> {
 
     /// Match pattern starting at pat_idx against source starting at si.
     /// Returns the end position in source if match succeeds.
-    fn match_pattern(&mut self, si: usize, pi: usize) -> Option<usize> {
+    pub(crate) fn match_pattern(&mut self, si: usize, pi: usize) -> Option<usize> {
         self.match_impl(si, pi, 0)
     }
 
@@ -955,96 +955,7 @@ pub fn string_gmatch(args: &[Value], gc: &mut Gc) -> Result<Vec<Value>, LuaError
     Ok(vec![Value::Object(gc_ref)])
 }
 
-pub fn string_gsub(args: &[Value], gc: &mut Gc) -> Result<Vec<Value>, LuaError> {
-    let s = check_string(args, 0, "gsub")?;
-    let pat = check_string(args, 1, "gsub")?;
-    let repl = args.get(2).copied().unwrap_or(Value::Nil);
-    let max_s = args
-        .get(3)
-        .and_then(|v| v.as_integer())
-        .map(|n| n as usize)
-        .unwrap_or(usize::MAX);
-
-    let anchored = !pat.is_empty() && pat[0] == b'^';
-    let pat_slice = if anchored { &pat[1..] } else { &pat[..] };
-
-    let mut result = Vec::new();
-    let mut si = 0;
-    let mut count = 0;
-
-    while si <= s.len() && count < max_s {
-        let mut ms = MatchState::new(&s, pat_slice);
-        if let Some(end) = ms.match_pattern(si, 0) {
-            count += 1;
-            // Build replacement
-            match repl {
-                Value::Object(r) if r.as_object().as_string().is_some() => {
-                    let repl_str = r.as_object().as_string().unwrap().as_bytes().to_vec();
-                    apply_string_replacement(&mut result, &repl_str, &ms, &s, si, end);
-                }
-                Value::Object(r) if r.as_object().as_table().is_some() => {
-                    // Table replacement: first capture (or whole match) is the key.
-                    let key = match ms.captures.first() {
-                        Some(cap) => capture_to_value(cap, &s, gc),
-                        None => {
-                            let whole = gc.new_string(&s[si..end]);
-                            Value::Object(whole)
-                        }
-                    };
-                    let val = r.as_object().as_table().unwrap().raw_get(&key);
-                    if val.is_truthy() {
-                        let bytes = match val {
-                            Value::Object(sr) if sr.as_object().as_string().is_some() => {
-                                sr.as_object().as_string().unwrap().as_bytes().to_vec()
-                            }
-                            Value::Integer(n) => format!("{n}").into_bytes(),
-                            Value::Float(n) => format!("{n}").into_bytes(),
-                            other => {
-                                return Err(LuaError::new(format!(
-                                    "invalid replacement value (a {})",
-                                    other.type_name()
-                                )))
-                            }
-                        };
-                        result.extend_from_slice(&bytes);
-                    } else {
-                        result.extend_from_slice(&s[si..end]);
-                    }
-                }
-                _ => {
-                    // For other replacements, use the whole match
-                    let whole = &s[si..end];
-                    result.extend_from_slice(whole);
-                }
-            }
-            if end == si {
-                if si < s.len() {
-                    result.push(s[si]);
-                }
-                si += 1;
-            } else {
-                si = end;
-            }
-            if anchored {
-                break;
-            }
-        } else {
-            if si < s.len() {
-                result.push(s[si]);
-            }
-            si += 1;
-        }
-    }
-    // Append remaining
-    if si <= s.len() {
-        result.extend_from_slice(&s[si..]);
-    }
-
-    let r = gc.new_string(&result);
-    Ok(vec![Value::Object(r), Value::Integer(count as i64)])
-}
-
-fn apply_string_replacement(
+pub(crate) fn apply_string_replacement(
     result: &mut Vec<u8>,
     repl: &[u8],
     ms: &MatchState,
@@ -1111,7 +1022,7 @@ fn capture_to_value(cap: &Capture, source: &[u8], gc: &mut Gc) -> Value {
     }
 }
 
-fn get_captures(ms: &MatchState, source: &[u8], start: usize, end: usize, gc: &mut Gc) -> Vec<Value> {
+pub(crate) fn get_captures(ms: &MatchState, source: &[u8], start: usize, end: usize, gc: &mut Gc) -> Vec<Value> {
     if ms.captures.is_empty() {
         // No explicit captures: return whole match
         let s = gc.new_string(&source[start..end]);
@@ -1157,7 +1068,6 @@ pub fn string_functions() -> Vec<(&'static str, NativeFn)> {
         ("find", string_find),
         ("format", string_format),
         ("gmatch", string_gmatch),
-        ("gsub", string_gsub),
         ("len", string_len),
         ("lower", string_lower),
         ("match", string_match),

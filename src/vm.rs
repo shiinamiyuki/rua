@@ -164,6 +164,8 @@ pub struct Vm {
     /// `tostring` / `print` are VM-special so they can call `__tostring`.
     tostring_ref: Option<GcRef>,
     print_ref: Option<GcRef>,
+    /// `string.gsub` is VM-special so function replacements can be called.
+    gsub_ref: Option<GcRef>,
     /// The registry table returned by `debug.getregistry`.
     registry: Option<GcRef>,
     /// Active debug hook state (per-thread; swapped on coroutine switch).
@@ -249,6 +251,7 @@ impl Vm {
             debug_gethook_ref: None,
             tostring_ref: None,
             print_ref: None,
+            gsub_ref: None,
             registry: None,
             hook_func: None,
             hook_mask: 0,
@@ -452,6 +455,14 @@ impl Vm {
         let mut string_table = Table::new();
         for (name, func) in crate::stdlib::string::string_functions() {
             self.register_native(&mut string_table, name, func);
+        }
+        // string.gsub can call Lua functions for replacements.
+        {
+            let gsub_closure = Closure::new_native("gsub", |_, _| Ok(vec![]));
+            let gsub_gc = self.gc.new_closure(gsub_closure);
+            self.gsub_ref = Some(gsub_gc);
+            let key = self.gc.new_string(b"gsub");
+            string_table.raw_set(Value::Object(key), Value::Object(gsub_gc));
         }
         let string_ref = self.gc.new_table(string_table);
         let string_key = self.gc.new_string(b"string");
@@ -1723,6 +1734,9 @@ impl Vm {
 
     /// Table set with __newindex metamethod support.
     fn table_set(&mut self, table_val: Value, key: Value, val: Value) -> Result<(), LuaError> {
+        if matches!(key, Value::Float(f) if f.is_nan()) {
+            return Err(LuaError::new("table index is NaN"));
+        }
         let mut current = table_val;
         let mut limit = 16;
         loop {
@@ -1919,6 +1933,7 @@ impl Vm {
             self.registry,
             self.tostring_ref,
             self.print_ref,
+            self.gsub_ref,
         ] {
             if let Some(r) = r {
                 roots.push(r);
@@ -2505,6 +2520,7 @@ impl Vm {
                         else if self.debug_getregistry_ref == Some(r) { 25 }
                         else if self.tostring_ref == Some(r) { 28 }
                         else if self.print_ref == Some(r) { 29 }
+                        else if self.gsub_ref == Some(r) { 30 }
                         else if self.debug_sethook_ref == Some(r) { 26 }
                         else if self.debug_gethook_ref == Some(r) { 27 }
                         else { 0 }
@@ -2683,6 +2699,12 @@ impl Vm {
                                 .collect();
                             self.handle_print(&args)?;
                             self.place_results(base + a, num_results, &[]);
+                        }
+                        30 => { // string.gsub
+                            let args: Vec<Value> = (0..num_args)
+                                .map(|i| self.stack[base + a + 1 + i])
+                                .collect();
+                            self.handle_gsub(&args, base + a, num_results)?;
                         }
                         26 => { // debug.sethook
                             let args: Vec<Value> = (0..num_args)
@@ -3044,6 +3066,9 @@ impl Vm {
                     self.handle_print(&actual_args)?;
                     self.place_results(result_base, num_results, &[]);
                     return Ok(());
+                }
+                if self.gsub_ref == Some(gc_ref) {
+                    return self.handle_gsub(&actual_args, result_base, num_results);
                 }
                 if self.debug_sethook_ref == Some(gc_ref) {
                     self.handle_debug_sethook(&actual_args)?;
@@ -4060,6 +4085,116 @@ impl Vm {
         let s = self.gc.new_string(&bytes);
         self.place_results(result_base, num_results, &[Value::Object(s)]);
         Ok(())
+    }
+
+    /// Handle `string.gsub(s, pat, repl [, n])`. Supports string, table and
+    /// function replacements; function replacements may call back into Lua.
+    fn handle_gsub(
+        &mut self,
+        args: &[Value],
+        result_base: usize,
+        num_results: i32,
+    ) -> Result<(), LuaError> {
+        use crate::stdlib::string::{apply_string_replacement, get_captures, MatchState};
+        let s = crate::stdlib::string::check_string(args, 0, "gsub")?;
+        let pat = crate::stdlib::string::check_string(args, 1, "gsub")?;
+        let repl = args.get(2).copied().unwrap_or(Value::Nil);
+        let max_s = args
+            .get(3)
+            .and_then(|v| v.as_integer())
+            .map(|n| n as usize)
+            .unwrap_or(usize::MAX);
+
+        let anchored = !pat.is_empty() && pat[0] == b'^';
+        let pat_slice = if anchored { &pat[1..] } else { &pat[..] };
+
+        let mut result: Vec<u8> = Vec::new();
+        let mut si = 0usize;
+        let mut count = 0usize;
+
+        while si <= s.len() && count < max_s {
+            let mut ms = MatchState::new(&s, pat_slice);
+            if let Some(end) = ms.match_pattern(si, 0) {
+                count += 1;
+
+                // Build the replacement piece.
+                let piece: Vec<u8> = match repl {
+                    Value::Object(r) if r.as_object().as_string().is_some() => {
+                        let repl_str = r.as_object().as_string().unwrap().as_bytes().to_vec();
+                        let mut out = Vec::new();
+                        apply_string_replacement(&mut out, &repl_str, &ms, &s, si, end);
+                        out
+                    }
+                    Value::Object(r) if r.as_object().as_table().is_some() => {
+                        let captures = get_captures(&ms, &s, si, end, &mut self.gc);
+                        let key = captures.into_iter().next().unwrap_or(Value::Nil);
+                        let val = r.as_object().as_table().unwrap().raw_get(&key);
+                        if val.is_truthy() {
+                            Self::replacement_bytes(val)?
+                        } else {
+                            s[si..end].to_vec()
+                        }
+                    }
+                    Value::Object(r)
+                        if r.as_object().as_closure().is_some() =>
+                    {
+                        let captures = get_captures(&ms, &s, si, end, &mut self.gc);
+                        let results = self.call_value(repl, &captures)?;
+                        let first = results.first().copied().unwrap_or(Value::Nil);
+                        if first.is_nil() || first == Value::Boolean(false) {
+                            s[si..end].to_vec()
+                        } else {
+                            Self::replacement_bytes(first)?
+                        }
+                    }
+                    _ => s[si..end].to_vec(),
+                };
+                result.extend_from_slice(&piece);
+
+                if end == si {
+                    if si < s.len() {
+                        result.push(s[si]);
+                    }
+                    si += 1;
+                } else {
+                    si = end;
+                }
+                if anchored {
+                    break;
+                }
+            } else {
+                if si < s.len() {
+                    result.push(s[si]);
+                }
+                si += 1;
+            }
+        }
+        if si <= s.len() {
+            result.extend_from_slice(&s[si..]);
+        }
+
+        let r = self.gc.new_string(&result);
+        self.place_results(
+            result_base,
+            num_results,
+            &[Value::Object(r), Value::Integer(count as i64)],
+        );
+        Ok(())
+    }
+
+    /// Convert a gsub replacement value to bytes (strings and numbers only).
+    fn replacement_bytes(v: Value) -> Result<Vec<u8>, LuaError> {
+        match v {
+            Value::Object(r) if r.as_object().as_string().is_some() => {
+                Ok(r.as_object().as_string().unwrap().as_bytes().to_vec())
+            }
+            Value::Integer(n) => Ok(format!("{n}").into_bytes()),
+            Value::Float(n) => Ok(format!("{n}").into_bytes()),
+            other => Err(LuaError::new(format!(
+                "invalid replacement value (a {})",
+                other.type_name()
+            ))),
+        }
     }
 
     /// Handle `print(...)` using `__tostring` semantics.

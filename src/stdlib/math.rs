@@ -102,10 +102,13 @@ pub fn math_atan(args: &[Value], _gc: &mut Gc) -> Result<Vec<Value>, LuaError> {
 }
 
 pub fn math_ceil(args: &[Value], _gc: &mut Gc) -> Result<Vec<Value>, LuaError> {
+    if let Some(Value::Integer(i)) = args.first() {
+        return Ok(vec![Value::Integer(*i)]);
+    }
     let x = check_number(args, 0, "ceil")?;
     let r = x.ceil();
     let i = r as i64;
-    if i as f64 == r && r >= i64::MIN as f64 && r <= i64::MAX as f64 {
+    if i as f64 == r && r >= -(2f64.powi(63)) && r < 2f64.powi(63) {
         Ok(vec![Value::Integer(i)])
     } else {
         Ok(vec![Value::Float(r)])
@@ -128,10 +131,13 @@ pub fn math_exp(args: &[Value], _gc: &mut Gc) -> Result<Vec<Value>, LuaError> {
 }
 
 pub fn math_floor(args: &[Value], _gc: &mut Gc) -> Result<Vec<Value>, LuaError> {
+    if let Some(Value::Integer(i)) = args.first() {
+        return Ok(vec![Value::Integer(*i)]);
+    }
     let x = check_number(args, 0, "floor")?;
     let r = x.floor();
     let i = r as i64;
-    if i as f64 == r && r >= i64::MIN as f64 && r <= i64::MAX as f64 {
+    if i as f64 == r && r >= -(2f64.powi(63)) && r < 2f64.powi(63) {
         Ok(vec![Value::Integer(i)])
     } else {
         Ok(vec![Value::Float(r)])
@@ -139,11 +145,25 @@ pub fn math_floor(args: &[Value], _gc: &mut Gc) -> Result<Vec<Value>, LuaError> 
 }
 
 pub fn math_fmod(args: &[Value], _gc: &mut Gc) -> Result<Vec<Value>, LuaError> {
-    let v = args.first().copied().unwrap_or(Value::Nil);
+    // Two integers use integer modulo (exact); otherwise floating fmod.
+    if let (Some(Value::Integer(a)), Some(Value::Integer(b))) = (args.first(), args.get(1)) {
+        let b = *b;
+        if b == 0 {
+            return Err(LuaError::new("bad argument #2 to 'fmod' (zero)"));
+        }
+        let r = if b == -1 {
+            0
+        } else {
+            a.wrapping_rem(b)
+        };
+        return Ok(vec![Value::Integer(r)]);
+    }
+    check_number(args, 0, "fmod")?;
+    check_number(args, 1, "fmod")?;
     let x = check_number(args, 0, "fmod")?;
     let y = check_number(args, 1, "fmod")?;
     let r = x % y;
-    Ok(vec![integer_or_float(v, r)])
+    Ok(vec![Value::Float(r)])
 }
 
 pub fn math_log(args: &[Value], _gc: &mut Gc) -> Result<Vec<Value>, LuaError> {
@@ -214,7 +234,7 @@ pub fn math_modf(args: &[Value], _gc: &mut Gc) -> Result<Vec<Value>, LuaError> {
         (x.trunc(), x.fract())
     };
     let i = trunc as i64;
-    let int_part = if i as f64 == trunc && trunc >= i64::MIN as f64 && trunc <= i64::MAX as f64 {
+    let int_part = if i as f64 == trunc && trunc >= -(2f64.powi(63)) && trunc < 2f64.powi(63) {
         Value::Integer(i)
     } else {
         Value::Float(trunc)
@@ -247,11 +267,23 @@ pub fn math_tointeger(args: &[Value], _gc: &mut Gc) -> Result<Vec<Value>, LuaErr
     match v {
         Value::Integer(i) => Ok(vec![Value::Integer(i)]),
         Value::Float(f) => {
-            let i = f as i64;
-            if i as f64 == f {
-                Ok(vec![Value::Integer(i)])
+            if f.fract() == 0.0 && f >= -(2f64.powi(63)) && f < 2f64.powi(63) {
+                Ok(vec![Value::Integer(f as i64)])
             } else {
                 Ok(vec![Value::Nil]) // fail
+            }
+        }
+        // Numeric strings are accepted.
+        Value::Object(r) if r.as_object().as_string().is_some() => {
+            match crate::stdlib::io::parse_lua_number(r.as_object().as_string().unwrap().as_bytes())
+            {
+                Some(Value::Integer(i)) => Ok(vec![Value::Integer(i)]),
+                Some(Value::Float(f))
+                    if f.fract() == 0.0 && f >= -(2f64.powi(63)) && f < 2f64.powi(63) =>
+                {
+                    Ok(vec![Value::Integer(f as i64)])
+                }
+                _ => Ok(vec![Value::Nil]),
             }
         }
         _ => Ok(vec![Value::Nil]), // fail
@@ -336,21 +368,29 @@ fn ensure_random_init() {
 }
 
 fn seed_random(x: u64, y: u64) {
-    // SplitMix64 to expand seeds
-    let mut state = x;
-    let mut split = |s: &mut u64| -> u64 {
-        *s = s.wrapping_add(0x9e3779b97f4a7c15);
-        let mut z = *s;
-        z = (z ^ (z >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94d049bb133111eb);
-        z ^ (z >> 31)
-    };
-    let s0 = split(&mut state);
-    let s1 = split(&mut state);
-    state = y;
-    let s2 = split(&mut state);
-    let s3 = split(&mut state);
-    RANDOM_STATE.with(|cell| cell.set([s0, s1, s2, s3]));
+    // Reference Lua's seeding: state = {n1, 0xff, n2, 0}, then discard
+    // 16 values to spread the seed.
+    RANDOM_STATE.with(|cell| cell.set([x, 0xff, y, 0]));
+    for _ in 0..16 {
+        xoshiro256_next();
+    }
+}
+
+/// Reference Lua's uniform projection of a random integer into [0, n].
+fn project(mut ran: u64, n: u64) -> u64 {
+    let mut lim = n;
+    let mut sh: u32 = 1;
+    while lim & lim.wrapping_add(1) != 0 {
+        lim |= lim >> sh;
+        sh *= 2;
+    }
+    loop {
+        ran &= lim;
+        if ran <= n {
+            return ran;
+        }
+        ran = xoshiro256_next();
+    }
 }
 
 fn xoshiro256_next() -> u64 {
@@ -371,27 +411,26 @@ fn xoshiro256_next() -> u64 {
 
 pub fn math_random(args: &[Value], _gc: &mut Gc) -> Result<Vec<Value>, LuaError> {
     ensure_random_init();
+    if args.len() > 2 {
+        return Err(LuaError::new("wrong number of arguments"));
+    }
     if args.is_empty() {
         // Return float in [0, 1)
         let r = xoshiro256_next();
         let f = (r >> 11) as f64 / (1u64 << 53) as f64;
         Ok(vec![Value::Float(f)])
     } else if args.len() == 1 {
-        let v = args[0];
-        let n = match v {
-            Value::Integer(0) => {
-                return Ok(vec![Value::Integer(xoshiro256_next() as i64)]);
-            }
-            Value::Integer(i) if i > 0 => i,
-            _ => {
-                return Err(LuaError::new(
-                    "bad argument #1 to 'random' (interval is empty)",
-                ))
-            }
-        };
-        // random(n) = random(1, n)
+        let n = check_integer(args, 0, "random")?;
+        if n == 0 {
+            return Ok(vec![Value::Integer(xoshiro256_next() as i64)]);
+        }
+        if n < 1 {
+            return Err(LuaError::new(
+                "bad argument #1 to 'random' (interval is empty)",
+            ));
+        }
         let r = xoshiro256_next();
-        let result = (r % n as u64) as i64 + 1;
+        let result = project(r, n as u64 - 1) as i64 + 1;
         Ok(vec![Value::Integer(result)])
     } else {
         let m = check_integer(args, 0, "random")?;
@@ -401,23 +440,25 @@ pub fn math_random(args: &[Value], _gc: &mut Gc) -> Result<Vec<Value>, LuaError>
                 "bad argument #2 to 'random' (interval is empty)",
             ));
         }
-        let range = (n as u128 - m as u128 + 1) as u64;
         let r = xoshiro256_next();
-        let result = m + (r % range) as i64;
-        Ok(vec![Value::Integer(result)])
+        let p = project(r, (n as u64).wrapping_sub(m as u64));
+        Ok(vec![Value::Integer((p.wrapping_add(m as u64)) as i64)])
     }
 }
 
 pub fn math_randomseed(args: &[Value], _gc: &mut Gc) -> Result<Vec<Value>, LuaError> {
+    ensure_random_init();
     if args.is_empty() {
+        ensure_random_init();
         let seed = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos() as u64)
             .unwrap_or(12345);
-        seed_random(seed, 0);
+        let n2 = xoshiro256_next();
+        seed_random(seed, n2);
         Ok(vec![
             Value::Integer(seed as i64),
-            Value::Integer(0),
+            Value::Integer(n2 as i64),
         ])
     } else {
         let x = check_integer(args, 0, "randomseed")?;
