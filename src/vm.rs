@@ -266,6 +266,17 @@ pub struct Vm {
     /// debug.getinfo(2) inside the hook can name it).
     return_hook_c_name: Option<String>,
 
+    /// Coroutine that is closing itself (via `coroutine.close()` inside it);
+    /// the coroutine is unwound to its resume point.
+    self_closing: Option<GcRef>,
+
+    /// Coroutine currently being closed by an external `coroutine.close`.
+    closing_thread: Option<GcRef>,
+
+    /// Number of active C-level calls that cannot be suspended
+    /// (gsub replacements, sort comparators, message handlers, ...).
+    unyieldable_depth: usize,
+
     /// Name of the protected call whose frame is being unwound, if any.
     /// Closing methods report it through debug.getinfo (reference Lua keeps
     /// the C `pcall` frame as their caller).
@@ -353,6 +364,9 @@ impl Vm {
             pending_c_call: false,
             error_handling: false,
             return_hook_c_name: None,
+            self_closing: None,
+            closing_thread: None,
+            unyieldable_depth: 0,
             closing_pcall_name: None,
             close_frame_info: None,
         }
@@ -380,6 +394,7 @@ impl Vm {
             hook_mask: 0,
             hook_count: 0,
             hook_counter: 0,
+            pending_error: None,
         };
         let main_thread_ref = self.gc.new_thread(main_coro);
         self.main_thread = Some(main_thread_ref);
@@ -1208,6 +1223,8 @@ impl Vm {
                     }
                     self.open_upvalues.truncate(saved_uv);
                     self.extra_roots.push(ev);
+                    // Continue closing the remaining variables with the
+                    // new error object (mirrors luaD_closeprotected).
                     status_err = Some(ev);
                 }
             } else {
@@ -3126,7 +3143,13 @@ impl Vm {
                             let args: Vec<Value> = (0..num_args)
                                 .map(|i| self.stack[base + a + 1 + i])
                                 .collect();
-                            self.handle_yield(&args, base + a, self.frames[fi].num_results)?;
+                            // A tail call to yield returns the resumed values
+                            // directly to this function's caller, so the frame
+                            // is finished once the values are delivered.
+                            let rb = self.frames[fi].result_base;
+                            let nr = self.frames[fi].num_results;
+                            self.handle_yield(&args, rb, nr)?;
+                            self.frames.pop();
                             continue;
                         }
                     }
@@ -3465,6 +3488,17 @@ impl Vm {
                 if self.coro_yield_ref == Some(gc_ref) {
                     return self.handle_yield(&actual_args, result_base, num_results);
                 }
+                if self.coro_running_ref == Some(gc_ref) {
+                    self.handle_running(result_base, num_results);
+                    return Ok(());
+                }
+                if self.coro_isyieldable_ref == Some(gc_ref) {
+                    self.handle_isyieldable(&actual_args, result_base, num_results);
+                    return Ok(());
+                }
+                if self.coro_close_ref == Some(gc_ref) {
+                    return self.handle_close(&actual_args, result_base, num_results);
+                }
                 // Intercept debug VM-special functions
                 if self.debug_traceback_ref == Some(gc_ref) {
                     self.handle_debug_traceback(&actual_args, result_base, num_results);
@@ -3794,6 +3828,9 @@ impl Vm {
                             }
                         }
                         Err(e) => {
+                            if self.self_closing.is_some() {
+                                return Err(e);
+                            }
                             let e = self.position_error(e);
                             let err_val = e.to_value(&mut self.gc);
                             let prev = self.closing_pcall_name;
@@ -3825,6 +3862,9 @@ impl Vm {
                 }
             }
             Err(e) => {
+                if self.self_closing.is_some() {
+                    return Err(e);
+                }
                 // The call itself failed (e.g. calling a non-function)
                 let e = self.position_error(e);
                 let err_val = e.to_value(&mut self.gc);
@@ -3993,7 +4033,41 @@ impl Vm {
                 self.stack[call_base + 1 + i] = arg;
             }
             let depth_before = self.frames.len();
-            self.call_function(call_base, resume_args.len() + 1, -1)?;
+            if let Err(e) = self.call_function(call_base, resume_args.len() + 1, -1) {
+                let err_val = e.to_value(&mut self.gc);
+                co_ref.as_object_mut().as_coroutine_mut().unwrap().status =
+                    CoroutineStatus::Dead;
+                co_ref
+                    .as_object_mut()
+                    .as_coroutine_mut()
+                    .unwrap()
+                    .pending_error = Some(err_val);
+                self.save_vm_to_thread(co_ref);
+                self.load_thread_to_vm(resumer_ref);
+                resumer_ref.as_object_mut().as_coroutine_mut().unwrap().status =
+                    CoroutineStatus::Running;
+                self.current_thread = if resumer_ref == self.main_thread.unwrap() {
+                    None
+                } else {
+                    Some(resumer_ref)
+                };
+                let rb = resumer_ref
+                    .as_object()
+                    .as_coroutine()
+                    .unwrap()
+                    .yield_result_base;
+                let nr = resumer_ref
+                    .as_object()
+                    .as_coroutine()
+                    .unwrap()
+                    .yield_num_results;
+                self.place_results(
+                    rb,
+                    nr,
+                    &[Value::Boolean(false), err_val],
+                );
+                return Ok(());
+            }
             if self.frames.len() == depth_before {
                 // Native body finished synchronously.
                 self.last_return_values =
@@ -4012,6 +4086,9 @@ impl Vm {
                 Ok(()) => break Ok(()),
                 Err(e) => {
                     let e = self.position_error(e);
+                    if self.self_closing.is_some() {
+                        break Err(e);
+                    }
                     // Check if a pcall guard can catch this error.
                     if let Some(guard) = self.pcall_guards.last() {
                         if guard.frame_depth <= self.frames.len() {
@@ -4041,6 +4118,14 @@ impl Vm {
                                 guard.num_results,
                                 &[Value::Boolean(false), handled],
                             );
+                            // The protected call is the coroutine body (or a
+                            // nested one): take its results as pending
+                            // return values for when the coroutine ends.
+                            let rb = guard.result_base;
+                            let top =
+                                self.top.max(rb).min(self.stack.len());
+                            self.last_return_values =
+                                self.stack[rb..top].to_vec();
                             continue; // Re-enter execution
                         }
                     }
@@ -4051,9 +4136,53 @@ impl Vm {
 
         // Determine outcome
         if let Err(e) = exec_result {
+            if self.self_closing == Some(co_ref) {
+                // Closed itself: close remaining variables, discard frames,
+                // and finish without results.
+                self.self_closing = None;
+                let uv_len = self.open_upvalues.len();
+                let close_err = self.recover_from_error(0, uv_len, None);
+                co_ref.as_object_mut().as_coroutine_mut().unwrap().status =
+                    CoroutineStatus::Dead;
+                self.save_vm_to_thread(co_ref);
+                self.load_thread_to_vm(resumer_ref);
+                resumer_ref.as_object_mut().as_coroutine_mut().unwrap().status =
+                    CoroutineStatus::Running;
+                self.current_thread = if resumer_ref == self.main_thread.unwrap() {
+                    None
+                } else {
+                    Some(resumer_ref)
+                };
+                let rb = resumer_ref
+                    .as_object()
+                    .as_coroutine()
+                    .unwrap()
+                    .yield_result_base;
+                let nr = resumer_ref
+                    .as_object()
+                    .as_coroutine()
+                    .unwrap()
+                    .yield_num_results;
+                match close_err {
+                    Some(err) => self.place_results(
+                        rb,
+                        nr,
+                        &[Value::Boolean(false), err],
+                    ),
+                    None => {
+                        self.place_results(rb, nr, &[Value::Boolean(true)])
+                    }
+                }
+                return Ok(());
+            }
             // Error: coroutine is now dead
             let err_val = e.to_value(&mut self.gc);
             co_ref.as_object_mut().as_coroutine_mut().unwrap().status = CoroutineStatus::Dead;
+            co_ref
+                .as_object_mut()
+                .as_coroutine_mut()
+                .unwrap()
+                .pending_error = Some(err_val);
             self.save_vm_to_thread(co_ref);
 
             // Restore resumer
@@ -4111,6 +4240,11 @@ impl Vm {
     ) -> Result<(), LuaError> {
         if self.current_thread.is_none() {
             return Err(LuaError::new("cannot yield from main thread"));
+        }
+        if self.unyieldable_depth > 0 {
+            return Err(LuaError::new(
+                "attempt to yield across a C-call boundary",
+            ));
         }
 
         // Save where to deliver resume arguments when this coroutine is resumed
@@ -4222,6 +4356,11 @@ impl Vm {
                                 guard.num_results,
                                 &[Value::Boolean(false), handled],
                             );
+                            let rb = guard.result_base;
+                            let top =
+                                self.top.max(rb).min(self.stack.len());
+                            self.last_return_values =
+                                self.stack[rb..top].to_vec();
                             continue;
                         }
                     }
@@ -4282,7 +4421,26 @@ impl Vm {
             _ => self.running_thread(),
         };
         let is_main = co_ref.as_object().as_coroutine().unwrap().is_main;
-        self.place_results(result_base, num_results, &[Value::Boolean(!is_main)]);
+        // A C-level frame in the running thread makes it unyieldable.
+        let in_c_call = self.running_thread() == co_ref && self.unyieldable_depth > 0;
+        self.place_results(
+            result_base,
+            num_results,
+            &[Value::Boolean(!is_main && !in_c_call)],
+        );
+    }
+
+    /// Call a function from a C-level context where yielding is not
+    /// allowed (gsub replacements, sort comparators, ...).
+    fn call_value_unyieldable(
+        &mut self,
+        func: Value,
+        args: &[Value],
+    ) -> Result<Vec<Value>, LuaError> {
+        self.unyieldable_depth += 1;
+        let r = self.call_value(func, args);
+        self.unyieldable_depth -= 1;
+        r
     }
 
     /// Handle coroutine.close([co]).
@@ -4294,44 +4452,113 @@ impl Vm {
     ) -> Result<(), LuaError> {
         let co_ref = match args.first() {
             Some(Value::Object(r)) if r.as_object().as_coroutine().is_some() => *r,
-            _ => {
-                // Default = running coroutine. For now: cannot close running.
-                return Err(LuaError::new("cannot close a running coroutine"));
+            Some(v) if !v.is_nil() => {
+                return Err(LuaError::new(
+                    "bad argument #1 to 'close' (coroutine expected)",
+                ));
             }
+            _ => self.running_thread(),
         };
 
+        let is_main = Some(co_ref) == self.main_thread;
+        if is_main && self.running_thread() == co_ref {
+            return Err(LuaError::new("cannot close main thread"));
+        }
         let status = co_ref.as_object().as_coroutine().unwrap().status;
         match status {
             CoroutineStatus::Dead => {
-                self.place_results(result_base, num_results, &[Value::Boolean(true)]);
+                let pending = co_ref
+                    .as_object_mut()
+                    .as_coroutine_mut()
+                    .unwrap()
+                    .pending_error
+                    .take();
+                match pending {
+                    Some(err) => self.place_results(
+                        result_base,
+                        num_results,
+                        &[Value::Boolean(false), err],
+                    ),
+                    None => self.place_results(
+                        result_base,
+                        num_results,
+                        &[Value::Boolean(true)],
+                    ),
+                }
             }
             CoroutineStatus::Suspended => {
-                // Close TBC variables in the suspended coroutine
-                // We need to temporarily load the coroutine's state to close its TBC vars
+                // Close TBC variables and upvalues of the suspended thread.
                 let resumer_ref = self.running_thread();
                 self.save_vm_to_thread(resumer_ref);
 
                 self.load_thread_to_vm(co_ref);
-                // Close all TBC vars and upvalues
-                if !self.frames.is_empty() {
-                    let _ = self.close_tbc_vars(0, None);
-                    self.close_upvalues(0);
-                }
+                self.closing_thread = Some(co_ref);
+                let prev_current = self.current_thread;
+                self.current_thread = if co_ref == self.main_thread.unwrap() {
+                    None
+                } else {
+                    Some(co_ref)
+                };
+                co_ref.as_object_mut().as_coroutine_mut().unwrap().status =
+                    CoroutineStatus::Running;
+                let close_result = if self.frames.is_empty() {
+                    Ok(())
+                } else {
+                    self.close_tbc_vars(0, None)
+                };
+                self.close_upvalues(0);
                 self.frames.clear();
+                let mut err_val = None;
+                if let Err(e) = close_result {
+                    err_val = Some(e.to_value(&mut self.gc));
+                }
                 self.save_vm_to_thread(co_ref);
-                co_ref.as_object_mut().as_coroutine_mut().unwrap().status = CoroutineStatus::Dead;
+                self.closing_thread = None;
+                self.current_thread = prev_current;
+                co_ref.as_object_mut().as_coroutine_mut().unwrap().status =
+                    CoroutineStatus::Dead;
 
                 self.load_thread_to_vm(resumer_ref);
-                self.place_results(result_base, num_results, &[Value::Boolean(true)]);
+                match err_val {
+                    Some(err) => self.place_results(
+                        result_base,
+                        num_results,
+                        &[Value::Boolean(false), err],
+                    ),
+                    None => self.place_results(
+                        result_base,
+                        num_results,
+                        &[Value::Boolean(true)],
+                    ),
+                }
             }
             _ => {
-                let msg = format!("cannot close a {} coroutine", status.as_str());
-                let err_str = self.gc.new_string(msg.as_bytes());
-                self.place_results(
-                    result_base,
-                    num_results,
-                    &[Value::Boolean(false), Value::Object(err_str)],
-                );
+                if status == CoroutineStatus::Running
+                    && self.running_thread() == co_ref
+                    && !is_main
+                {
+                    if self.closing_thread == Some(co_ref) {
+                        // A closing method re-closing its own coroutine
+                        // while it is being closed: tolerated.
+                        self.place_results(result_base, num_results, &[]);
+                        return Ok(());
+                    }
+                    // Closing the running coroutine: unwind it to its
+                    // resume point (pcall recovery entries are bypassed).
+                    self.self_closing = Some(co_ref);
+                    return Err(LuaError::new("__coroutine_self_close__"));
+                }
+                let msg = match status {
+                    CoroutineStatus::Running => {
+                        "cannot close a running coroutine".to_string()
+                    }
+                    CoroutineStatus::Normal => {
+                        "cannot close a normal coroutine".to_string()
+                    }
+                    CoroutineStatus::Dead => unreachable!(),
+                    CoroutineStatus::Suspended => unreachable!(),
+                };
+                return Err(LuaError::new(msg));
             }
         }
         Ok(())
@@ -4524,6 +4751,9 @@ impl Vm {
                             self.stack[result_base] = Value::Boolean(true);
                         }
                         Err(e) => {
+                            if self.self_closing.is_some() {
+                                return Err(e);
+                            }
                             let e = self.position_error(e);
                             let err_val = e.to_value(&mut self.gc);
                             // Call message handler before unwinding
@@ -4541,6 +4771,9 @@ impl Vm {
                 }
             }
             Err(e) => {
+                if self.self_closing.is_some() {
+                    return Err(e);
+                }
                 let e = self.position_error(e);
                 let err_val = e.to_value(&mut self.gc);
                 let handled = self.call_message_handler(msgh, err_val);
@@ -4562,7 +4795,7 @@ impl Vm {
         // "error in error handling".
         let prev = self.error_handling;
         self.error_handling = true;
-        let result = self.call_value(msgh, &[err_val]);
+        let result = self.call_value_unyieldable(msgh, &[err_val]);
         self.error_handling = prev;
         match result {
             Ok(results) => results.into_iter().next().unwrap_or(Value::Nil),
@@ -5267,7 +5500,8 @@ impl Vm {
                     Value::Object(r) if r.as_object().as_closure().is_some() => {
                         let captures =
                             crate::stdlib::string::get_captures(&ms, &s, src, e, &mut self.gc)?;
-                        let results = self.call_value(repl, &captures)?;
+                        let results =
+                            self.call_value_unyieldable(repl, &captures)?;
                         let first = results.first().copied().unwrap_or(Value::Nil);
                         if first.is_nil() || first == Value::Boolean(false) {
                             result.extend_from_slice(&s[src..e]);
@@ -6788,7 +7022,7 @@ impl Vm {
             // string. Reader errors become load failures (nil + message).
             let mut buf: Vec<u8> = Vec::new();
             loop {
-                let results = match self.call_value(chunk, &[]) {
+                let results = match self.call_value_unyieldable(chunk, &[]) {
                     Ok(r) => r,
                     Err(e) => {
                         let msg = e.to_value(&mut self.gc);
@@ -7090,7 +7324,7 @@ impl Vm {
         if comp.is_nil() {
             self.compare_lt(a, b)
         } else {
-            let res = self.call_value(comp, &[a, b])?;
+            let res = self.call_value_unyieldable(comp, &[a, b])?;
             Ok(res.first().copied().unwrap_or(Value::Nil).is_truthy())
         }
     }

@@ -60,4 +60,7 @@ pub struct Coroutine {
     pub hook_count: i64,
     /// Remaining instructions until the next count hook fires.
     pub hook_counter: i64,
+    /// Error object that killed this coroutine, returned by the first
+    /// `coroutine.close`.
+    pub pending_error: Option<Value>,
 }
