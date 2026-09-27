@@ -202,6 +202,15 @@ pub struct Vm {
     /// `table.sort` (VM-special: needs to call the comparator).
     sort_ref: Option<GcRef>,
 
+    /// `table.move` (VM-special: honors `__index`/`__newindex`).
+    move_ref: Option<GcRef>,
+
+    /// `table.unpack` (VM-special: honors `__index`/`__len`).
+    unpack_ref: Option<GcRef>,
+
+    /// `table.insert` (VM-special: honors `__index`/`__newindex`/`__len`).
+    insert_ref: Option<GcRef>,
+
     // ── Warning system (`warn`) ────────────────────────────────────
     warn_ref: Option<GcRef>,
     /// Warnings are printed when true (`@on`).
@@ -272,6 +281,9 @@ impl Vm {
             globals_ref: None,
             collectgarbage_ref: None,
             sort_ref: None,
+            move_ref: None,
+            unpack_ref: None,
+            insert_ref: None,
             warn_ref: None,
             warn_on: false,
             warn_store: false,
@@ -488,6 +500,30 @@ impl Vm {
             self.sort_ref = Some(sort_gc);
             let key = self.gc.new_string(b"sort");
             table_table.raw_set(Value::Object(key), Value::Object(sort_gc));
+        }
+        // table.move is VM-special: it honors __index/__newindex.
+        {
+            let move_closure = Closure::new_native("move", |_, _| Ok(vec![]));
+            let move_gc = self.gc.new_closure(move_closure);
+            self.move_ref = Some(move_gc);
+            let key = self.gc.new_string(b"move");
+            table_table.raw_set(Value::Object(key), Value::Object(move_gc));
+        }
+        // table.unpack is VM-special: it honors __index/__len.
+        {
+            let unpack_closure = Closure::new_native("unpack", |_, _| Ok(vec![]));
+            let unpack_gc = self.gc.new_closure(unpack_closure);
+            self.unpack_ref = Some(unpack_gc);
+            let key = self.gc.new_string(b"unpack");
+            table_table.raw_set(Value::Object(key), Value::Object(unpack_gc));
+        }
+        // table.insert is VM-special: it honors __index/__newindex/__len.
+        {
+            let insert_closure = Closure::new_native("insert", |_, _| Ok(vec![]));
+            let insert_gc = self.gc.new_closure(insert_closure);
+            self.insert_ref = Some(insert_gc);
+            let key = self.gc.new_string(b"insert");
+            table_table.raw_set(Value::Object(key), Value::Object(insert_gc));
         }
         let table_ref = self.gc.new_table(table_table);
         let table_key = self.gc.new_string(b"table");
@@ -1929,6 +1965,9 @@ impl Vm {
             self.globals_ref,
             self.collectgarbage_ref,
             self.sort_ref,
+            self.move_ref,
+            self.unpack_ref,
+            self.insert_ref,
             self.warn_ref,
             self.registry,
             self.tostring_ref,
@@ -2517,6 +2556,9 @@ impl Vm {
                         else if self.collectgarbage_ref == Some(r) { 22 }
                         else if self.warn_ref == Some(r) { 23 }
                         else if self.sort_ref == Some(r) { 24 }
+                        else if self.move_ref == Some(r) { 31 }
+                        else if self.unpack_ref == Some(r) { 32 }
+                        else if self.insert_ref == Some(r) { 33 }
                         else if self.debug_getregistry_ref == Some(r) { 25 }
                         else if self.tostring_ref == Some(r) { 28 }
                         else if self.print_ref == Some(r) { 29 }
@@ -2683,6 +2725,25 @@ impl Vm {
                                 .map(|i| self.stack[base + a + 1 + i])
                                 .collect();
                             self.handle_sort(&args, base + a, num_results)?;
+                        }
+                        31 => { // table.move
+                            let args: Vec<Value> = (0..num_args)
+                                .map(|i| self.stack[base + a + 1 + i])
+                                .collect();
+                            self.handle_table_move(&args, base + a, num_results)?;
+                        }
+                        32 => { // table.unpack
+                            let args: Vec<Value> = (0..num_args)
+                                .map(|i| self.stack[base + a + 1 + i])
+                                .collect();
+                            self.handle_table_unpack(&args, base + a, num_results)?;
+                        }
+                        33 => { // table.insert
+                            let args: Vec<Value> = (0..num_args)
+                                .map(|i| self.stack[base + a + 1 + i])
+                                .collect();
+                            self.handle_table_insert(&args)?;
+                            self.place_results(base + a, num_results, &[]);
                         }
                         25 => { // debug.getregistry
                             self.handle_debug_getregistry(base + a, num_results);
@@ -3054,6 +3115,17 @@ impl Vm {
                 }
                 if self.sort_ref == Some(gc_ref) {
                     return self.handle_sort(&actual_args, result_base, num_results);
+                }
+                if self.move_ref == Some(gc_ref) {
+                    return self.handle_table_move(&actual_args, result_base, num_results);
+                }
+                if self.unpack_ref == Some(gc_ref) {
+                    return self.handle_table_unpack(&actual_args, result_base, num_results);
+                }
+                if self.insert_ref == Some(gc_ref) {
+                    self.handle_table_insert(&actual_args)?;
+                    self.place_results(result_base, num_results, &[]);
+                    return Ok(());
                 }
                 if self.debug_getregistry_ref == Some(gc_ref) {
                     self.handle_debug_getregistry(result_base, num_results);
@@ -4085,6 +4157,219 @@ impl Vm {
         let s = self.gc.new_string(&bytes);
         self.place_results(result_base, num_results, &[Value::Object(s)]);
         Ok(())
+    }
+
+    /// Handle `table.move(a1, f, e, t [, a2])`, mirroring `tmove` from
+    /// `ltablib.c`: honors `__index`/`__newindex` and picks the copy
+    /// direction that is safe for overlapping ranges.
+    fn handle_table_move(
+        &mut self,
+        args: &[Value],
+        result_base: usize,
+        num_results: i32,
+    ) -> Result<(), LuaError> {
+        fn check_int(args: &[Value], idx: usize) -> Result<i64, LuaError> {
+            let v = args.get(idx).copied().unwrap_or(Value::Nil);
+            match v {
+                Value::Integer(i) => Ok(i),
+                Value::Float(f) if f.floor() == f => Ok(f as i64),
+                _ => Err(LuaError::new(format!(
+                    "bad argument #{} to 'move' (number expected, got {})",
+                    idx + 1,
+                    v.type_name()
+                ))),
+            }
+        }
+        let f = check_int(args, 1)?;
+        let e = check_int(args, 2)?;
+        let t = check_int(args, 3)?;
+        let a1 = args.first().copied().unwrap_or(Value::Nil);
+        let has_dst = args.len() > 4 && !args[4].is_nil();
+        let dst = if has_dst { args[4] } else { a1 };
+        let dst_argn = if has_dst { 5 } else { 1 };
+
+        self.check_move_table(a1, 1, false)?;
+        self.check_move_table(dst, dst_argn, true)?;
+
+        if e >= f {
+            if !(f > 0 || e < i64::MAX.wrapping_add(f)) {
+                return Err(LuaError::new(
+                    "bad argument #3 to 'move' (too many elements to move)",
+                ));
+            }
+            let n = e.wrapping_sub(f).wrapping_add(1);
+            if t > i64::MAX.wrapping_sub(n).wrapping_add(1) {
+                return Err(LuaError::new(
+                    "bad argument #4 to 'move' (destination wrap around)",
+                ));
+            }
+            let same = !has_dst || a1 == dst;
+            if t > e || t <= f || !same {
+                let mut i = 0i64;
+                while i < n {
+                    let v = self.table_get(a1, Value::Integer(f.wrapping_add(i)))?;
+                    self.table_set(dst, Value::Integer(t.wrapping_add(i)), v)?;
+                    i += 1;
+                }
+            } else {
+                let mut i = n - 1;
+                loop {
+                    let v = self.table_get(a1, Value::Integer(f.wrapping_add(i)))?;
+                    self.table_set(dst, Value::Integer(t.wrapping_add(i)), v)?;
+                    if i == 0 {
+                        break;
+                    }
+                    i -= 1;
+                }
+            }
+        }
+        self.place_results(result_base, num_results, &[dst]);
+        Ok(())
+    }
+
+    /// Look up the length of a value like `luaL_len`: honors `__len` and
+    /// requires an integer result.
+    fn lua_len_integer(&mut self, v: Value) -> Result<i64, LuaError> {
+        let l = self.value_length(v)?;
+        match l {
+            Value::Integer(n) => Ok(n),
+            Value::Float(f) if f.floor() == f => Ok(f as i64),
+            _ => Err(LuaError::new("object length is not an integer")),
+        }
+    }
+
+    /// Handle `table.insert(list, [pos,] value)`, mirroring `tinsert` from
+    /// `ltablib.c`.
+    fn handle_table_insert(&mut self, args: &[Value]) -> Result<(), LuaError> {
+        let t = args.first().copied().unwrap_or(Value::Nil);
+        self.check_move_table_rw(t, 1)?;
+        let e = self.lua_len_integer(t)?.wrapping_add(1);
+        let pos;
+        match args.len() {
+            2 => pos = e,
+            3 => {
+                let p = match args[1] {
+                    Value::Integer(i) => i,
+                    Value::Float(f) if f.floor() == f => f as i64,
+                    v => {
+                        return Err(LuaError::new(format!(
+                            "bad argument #2 to 'insert' (number expected, got {})",
+                            v.type_name()
+                        )));
+                    }
+                };
+                if (p as u64).wrapping_sub(1) >= e as u64 {
+                    return Err(LuaError::new(
+                        "bad argument #2 to 'insert' (position out of bounds)",
+                    ));
+                }
+                pos = p;
+                let mut i = e;
+                while i > pos {
+                    let v = self.table_get(t, Value::Integer(i - 1))?;
+                    self.table_set(t, Value::Integer(i), v)?;
+                    i -= 1;
+                }
+            }
+            _ => {
+                return Err(LuaError::new("wrong number of arguments to 'insert'"));
+            }
+        }
+        let val = args[args.len() - 1];
+        self.table_set(t, Value::Integer(pos), val)?;
+        Ok(())
+    }
+
+    /// Check a `table.move`-style argument that needs both `__index` and
+    /// `__newindex` (TAB_RW).
+    fn check_move_table_rw(&self, v: Value, argn: usize) -> Result<(), LuaError> {
+        if matches!(v, Value::Object(r) if r.as_object().as_table().is_some()) {
+            return Ok(());
+        }
+        if self.get_metatable(v).is_some()
+            && self.get_metamethod(v, MM_INDEX).is_some()
+            && self.get_metamethod(v, MM_NEWINDEX).is_some()
+        {
+            return Ok(());
+        }
+        Err(LuaError::new(format!(
+            "bad argument #{} to 'insert' (table expected, got {})",
+            argn,
+            v.type_name()
+        )))
+    }
+
+    /// Handle `table.unpack(list [, i [, j]])`, mirroring `tunpack` from
+    /// `ltablib.c`: reads through `__index` and defaults `j` to `#list`
+    /// (honoring `__len`).
+    fn handle_table_unpack(
+        &mut self,
+        args: &[Value],
+        result_base: usize,
+        num_results: i32,
+    ) -> Result<(), LuaError> {
+        fn check_int(args: &[Value], idx: usize) -> Result<i64, LuaError> {
+            let v = args.get(idx).copied().unwrap_or(Value::Nil);
+            match v {
+                Value::Integer(i) => Ok(i),
+                Value::Float(f) if f.floor() == f => Ok(f as i64),
+                _ => Err(LuaError::new(format!(
+                    "bad argument #{} to 'unpack' (number expected, got {})",
+                    idx + 1,
+                    v.type_name()
+                ))),
+            }
+        }
+        let list = args.first().copied().unwrap_or(Value::Nil);
+        let i = if args.len() > 1 { check_int(args, 1)? } else { 1 };
+        let e = if args.len() > 2 {
+            check_int(args, 2)?
+        } else {
+            let l = self.value_length(list)?;
+            match l {
+                Value::Integer(n) => n,
+                Value::Float(f) if f.floor() == f => f as i64,
+                _ => {
+                    return Err(LuaError::new("object length is not an integer"));
+                }
+            }
+        };
+        if i > e {
+            self.place_results(result_base, num_results, &[]);
+            return Ok(());
+        }
+        let n = (e as u64).wrapping_sub(i as u64);
+        if n >= i32::MAX as u64 || n + 1 > 1_000_000 {
+            return Err(LuaError::new("too many results to unpack"));
+        }
+        let mut results = Vec::with_capacity(n as usize + 1);
+        let mut k = i;
+        loop {
+            results.push(self.table_get(list, Value::Integer(k))?);
+            if k == e {
+                break;
+            }
+            k += 1;
+        }
+        self.place_results(result_base, num_results, &results);
+        Ok(())
+    }
+
+    /// Check that a `table.move` argument is a table or can behave like
+    /// one (has a metatable with the required metamethod).
+    fn check_move_table(&self, v: Value, argn: usize, write: bool) -> Result<(), LuaError> {
+        if matches!(v, Value::Object(r) if r.as_object().as_table().is_some()) {
+            return Ok(());
+        }
+        let mm = if write { MM_NEWINDEX } else { MM_INDEX };
+        if self.get_metatable(v).is_some() && self.get_metamethod(v, mm).is_some() {
+            return Ok(());
+        }
+        Err(LuaError::new(format!(
+            "bad argument #{} to 'move' (table expected, got {})",
+            argn,
+            v.type_name()
+        )))
     }
 
     /// Handle `string.gsub(s, pat, repl [, n])`. Supports string, table and

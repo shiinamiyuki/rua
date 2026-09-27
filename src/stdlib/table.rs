@@ -69,7 +69,7 @@ pub fn table_insert(args: &[Value], _gc: &mut Gc) -> Result<Vec<Value>, LuaError
             tbl.array.push(val);
         }
         // table.insert(t, pos, value)
-        3 | _ => {
+        3 => {
             let pos = check_integer(args, 1, "insert")? as usize;
             let val = args[2];
             if pos < 1 || pos > len + 1 {
@@ -78,6 +78,9 @@ pub fn table_insert(args: &[Value], _gc: &mut Gc) -> Result<Vec<Value>, LuaError
                 )));
             }
             tbl.array.insert(pos - 1, val);
+        }
+        _ => {
+            return Err(LuaError::new("wrong number of arguments to 'insert'"));
         }
     }
     Ok(vec![])
@@ -238,21 +241,31 @@ pub fn table_unpack(args: &[Value], _gc: &mut Gc) -> Result<Vec<Value>, LuaError
 /// table.create(narr [, nrec]) → table
 /// Lua 5.5 extension: pre-allocate array and hash parts.
 pub fn table_create(args: &[Value], gc: &mut Gc) -> Result<Vec<Value>, LuaError> {
-    let narr = opt_integer(args, 0).unwrap_or(0) as usize;
-    let nrec = opt_integer(args, 1).unwrap_or(0) as usize;
-    let t = Table::with_capacity(narr, nrec);
+    let narr = check_integer(args, 0, "create")?;
+    let nrec = opt_integer(args, 1).unwrap_or(0);
+    if (narr as u64) > i32::MAX as u64 {
+        return Err(LuaError::new(
+            "bad argument #1 to 'create' (out of range)",
+        ));
+    }
+    if (nrec as u64) > i32::MAX as u64 {
+        return Err(LuaError::new(
+            "bad argument #2 to 'create' (out of range)",
+        ));
+    }
+    if nrec > (1i64 << 30) {
+        return Err(LuaError::new("table overflow"));
+    }
+    let t = Table::with_capacity(narr as usize, nrec as usize);
     let r = gc.new_table(t);
     Ok(vec![Value::Object(r)])
 }
 
 pub fn table_functions() -> Vec<(&'static str, NativeFn)> {
     vec![
-        ("insert", table_insert as NativeFn),
         ("remove", table_remove),
         ("concat", table_concat),
-        ("move", table_move),
         ("pack", table_pack),
-        ("unpack", table_unpack),
         ("create", table_create),
     ]
 }
