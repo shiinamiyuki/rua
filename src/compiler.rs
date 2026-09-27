@@ -29,6 +29,7 @@ pub fn compile(block: &Block, source: Option<String>) -> Result<Proto, LuaError>
     fs.emit_abc(OpCode::VarArgPrep, 0, 0, 0, 0);
 
     compile_block(&mut fs, block)?;
+    fs.check_pending_gotos()?;
 
     // Ensure the function ends with RETURN
     let last_line = block.end_line;
@@ -63,6 +64,8 @@ struct PendingGoto {
     patch_pc: usize,
     /// Number of locals active at the goto site.
     num_locals: usize,
+    /// Block depth where the goto appears (0 = function body).
+    depth: usize,
     /// Line of the goto for error messages.
     line: u32,
 }
@@ -291,10 +294,13 @@ impl FuncState {
 
         // Break jumps are returned to the caller for patching.
 
-        // Check for unresolved gotos
-        let remaining_gotos: Vec<_> = self.pending_gotos.drain(scope.first_goto..).collect();
-        for goto in remaining_gotos {
-            // Try to resolve against labels
+        // Export unresolved gotos to the enclosing block, updating their
+        // local level (locals of this block are now out of scope). The
+        // recorded index can be stale after gotos were resolved elsewhere,
+        // so clamp it defensively.
+        let start = scope.first_goto.min(self.pending_gotos.len());
+        let remaining_gotos: Vec<_> = self.pending_gotos.drain(start..).collect();
+        for mut goto in remaining_gotos {
             let mut resolved = false;
             for label in &self.labels {
                 if label.name == goto.name {
@@ -303,15 +309,9 @@ impl FuncState {
                 }
             }
             if !resolved {
-                // Push back unresolved gotos if we're not at the outermost scope
-                if !self.scopes.is_empty() {
-                    self.pending_gotos.push(goto);
-                } else {
-                    return Err(LuaError::new(format!(
-                        "no visible label '{}' for goto at line {}",
-                        goto.name, goto.line
-                    )));
-                }
+                goto.num_locals = goto.num_locals.min(scope.first_local);
+                goto.depth = goto.depth.saturating_sub(1);
+                self.pending_gotos.push(goto);
             }
         }
 
@@ -340,6 +340,17 @@ impl FuncState {
         }
 
         Ok(scope.break_jumps)
+    }
+
+    /// Error if any goto could not be resolved within the function.
+    fn check_pending_gotos(&self) -> Result<(), LuaError> {
+        if let Some(goto) = self.pending_gotos.first() {
+            return Err(LuaError::new(format!(
+                "no visible label '{}' for goto at line {}",
+                goto.name, goto.line
+            )));
+        }
+        Ok(())
     }
 
     fn add_local(&mut self, name: String) -> Result<u8, LuaError> {
@@ -476,8 +487,30 @@ enum ExprResult {
 // ── Block & statement compilation ──────────────────────────────────
 
 fn compile_block(fs: &mut FuncState, block: &Block) -> Result<(), LuaError> {
-    for stat in &block.stmts {
-        compile_stat(fs, stat)?;
+    compile_block_with(fs, block, true)
+}
+
+/// `labels_can_be_last` is false for `repeat` bodies, where a label before
+/// `until` still has the body's locals in scope (reference Lua's
+/// `block_follow` without `until`).
+fn compile_block_with(
+    fs: &mut FuncState,
+    block: &Block,
+    labels_can_be_last: bool,
+) -> Result<(), LuaError> {
+    for (i, stat) in block.stmts.iter().enumerate() {
+        if let StatKind::Label(name) = &stat.node {
+            // Reference Lua skips following no-op statements (labels and
+            // empty statements) when deciding whether a label is last.
+            let is_last = labels_can_be_last
+                && block.ret.is_none()
+                && block.stmts[i + 1..]
+                    .iter()
+                    .all(|st| matches!(st.node, StatKind::Label(_) | StatKind::Empty));
+            compile_label(fs, name, is_last)?;
+        } else {
+            compile_stat(fs, stat)?;
+        }
     }
     if let Some(ret) = &block.ret {
         compile_return(fs, ret)?;
@@ -536,7 +569,7 @@ fn compile_stat(fs: &mut FuncState, stat: &Stat) -> Result<(), LuaError> {
             compile_goto(fs, label, line)?;
         }
         StatKind::Label(label) => {
-            compile_label(fs, label)?;
+            compile_label(fs, label, false)?;
         }
         StatKind::Break => {
             compile_break(fs, line)?;
@@ -557,7 +590,16 @@ fn compile_stat(fs: &mut FuncState, stat: &Stat) -> Result<(), LuaError> {
             compile_global_decl(fs, names, values, line)?;
         }
         StatKind::GlobalStar { .. } => {
-            // global * is a compile-time directive, no bytecode needed
+            // `global *` introduces a pseudo-variable "*" so that gotos
+            // cannot jump over it (reference Lua behavior).
+            let reg = fs.alloc_reg()?;
+            fs.locals.push(Local {
+                name: "*".to_string(),
+                reg,
+                start_pc: fs.proto.code.len() as u32,
+                is_const: true,
+                is_close: false,
+            });
         }
     }
     Ok(())
@@ -794,7 +836,7 @@ fn compile_repeat(
     let loop_start = fs.current_pc();
 
     fs.enter_scope(true);
-    compile_block(fs, body)?;
+    compile_block_with(fs, body, false)?;
 
     // Evaluate condition
     let base = fs.free_reg;
@@ -1060,23 +1102,30 @@ fn compile_goto(fs: &mut FuncState, label: &str, line: u32) -> Result<(), LuaErr
         name: label.to_string(),
         patch_pc: jmp_pc,
         num_locals: fs.locals.len(),
+        depth: fs.scopes.len(),
         line,
     });
     Ok(())
 }
 
-fn compile_label(fs: &mut FuncState, label: &str) -> Result<(), LuaError> {
+fn compile_label(fs: &mut FuncState, label: &str, is_last: bool) -> Result<(), LuaError> {
     let pc = fs.current_pc();
-    let num_locals = fs.locals.len();
+    // A label that is the last (non-op) statement of its block behaves as
+    // if the block's locals were already out of scope (reference Lua's
+    // `createlabel` with `last`).
+    let num_locals = if is_last {
+        fs.scopes.last().map(|s| s.first_local).unwrap_or(0)
+    } else {
+        fs.locals.len()
+    };
 
-    // Check for duplicate labels in current block
-    if let Some(scope) = fs.scopes.last() {
-        for lbl in &fs.labels[scope.first_label..] {
-            if lbl.name == label {
-                return Err(LuaError::new(format!(
-                    "label '{label}' already defined"
-                )));
-            }
+    // Labels cannot repeat while a previous definition is still visible
+    // (including enclosing blocks; finished scopes were truncated).
+    for lbl in &fs.labels {
+        if lbl.name == label {
+            return Err(LuaError::new(format!(
+                "label '{label}' already defined"
+            )));
         }
     }
 
@@ -1086,15 +1135,17 @@ fn compile_label(fs: &mut FuncState, label: &str) -> Result<(), LuaError> {
         num_locals,
     });
 
-    // Resolve pending gotos that target this label
+    // Resolve pending gotos that target this label. Only gotos from this
+    // block (or exported from nested blocks into it) may see the label.
+    let depth = fs.scopes.len();
     let mut i = 0;
     while i < fs.pending_gotos.len() {
-        if fs.pending_gotos[i].name == label {
+        if fs.pending_gotos[i].name == label && fs.pending_gotos[i].depth == depth {
             let goto = fs.pending_gotos.remove(i);
             // Validate: can't jump into a local's scope
             if goto.num_locals < num_locals {
                 return Err(LuaError::new(format!(
-                    "goto '{}' at line {} jumps into the scope of local '{}'",
+                    "goto '{}' at line {} jumps into the scope of '{}'",
                     label,
                     goto.line,
                     fs.locals[goto.num_locals].name,
@@ -1372,6 +1423,7 @@ fn compile_func_body_with_parent(
     }));
 
     compile_block(&mut child_fs, &body.body)?;
+    child_fs.check_pending_gotos()?;
 
     let last_line = body.end_line;
     child_fs.emit_abc(OpCode::Return, 0, 1, 0, last_line);
