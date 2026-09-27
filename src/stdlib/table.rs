@@ -264,7 +264,6 @@ pub fn table_create(args: &[Value], gc: &mut Gc) -> Result<Vec<Value>, LuaError>
 pub fn table_functions() -> Vec<(&'static str, NativeFn)> {
     vec![
         ("remove", table_remove),
-        ("concat", table_concat),
         ("pack", table_pack),
         ("create", table_create),
     ]

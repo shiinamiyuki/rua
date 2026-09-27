@@ -184,182 +184,589 @@ pub fn string_upper(args: &[Value], gc: &mut Gc) -> Result<Vec<Value>, LuaError>
     Ok(vec![Value::Object(r)])
 }
 
-// ── string.format ──────────────────────────────────────────────────
+// ── string.format (port of str_format from lstrlib.c) ─────────────
 
-pub fn string_format(args: &[Value], gc: &mut Gc) -> Result<Vec<Value>, LuaError> {
-    let fmt = check_string(args, 0, "format")?;
+#[derive(Clone, Copy)]
+pub struct FmtSpec {
+    minus: bool,
+    plus: bool,
+    space: bool,
+    hash: bool,
+    zero: bool,
+    width: usize,
+    prec: Option<usize>,
+    spec: u8,
+}
+
+/// Entry point mirroring `str_format`: `args` are the values *after* the
+/// format string; `tostring` resolves `%s` (honoring `__tostring`).
+pub fn format_values(
+    fmt: &[u8],
+    args: &[Value],
+    tostring: &mut dyn FnMut(Value) -> Result<Vec<u8>, LuaError>,
+) -> Result<Vec<u8>, LuaError> {
     let mut result = Vec::new();
-    let mut arg_idx = 1;
-    let mut i = 0;
+    let mut arg = 0usize;
+    let mut i = 0usize;
     while i < fmt.len() {
-        if fmt[i] == b'%' {
-            i += 1;
-            if i >= fmt.len() {
-                return Err(LuaError::new("invalid format string (ends with '%')"));
-            }
-            if fmt[i] == b'%' {
-                result.push(b'%');
-                i += 1;
-                continue;
-            }
-            // Parse flags
-            let spec_start = i - 1;
-            let mut flags = String::new();
-            while i < fmt.len() && b"-+ #0".contains(&fmt[i]) {
-                flags.push(fmt[i] as char);
-                i += 1;
-            }
-            // Parse width
-            let mut width = String::new();
-            while i < fmt.len() && fmt[i].is_ascii_digit() {
-                width.push(fmt[i] as char);
-                i += 1;
-            }
-            // Parse precision
-            let mut prec = String::new();
-            if i < fmt.len() && fmt[i] == b'.' {
-                i += 1;
-                while i < fmt.len() && fmt[i].is_ascii_digit() {
-                    prec.push(fmt[i] as char);
-                    i += 1;
-                }
-                if prec.is_empty() {
-                    prec = "0".to_string();
-                }
-            }
-            if i >= fmt.len() {
-                return Err(LuaError::new(format!(
-                    "invalid format string near '{}'",
-                    String::from_utf8_lossy(&fmt[spec_start..])
-                )));
-            }
-            let spec = fmt[i] as char;
-            i += 1;
-            let val = args.get(arg_idx).copied().unwrap_or(Value::Nil);
-            arg_idx += 1;
-
-            let w: usize = width.parse().unwrap_or(0);
-            let p: usize = prec.parse().unwrap_or(6);
-            let left = flags.contains('-');
-            let plus = flags.contains('+');
-            let space = flags.contains(' ');
-            let zero = flags.contains('0');
-
-            match spec {
-                'd' | 'i' => {
-                    let n = val_to_integer(val, "format")?;
-                    let sign = if n < 0 {
-                        "-"
-                    } else if plus {
-                        "+"
-                    } else if space {
-                        " "
-                    } else {
-                        ""
-                    };
-                    let abs = (n as i128).unsigned_abs();
-                    let digits = format!("{abs}");
-                    let s = format!("{sign}{digits}");
-                    pad_string(&mut result, &s, w, left, if zero { '0' } else { ' ' }, sign.len());
-                }
-                'u' => {
-                    let n = val_to_integer(val, "format")? as u64;
-                    let s = format!("{n}");
-                    pad_string(&mut result, &s, w, left, if zero { '0' } else { ' ' }, 0);
-                }
-                'f' => {
-                    let f = val_to_float(val, "format")?;
-                    let s = format!("{f:.prec$}", prec = p);
-                    if w > 0 {
-                        pad_string(&mut result, &s, w, left, if zero { '0' } else { ' ' }, if s.starts_with('-') { 1 } else { 0 });
-                    } else {
-                        result.extend_from_slice(s.as_bytes());
-                    }
-                }
-                'e' | 'E' => {
-                    let f = val_to_float(val, "format")?;
-                    let s = if spec == 'e' {
-                        format_exp_lower(f, p)
-                    } else {
-                        format_exp_upper(f, p)
-                    };
-                    pad_string(&mut result, &s, w, left, ' ', 0);
-                }
-                'g' | 'G' => {
-                    let f = val_to_float(val, "format")?;
-                    let s = format_g(f, p, spec == 'G');
-                    pad_string(&mut result, &s, w, left, ' ', 0);
-                }
-                'x' | 'X' => {
-                    let n = val_to_integer(val, "format")? as u64;
-                    let s = if spec == 'x' {
-                        if flags.contains('#') {
-                            format!("0x{n:x}")
-                        } else {
-                            format!("{n:x}")
-                        }
-                    } else if flags.contains('#') {
-                        format!("0X{n:X}")
-                    } else {
-                        format!("{n:X}")
-                    };
-                    pad_string(&mut result, &s, w, left, if zero { '0' } else { ' ' }, 0);
-                }
-                'o' => {
-                    let n = val_to_integer(val, "format")? as u64;
-                    let s = format!("{n:o}");
-                    pad_string(&mut result, &s, w, left, if zero { '0' } else { ' ' }, 0);
-                }
-                's' => {
-                    let s = val_to_string(val);
-                    let s = if !prec.is_empty() && s.len() > p {
-                        &s[..p]
-                    } else {
-                        &s
-                    };
-                    if w > 0 {
-                        pad_string(&mut result, s, w, left, ' ', 0);
-                    } else {
-                        result.extend_from_slice(s.as_bytes());
-                    }
-                }
-                'c' => {
-                    let n = val_to_integer(val, "format")?;
-                    result.push((n & 0xFF) as u8);
-                }
-                'q' => {
-                    let s = val_to_string(val);
-                    result.push(b'"');
-                    for &b in s.as_bytes() {
-                        match b {
-                            b'\\' => result.extend_from_slice(b"\\\\"),
-                            b'"' => result.extend_from_slice(b"\\\""),
-                            b'\n' => result.extend_from_slice(b"\\n"),
-                            b'\r' => result.extend_from_slice(b"\\r"),
-                            b'\0' => result.extend_from_slice(b"\\0"),
-                            b'\x1a' => result.extend_from_slice(b"\\26"),
-                            _ => result.push(b),
-                        }
-                    }
-                    result.push(b'"');
-                }
-                'p' => {
-                    let s = format!("{val}");
-                    result.extend_from_slice(s.as_bytes());
-                }
-                _ => {
-                    return Err(LuaError::new(format!(
-                        "invalid conversion specifier '%{spec}'"
-                    )));
-                }
-            }
-        } else {
+        if fmt[i] != b'%' {
             result.push(fmt[i]);
             i += 1;
+            continue;
+        }
+        i += 1;
+        if i < fmt.len() && fmt[i] == b'%' {
+            result.push(b'%');
+            i += 1;
+            continue;
+        }
+        let form_start = i - 1;
+        let mut sp = FmtSpec {
+            minus: false,
+            plus: false,
+            space: false,
+            hash: false,
+            zero: false,
+            width: 0,
+            prec: None,
+            spec: 0,
+        };
+        while i < fmt.len() {
+            match fmt[i] {
+                b'-' => sp.minus = true,
+                b'+' => sp.plus = true,
+                b' ' => sp.space = true,
+                b'#' => sp.hash = true,
+                b'0' => sp.zero = true,
+                _ => break,
+            }
+            i += 1;
+        }
+        let width_start = i;
+        while i < fmt.len() && fmt[i].is_ascii_digit() {
+            i += 1;
+        }
+        let width_digits = i - width_start;
+        let mut prec_digits = 0usize;
+        if i < fmt.len() && fmt[i] == b'.' {
+            i += 1;
+            let ps = i;
+            while i < fmt.len() && fmt[i].is_ascii_digit() {
+                i += 1;
+            }
+            prec_digits = i - ps;
+        }
+        // `getformat` rejects overly long specifications.
+        if i - form_start + 1 > 21 {
+            return Err(LuaError::new("invalid format (too long)"));
+        }
+        if i >= fmt.len() || !fmt[i].is_ascii_alphabetic() {
+            let end = i.min(fmt.len());
+            return Err(LuaError::new(format!(
+                "invalid conversion specification: '{}'",
+                String::from_utf8_lossy(&fmt[form_start..end])
+            )));
+        }
+        sp.spec = fmt[i];
+        i += 1;
+        let form = fmt[form_start..i].to_vec();
+        // `checkformat` reads at most two digits for width and precision.
+        if width_digits > 2 || prec_digits > 2 {
+            return Err(bad_spec(&form));
+        }
+        if width_digits > 0 {
+            sp.width = String::from_utf8_lossy(&fmt[width_start..width_start + width_digits])
+                .parse()
+                .unwrap_or(0);
+        }
+        if fmt[form_start..i].contains(&b'.') {
+            let dot = fmt[form_start..i].iter().position(|&b| b == b'.').unwrap() + form_start;
+            let pstr = &fmt[dot + 1..i - 1];
+            sp.prec = Some(
+                String::from_utf8_lossy(pstr).parse().unwrap_or(0),
+            );
+        }
+
+        // Fetch the argument (position includes the format string itself).
+        if arg >= args.len() {
+            return Err(LuaError::new(format!(
+                "bad argument #{} to 'format' (no value)",
+                arg + 2
+            )));
+        }
+        let val = args[arg];
+        let puc_arg = arg + 2;
+        arg += 1;
+
+        let text = match sp.spec {
+            b'c' => {
+                check_format(&sp, &form)?;
+                let n = val_to_integer(val, "format")?;
+                let b = (n as u64 & 0xFF) as u8;
+                pad_bytes(&[b], sp.width, sp.minus)
+            }
+            b'd' | b'i' | b'u' | b'o' | b'x' | b'X' => {
+                check_format(&sp, &form)?;
+                let n = val_to_integer(val, "format")?;
+                if matches!(sp.spec, b'u' | b'o' | b'x' | b'X') && sp.space {
+                    // ' ' is not a valid flag for unsigned conversions
+                    return Err(bad_spec(&form));
+                }
+                conv_integer(n, &sp)
+            }
+            b'a' | b'A' => {
+                check_format(&sp, &form)?;
+                let f = val_to_float(val, "format")?;
+                conv_float(f, &sp)
+            }
+            b'f' | b'e' | b'E' | b'g' | b'G' => {
+                check_format(&sp, &form)?;
+                let f = val_to_float(val, "format")?;
+                conv_float(f, &sp)
+            }
+            b'p' => {
+                check_format(&sp, &form)?;
+                let s = match val {
+                    Value::Object(r) => format!("0x{:x}", r.ptr_value()).into_bytes(),
+                    _ => b"(null)".to_vec(),
+                };
+                pad_bytes(&s, sp.width, sp.minus)
+            }
+            b'q' => {
+                if sp.minus
+                    || sp.plus
+                    || sp.space
+                    || sp.hash
+                    || sp.zero
+                    || sp.width > 0
+                    || sp.prec.is_some()
+                {
+                    return Err(LuaError::new("specifier '%q' cannot have modifiers"));
+                }
+                addliteral(val, puc_arg, tostring)?
+            }
+            b's' => {
+                let no_mods = !(sp.minus
+                    || sp.plus
+                    || sp.space
+                    || sp.hash
+                    || sp.zero
+                    || sp.width > 0
+                    || sp.prec.is_some());
+                let bytes = tostring(val)?;
+                if no_mods {
+                    bytes
+                } else {
+                    if bytes.contains(&0) {
+                        return Err(LuaError::new(format!(
+                            "bad argument #{} to 'format' (string contains zeros)",
+                            puc_arg
+                        )));
+                    }
+                    check_format(&sp, &form)?;
+                    if sp.prec.is_none() && bytes.len() >= 100 {
+                        bytes
+                    } else {
+                        let cut = match sp.prec {
+                            Some(p) if p < bytes.len() => &bytes[..p],
+                            _ => &bytes[..],
+                        };
+                        pad_bytes(cut, sp.width, sp.minus)
+                    }
+                }
+            }
+            _ => {
+                return Err(LuaError::new(format!(
+                    "invalid conversion '{}' to 'format'",
+                    String::from_utf8_lossy(&form)
+                )));
+            }
+        };
+        result.extend_from_slice(&text);
+    }
+    Ok(result)
+}
+
+fn bad_spec(form: &[u8]) -> LuaError {
+    LuaError::new(format!(
+        "invalid conversion specification: '{}'",
+        String::from_utf8_lossy(form)
+    ))
+}
+
+fn check_format(sp: &FmtSpec, form: &[u8]) -> Result<(), LuaError> {
+    let flags: &[u8] = match sp.spec {
+        b'd' | b'i' => b"-+0 ",
+        b'u' => b"-0",
+        b'o' | b'x' | b'X' => b"-#0",
+        b'c' | b'p' | b's' => b"-",
+        _ => b"-+#0 ",
+    };
+    let bad = (sp.minus && !flags.contains(&b'-'))
+        || (sp.plus && !flags.contains(&b'+'))
+        || (sp.space && !flags.contains(&b' '))
+        || (sp.hash && !flags.contains(&b'#'))
+        || (sp.zero && !flags.contains(&b'0'));
+    if bad {
+        return Err(bad_spec(form));
+    }
+    if sp.prec.is_some() && matches!(sp.spec, b'c' | b'p') {
+        return Err(bad_spec(form));
+    }
+    Ok(())
+}
+
+fn pad_bytes(bytes: &[u8], width: usize, left: bool) -> Vec<u8> {
+    let mut out = Vec::new();
+    if width > bytes.len() && left {
+        out.extend_from_slice(bytes);
+        out.extend(std::iter::repeat(b' ').take(width - bytes.len()));
+    } else if width > bytes.len() {
+        out.extend(std::iter::repeat(b' ').take(width - bytes.len()));
+        out.extend_from_slice(bytes);
+    } else {
+        out.extend_from_slice(bytes);
+    }
+    out
+}
+
+fn conv_integer(n: i64, sp: &FmtSpec) -> Vec<u8> {
+    let (neg, mag): (bool, u128) = match sp.spec {
+        b'd' | b'i' => (n < 0, (n as i128).unsigned_abs()),
+        _ => (false, n as u64 as u128),
+    };
+    let mut digits = match sp.spec {
+        b'o' => format!("{:o}", mag),
+        b'x' => format!("{:x}", mag),
+        b'X' => format!("{:X}", mag),
+        _ => mag.to_string(),
+    };
+    if let Some(p) = sp.prec {
+        if p == 0 && mag == 0 {
+            digits.clear();
+        } else if digits.len() < p {
+            let mut s = "0".repeat(p - digits.len());
+            s.push_str(&digits);
+            digits = s;
         }
     }
-    let r = gc.new_string(&result);
-    Ok(vec![Value::Object(r)])
+    let mut prefix: Vec<u8> = Vec::new();
+    if neg {
+        prefix.push(b'-');
+    } else if sp.plus {
+        prefix.push(b'+');
+    } else if sp.space {
+        prefix.push(b' ');
+    }
+    match sp.spec {
+        b'o' if sp.hash => {
+            if !digits.starts_with('0') {
+                digits.insert(0, '0');
+            }
+        }
+        b'x' if sp.hash && mag != 0 => prefix.extend_from_slice(b"0x"),
+        b'X' if sp.hash && mag != 0 => prefix.extend_from_slice(b"0X"),
+        _ => {}
+    }
+    let core = prefix.len() + digits.len();
+    let mut out = Vec::new();
+    if sp.width > core {
+        let pad = sp.width - core;
+        if sp.minus {
+            out.extend_from_slice(&prefix);
+            out.extend_from_slice(digits.as_bytes());
+            out.extend(std::iter::repeat(b' ').take(pad));
+        } else if sp.zero && sp.prec.is_none() {
+            out.extend_from_slice(&prefix);
+            out.extend(std::iter::repeat(b'0').take(pad));
+            out.extend_from_slice(digits.as_bytes());
+        } else {
+            out.extend(std::iter::repeat(b' ').take(pad));
+            out.extend_from_slice(&prefix);
+            out.extend_from_slice(digits.as_bytes());
+        }
+    } else {
+        out.extend_from_slice(&prefix);
+        out.extend_from_slice(digits.as_bytes());
+    }
+    out
+}
+
+fn strip_g_zeros(s: &mut String) {
+    if s.contains('.') {
+        while s.ends_with('0') {
+            s.pop();
+        }
+        if s.ends_with('.') {
+            s.pop();
+        }
+    }
+}
+
+fn float_special_sign(f: f64, sp: &FmtSpec) -> (Vec<u8>, String) {
+    let upper = matches!(sp.spec, b'E' | b'G' | b'A');
+    let name = if f.is_nan() {
+        if upper { "NAN" } else { "nan" }
+    } else if upper {
+        "INF"
+    } else {
+        "inf"
+    };
+    let neg = f.is_sign_negative();
+    let mut sign = Vec::new();
+    if neg {
+        sign.push(b'-');
+    } else if sp.plus {
+        sign.push(b'+');
+    } else if sp.space {
+        sign.push(b' ');
+    }
+    (sign, name.to_string())
+}
+
+fn conv_float(f: f64, sp: &FmtSpec) -> Vec<u8> {
+    if f.is_nan() || f.is_infinite() {
+        let (sign, body) = float_special_sign(f, sp);
+        return assemble_float(sign, body, sp);
+    }
+    let a = f.abs();
+    let mut sign = Vec::new();
+    if f.is_sign_negative() {
+        sign.push(b'-');
+    } else if sp.plus {
+        sign.push(b'+');
+    } else if sp.space {
+        sign.push(b' ');
+    }
+    let body = match sp.spec {
+        b'f' => {
+            let prec = sp.prec.unwrap_or(6);
+            let mut s = format!("{a:.prec$}");
+            if sp.hash && prec == 0 {
+                s.push('.');
+            }
+            s
+        }
+        b'e' | b'E' => float_e_body(a, sp.prec.unwrap_or(6), sp.hash, sp.spec == b'E'),
+        b'g' | b'G' => float_g_body(a, sp.prec.unwrap_or(6), sp.hash, sp.spec == b'G'),
+        b'a' | b'A' => float_a_body(a, sp.prec, sp.hash, sp.spec == b'A'),
+        _ => unreachable!(),
+    };
+    assemble_float(sign, body, sp)
+}
+
+fn assemble_float(sign: Vec<u8>, body: String, sp: &FmtSpec) -> Vec<u8> {
+    let core = sign.len() + body.len();
+    let mut out = Vec::new();
+    if sp.width > core {
+        let pad = sp.width - core;
+        if sp.minus {
+            out.extend_from_slice(&sign);
+            out.extend_from_slice(body.as_bytes());
+            out.extend(std::iter::repeat(b' ').take(pad));
+        } else if sp.zero {
+            out.extend_from_slice(&sign);
+            out.extend(std::iter::repeat(b'0').take(pad));
+            out.extend_from_slice(body.as_bytes());
+        } else {
+            out.extend(std::iter::repeat(b' ').take(pad));
+            out.extend_from_slice(&sign);
+            out.extend_from_slice(body.as_bytes());
+        }
+    } else {
+        out.extend_from_slice(&sign);
+        out.extend_from_slice(body.as_bytes());
+    }
+    out
+}
+
+fn float_e_body(a: f64, prec: usize, hash: bool, upper: bool) -> String {
+    let s = format!("{a:.prec$e}");
+    let (m, e) = s.split_once('e').unwrap();
+    let exp: i32 = e.parse().unwrap();
+    let mut m = m.to_string();
+    if hash && prec == 0 {
+        m.push('.');
+    }
+    format!(
+        "{m}{}{}{:02}",
+        if upper { 'E' } else { 'e' },
+        if exp < 0 { '-' } else { '+' },
+        exp.abs()
+    )
+}
+
+fn float_g_body(a: f64, prec: usize, hash: bool, upper: bool) -> String {
+    let p = if prec == 0 { 1 } else { prec };
+    let es = format!("{a:.p$e}", p = p - 1);
+    let (m0, e) = es.split_once('e').unwrap();
+    let x: i32 = e.parse().unwrap();
+    if x < -4 || x >= p as i32 {
+        let mut m = m0.to_string();
+        if !hash {
+            strip_g_zeros(&mut m);
+        }
+        format!(
+            "{m}{}{}{:02}",
+            if upper { 'E' } else { 'e' },
+            if x < 0 { '-' } else { '+' },
+            x.abs()
+        )
+    } else {
+        let dec = (p as i32 - 1 - x).max(0) as usize;
+        let mut s = format!("{a:.dec$}");
+        if !hash {
+            strip_g_zeros(&mut s);
+        }
+        s
+    }
+}
+
+fn float_a_body(a: f64, prec: Option<usize>, hash: bool, upper: bool) -> String {
+    let xp = if upper { 'P' } else { 'p' };
+    let pfx = if upper { "0X" } else { "0x" };
+    if a == 0.0 {
+        let p = prec.unwrap_or(0);
+        let mut frac = "0".repeat(p);
+        if p == 0 && hash {
+            frac.push('.');
+        }
+        return format!("{pfx}0{frac}{xp}+0");
+    }
+    let bits = a.to_bits();
+    let mut exp = ((bits >> 52) & 0x7FF) as i32;
+    let mut mant = bits & 0xF_FFFF_FFFF_FFFF;
+    if exp == 0 {
+        exp = -1022;
+        while mant & (1 << 52) == 0 {
+            mant <<= 1;
+            exp -= 1;
+        }
+    } else {
+        exp -= 1023;
+        mant |= 1 << 52;
+    }
+    let frac_bits = mant & 0xF_FFFF_FFFF_FFFF;
+    let p = prec.unwrap_or(13);
+    let (mut lead, mut exp, mut digits) = if p >= 13 {
+        let mut s = if upper {
+            format!("{frac_bits:013X}")
+        } else {
+            format!("{frac_bits:013x}")
+        };
+        for _ in 13..p {
+            s.push('0');
+        }
+        (1u64, exp, s)
+    } else {
+        let shift = 4 * (13 - p) as u32;
+        let kept = if shift >= 64 { 0 } else { frac_bits >> shift };
+        let dropped = if shift == 0 || shift >= 64 {
+            0
+        } else {
+            frac_bits & ((1u64 << shift) - 1)
+        };
+        let half = if shift == 0 { 0 } else { 1u64 << (shift - 1) };
+        let mut d = kept;
+        let mut l = 1u64;
+        let mut e = exp;
+        if dropped > half || (dropped == half && (kept & 1) == 1) {
+            d += 1;
+            if d == (1u64 << (4 * p as u32)) {
+                d = 0;
+                l += 1;
+                if l == 2 {
+                    l = 1;
+                    e += 1;
+                }
+            }
+        }
+        let digits = if upper {
+            format!("{d:0width$X}", width = p)
+        } else {
+            format!("{d:0width$x}", width = p)
+        };
+        (l, e, digits)
+    };
+    if prec.is_none() {
+        while digits.ends_with('0') {
+            digits.pop();
+        }
+    }
+    let dot = if digits.is_empty() {
+        if prec.is_some() || hash { "." } else { "" }
+    } else {
+        "."
+    };
+    let _ = &mut lead;
+    format!(
+        "{pfx}{lead}{dot}{digits}{xp}{}{}",
+        if exp < 0 { '-' } else { '+' },
+        exp.abs()
+    )
+}
+
+fn addliteral(
+    val: Value,
+    _argn: usize,
+    tostring: &mut dyn FnMut(Value) -> Result<Vec<u8>, LuaError>,
+) -> Result<Vec<u8>, LuaError> {
+    match val {
+        Value::Object(r) if r.as_object().as_string().is_some() => {
+            let s = r.as_object().as_string().unwrap();
+            let mut out = Vec::new();
+            addquoted(&mut out, s.as_bytes());
+            Ok(out)
+        }
+        Value::Integer(n) => {
+            if n == i64::MIN {
+                Ok(b"0x8000000000000000".to_vec())
+            } else {
+                Ok(n.to_string().into_bytes())
+            }
+        }
+        Value::Float(f) => {
+            if f == f64::INFINITY {
+                Ok(b"1e9999".to_vec())
+            } else if f == f64::NEG_INFINITY {
+                Ok(b"-1e9999".to_vec())
+            } else if f.is_nan() {
+                Ok(b"(0/0)".to_vec())
+            } else {
+                let neg = f.is_sign_negative();
+                let mut s = float_a_body(f.abs(), None, false, false);
+                if neg {
+                    s.insert(0, '-');
+                }
+                Ok(s.into_bytes())
+            }
+        }
+        Value::Nil => tostring(val),
+        Value::Boolean(_) => tostring(val),
+        _ => Err(LuaError::new(format!(
+            "bad argument #{} to 'format' (value has no literal form)",
+            _argn
+        ))),
+    }
+}
+
+fn addquoted(out: &mut Vec<u8>, s: &[u8]) {
+    out.push(b'"');
+    for (idx, &b) in s.iter().enumerate() {
+        if b == b'"' || b == b'\\' || b == b'\n' {
+            out.push(b'\\');
+            out.push(b);
+        } else if b < 0x20 || b == 0x7F {
+            if idx + 1 < s.len() && s[idx + 1].is_ascii_digit() {
+                out.extend_from_slice(format!("\\{:03}", b).as_bytes());
+            } else {
+                out.extend_from_slice(format!("\\{}", b).as_bytes());
+            }
+        } else {
+            out.push(b);
+        }
+    }
+    out.push(b'"');
 }
 
 fn val_to_integer(v: Value, fname: &str) -> Result<i64, LuaError> {
@@ -389,74 +796,6 @@ fn val_to_float(v: Value, fname: &str) -> Result<f64, LuaError> {
                 .map_err(|_| LuaError::new(format!("bad argument to '{fname}'")))
         }
         _ => Err(LuaError::new(format!("bad argument to '{fname}'"))),
-    }
-}
-
-fn val_to_string(v: Value) -> String {
-    format!("{v}")
-}
-
-fn pad_string(out: &mut Vec<u8>, s: &str, width: usize, left: bool, pad: char, sign_len: usize) {
-    if s.len() >= width {
-        out.extend_from_slice(s.as_bytes());
-        return;
-    }
-    let padding = width - s.len();
-    if left {
-        out.extend_from_slice(s.as_bytes());
-        for _ in 0..padding {
-            out.push(pad as u8);
-        }
-    } else if pad == '0' && sign_len > 0 {
-        // Put sign before zeros
-        out.extend_from_slice(&s.as_bytes()[..sign_len]);
-        for _ in 0..padding {
-            out.push(b'0');
-        }
-        out.extend_from_slice(&s.as_bytes()[sign_len..]);
-    } else {
-        for _ in 0..padding {
-            out.push(pad as u8);
-        }
-        out.extend_from_slice(s.as_bytes());
-    }
-}
-
-fn format_exp_lower(f: f64, prec: usize) -> String {
-    format!("{f:.prec$e}", prec = prec)
-}
-
-fn format_exp_upper(f: f64, prec: usize) -> String {
-    format!("{f:.prec$E}", prec = prec)
-}
-
-fn format_g(f: f64, prec: usize, upper: bool) -> String {
-    let p = if prec == 0 { 1 } else { prec };
-    // Try both representations
-    if f == 0.0 {
-        return "0".to_string();
-    }
-    let exp = if f != 0.0 { f.abs().log10().floor() as i32 } else { 0 };
-    if exp < -4 || exp >= p as i32 {
-        // Use exponential notation
-        let s = if upper {
-            format!("{f:.prec$E}", prec = p.saturating_sub(1))
-        } else {
-            format!("{f:.prec$e}", prec = p.saturating_sub(1))
-        };
-        s
-    } else {
-        // Use fixed notation, trim trailing zeros
-        let digits = (p as i32 - exp - 1).max(0) as usize;
-        let s = format!("{f:.digits$}");
-        // Trim trailing zeros after decimal point
-        if s.contains('.') {
-            let s = s.trim_end_matches('0');
-            let s = s.trim_end_matches('.');
-            s.to_string()
-        } else {
-            s
-        }
     }
 }
 
@@ -1066,7 +1405,6 @@ pub fn string_functions() -> Vec<(&'static str, NativeFn)> {
         ("char", string_char),
         ("dump", string_dump),
         ("find", string_find),
-        ("format", string_format),
         ("gmatch", string_gmatch),
         ("len", string_len),
         ("lower", string_lower),

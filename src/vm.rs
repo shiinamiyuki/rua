@@ -36,6 +36,7 @@ const MM_INDEX: &[u8] = b"__index";
 const MM_NEWINDEX: &[u8] = b"__newindex";
 const MM_CALL: &[u8] = b"__call";
 const MM_TOSTRING: &[u8] = b"__tostring";
+const MM_NAME: &[u8] = b"__name";
 const MM_METATABLE: &[u8] = b"__metatable";
 const MM_CLOSE: &[u8] = b"__close";
 const MM_GC: &[u8] = b"__gc";
@@ -166,6 +167,9 @@ pub struct Vm {
     print_ref: Option<GcRef>,
     /// `string.gsub` is VM-special so function replacements can be called.
     gsub_ref: Option<GcRef>,
+
+    /// `string.format` is VM-special so `%s` can call `__tostring`.
+    format_ref: Option<GcRef>,
     /// The registry table returned by `debug.getregistry`.
     registry: Option<GcRef>,
     /// Active debug hook state (per-thread; swapped on coroutine switch).
@@ -210,6 +214,9 @@ pub struct Vm {
 
     /// `table.insert` (VM-special: honors `__index`/`__newindex`/`__len`).
     insert_ref: Option<GcRef>,
+
+    /// `table.concat` (VM-special: honors `__index`/`__len`).
+    concat_ref: Option<GcRef>,
 
     // ── Warning system (`warn`) ────────────────────────────────────
     warn_ref: Option<GcRef>,
@@ -261,6 +268,7 @@ impl Vm {
             tostring_ref: None,
             print_ref: None,
             gsub_ref: None,
+            format_ref: None,
             registry: None,
             hook_func: None,
             hook_mask: 0,
@@ -284,6 +292,7 @@ impl Vm {
             move_ref: None,
             unpack_ref: None,
             insert_ref: None,
+            concat_ref: None,
             warn_ref: None,
             warn_on: false,
             warn_store: false,
@@ -363,7 +372,7 @@ impl Vm {
             MM_ADD, MM_SUB, MM_MUL, MM_DIV, MM_MOD, MM_POW, MM_UNM, MM_IDIV,
             MM_BAND, MM_BOR, MM_BXOR, MM_BNOT, MM_SHL, MM_SHR,
             MM_CONCAT, MM_LEN, MM_EQ, MM_LT, MM_LE,
-            MM_INDEX, MM_NEWINDEX, MM_CALL, MM_TOSTRING, MM_METATABLE,
+            MM_INDEX, MM_NEWINDEX, MM_CALL, MM_TOSTRING, MM_METATABLE, MM_NAME,
             MM_CLOSE, MM_GC, MM_MODE,
         ] {
             self.gc.new_string(name);
@@ -476,6 +485,14 @@ impl Vm {
             let key = self.gc.new_string(b"gsub");
             string_table.raw_set(Value::Object(key), Value::Object(gsub_gc));
         }
+        // string.format is VM-special: `%s` honors __tostring.
+        {
+            let fmt_closure = Closure::new_native("format", |_, _| Ok(vec![]));
+            let fmt_gc = self.gc.new_closure(fmt_closure);
+            self.format_ref = Some(fmt_gc);
+            let key = self.gc.new_string(b"format");
+            string_table.raw_set(Value::Object(key), Value::Object(fmt_gc));
+        }
         let string_ref = self.gc.new_table(string_table);
         let string_key = self.gc.new_string(b"string");
         env.raw_set(Value::Object(string_key), Value::Object(string_ref));
@@ -524,6 +541,14 @@ impl Vm {
             self.insert_ref = Some(insert_gc);
             let key = self.gc.new_string(b"insert");
             table_table.raw_set(Value::Object(key), Value::Object(insert_gc));
+        }
+        // table.concat is VM-special: it honors __index/__len.
+        {
+            let concat_closure = Closure::new_native("concat", |_, _| Ok(vec![]));
+            let concat_gc = self.gc.new_closure(concat_closure);
+            self.concat_ref = Some(concat_gc);
+            let key = self.gc.new_string(b"concat");
+            table_table.raw_set(Value::Object(key), Value::Object(concat_gc));
         }
         let table_ref = self.gc.new_table(table_table);
         let table_key = self.gc.new_string(b"table");
@@ -1671,7 +1696,9 @@ impl Vm {
                         result.extend_from_slice(format!("{n}").as_bytes());
                     }
                     Value::Float(n) => {
-                        result.extend_from_slice(format!("{n}").as_bytes());
+                        result.extend_from_slice(
+                            crate::value::lua_float_to_string(n).as_bytes(),
+                        );
                     }
                     _ => unreachable!(),
                 }
@@ -1968,11 +1995,13 @@ impl Vm {
             self.move_ref,
             self.unpack_ref,
             self.insert_ref,
+            self.concat_ref,
             self.warn_ref,
             self.registry,
             self.tostring_ref,
             self.print_ref,
             self.gsub_ref,
+            self.format_ref,
         ] {
             if let Some(r) = r {
                 roots.push(r);
@@ -2187,17 +2216,31 @@ impl Vm {
                 }
 
                 OpCode::GetTabUp => {
+                    let k = if c == 255 {
+                        let next = self.frames[fi].proto.code[self.frames[fi].pc];
+                        self.frames[fi].pc += 1;
+                        decode_ax(next) as usize
+                    } else {
+                        c as usize
+                    };
                     let upvalues = &self.frames[fi].upvalues;
                     let table_val = self.get_upvalue_val(upvalues, b);
-                    let key = self.frames[fi].proto.constants[c].to_value(&mut self.gc);
+                    let key = self.frames[fi].proto.constants[k].to_value(&mut self.gc);
                     let result = self.table_get(table_val, key)?;
                     self.set_reg(base, a, result);
                 }
 
                 OpCode::SetTabUp => {
+                    let k = if b == 255 {
+                        let next = self.frames[fi].proto.code[self.frames[fi].pc];
+                        self.frames[fi].pc += 1;
+                        decode_ax(next) as usize
+                    } else {
+                        b as usize
+                    };
                     let upvalues = &self.frames[fi].upvalues;
                     let table_val = self.get_upvalue_val(upvalues, a);
-                    let key = self.frames[fi].proto.constants[b].to_value(&mut self.gc);
+                    let key = self.frames[fi].proto.constants[k].to_value(&mut self.gc);
                     let val = self.reg(base, c);
                     self.table_set(table_val, key, val)?;
                 }
@@ -2559,10 +2602,12 @@ impl Vm {
                         else if self.move_ref == Some(r) { 31 }
                         else if self.unpack_ref == Some(r) { 32 }
                         else if self.insert_ref == Some(r) { 33 }
+                        else if self.concat_ref == Some(r) { 35 }
                         else if self.debug_getregistry_ref == Some(r) { 25 }
                         else if self.tostring_ref == Some(r) { 28 }
                         else if self.print_ref == Some(r) { 29 }
                         else if self.gsub_ref == Some(r) { 30 }
+                        else if self.format_ref == Some(r) { 34 }
                         else if self.debug_sethook_ref == Some(r) { 26 }
                         else if self.debug_gethook_ref == Some(r) { 27 }
                         else { 0 }
@@ -2745,6 +2790,12 @@ impl Vm {
                             self.handle_table_insert(&args)?;
                             self.place_results(base + a, num_results, &[]);
                         }
+                        35 => { // table.concat
+                            let args: Vec<Value> = (0..num_args)
+                                .map(|i| self.stack[base + a + 1 + i])
+                                .collect();
+                            self.handle_table_concat(&args, base + a, num_results)?;
+                        }
                         25 => { // debug.getregistry
                             self.handle_debug_getregistry(base + a, num_results);
                         }
@@ -2766,6 +2817,12 @@ impl Vm {
                                 .map(|i| self.stack[base + a + 1 + i])
                                 .collect();
                             self.handle_gsub(&args, base + a, num_results)?;
+                        }
+                        34 => { // string.format
+                            let args: Vec<Value> = (0..num_args)
+                                .map(|i| self.stack[base + a + 1 + i])
+                                .collect();
+                            self.handle_string_format(&args, base + a, num_results)?;
                         }
                         26 => { // debug.sethook
                             let args: Vec<Value> = (0..num_args)
@@ -3127,6 +3184,9 @@ impl Vm {
                     self.place_results(result_base, num_results, &[]);
                     return Ok(());
                 }
+                if self.concat_ref == Some(gc_ref) {
+                    return self.handle_table_concat(&actual_args, result_base, num_results);
+                }
                 if self.debug_getregistry_ref == Some(gc_ref) {
                     self.handle_debug_getregistry(result_base, num_results);
                     return Ok(());
@@ -3141,6 +3201,9 @@ impl Vm {
                 }
                 if self.gsub_ref == Some(gc_ref) {
                     return self.handle_gsub(&actual_args, result_base, num_results);
+                }
+                if self.format_ref == Some(gc_ref) {
+                    return self.handle_string_format(&actual_args, result_base, num_results);
                 }
                 if self.debug_sethook_ref == Some(gc_ref) {
                     self.handle_debug_sethook(&actual_args)?;
@@ -3445,6 +3508,34 @@ impl Vm {
     }
 
     /// Handle coroutine.resume(co [, val1, ...]).
+
+    /// True when the closure is implemented natively (cannot yield).
+    fn is_native_closure_ref(r: GcRef) -> bool {
+        matches!(
+            r.as_object().as_closure(),
+            Some(Closure::Native(_)) | Some(Closure::NativeDyn(_)) | Some(Closure::WrapIterator(_))
+        )
+    }
+
+    /// Run a coroutine whose body is a native function: call it directly
+    /// and leave the coroutine dead. Returns Ok(results) or the error.
+    fn run_native_coroutine_body(
+        &mut self,
+        co_ref: GcRef,
+        args: &[Value],
+    ) -> Result<Vec<Value>, LuaError> {
+        let body = co_ref
+            .as_object_mut()
+            .as_coroutine_mut()
+            .unwrap()
+            .body
+            .take()
+            .unwrap();
+        let outcome = self.call_value(Value::Object(body), args);
+        co_ref.as_object_mut().as_coroutine_mut().unwrap().status = CoroutineStatus::Dead;
+        outcome
+    }
+
     fn handle_resume(
         &mut self,
         args: &[Value],
@@ -3482,6 +3573,37 @@ impl Vm {
         }
 
         let is_first_resume = co_ref.as_object().as_coroutine().unwrap().body.is_some();
+
+        // A native body cannot yield: run it in place of the resumer.
+        if is_first_resume {
+            let body_ref = *co_ref
+                .as_object()
+                .as_coroutine()
+                .unwrap()
+                .body
+                .as_ref()
+                .unwrap();
+            if Self::is_native_closure_ref(body_ref) {
+                match self.run_native_coroutine_body(co_ref, &resume_args) {
+                    Ok(vals) => {
+                        let mut results = Vec::with_capacity(1 + vals.len());
+                        results.push(Value::Boolean(true));
+                        results.extend(vals);
+                        self.place_results(result_base, num_results, &results);
+                    }
+                    Err(e) => {
+                        let e = self.position_error(e);
+                        let err_val = e.to_value(&mut self.gc);
+                        self.place_results(
+                            result_base,
+                            num_results,
+                            &[Value::Boolean(false), err_val],
+                        );
+                    }
+                }
+                return Ok(());
+            }
+        }
 
         // Save the current (resumer) thread state
         let resumer_ref = self.running_thread();
@@ -3647,6 +3769,27 @@ impl Vm {
         }
 
         let is_first = co_ref.as_object().as_coroutine().unwrap().body.is_some();
+        if is_first {
+            let body_ref = *co_ref
+                .as_object()
+                .as_coroutine()
+                .unwrap()
+                .body
+                .as_ref()
+                .unwrap();
+            if Self::is_native_closure_ref(body_ref) {
+                match self.run_native_coroutine_body(co_ref, args) {
+                    Ok(vals) => {
+                        self.place_results(result_base, num_results, &vals);
+                    }
+                    Err(e) => {
+                        let e = self.position_error(e);
+                        return Err(e);
+                    }
+                }
+                return Ok(());
+            }
+        }
         let resumer_ref = self.running_thread();
         self.save_vm_to_thread(resumer_ref);
         resumer_ref.as_object_mut().as_coroutine_mut().unwrap().status = CoroutineStatus::Normal;
@@ -4134,11 +4277,54 @@ impl Vm {
                     return Ok(r.as_object().as_string().unwrap().as_bytes().to_vec());
                 }
                 Value::Integer(n) => return Ok(format!("{n}").into_bytes()),
-                Value::Float(f) => return Ok(format!("{f}").into_bytes()),
+                Value::Float(f) => {
+                    return Ok(crate::value::lua_float_to_string(f).into_bytes())
+                }
                 _ => return Err(LuaError::new("'__tostring' must return a string")),
             }
         }
+        // Strings are returned verbatim (raw bytes, may not be UTF-8).
+        if let Value::Object(r) = v {
+            if let Some(s) = r.as_object().as_string() {
+                return Ok(s.as_bytes().to_vec());
+            }
+        }
+        // `__name` fallback (only for collectable values that have no
+        // dedicated string representation).
+        if let Value::Object(r) = v {
+            if r.as_object().as_string().is_none() {
+                if let Some(Value::Object(nr)) = self.get_metamethod(v, MM_NAME) {
+                    if let Some(ns) = nr.as_object().as_string() {
+                        let mut out = ns.as_bytes().to_vec();
+                        out.extend_from_slice(
+                            format!(": 0x{:x}", r.ptr_value()).as_bytes(),
+                        );
+                        return Ok(out);
+                    }
+                }
+            }
+        }
         Ok(format!("{v}").into_bytes())
+    }
+
+    /// Handle `string.format(fmt, ...)` (VM-special so `%s` can call
+    /// `__tostring`).
+    fn handle_string_format(
+        &mut self,
+        args: &[Value],
+        result_base: usize,
+        num_results: i32,
+    ) -> Result<(), LuaError> {
+        let fmt = crate::stdlib::string::check_string(args, 0, "format")?;
+        let out = {
+            let vals: &[Value] = if args.len() > 1 { &args[1..] } else { &[] };
+            crate::stdlib::string::format_values(&fmt, vals, &mut |v| {
+                self.value_to_string(v)
+            })?
+        };
+        let s = self.gc.new_string(&out);
+        self.place_results(result_base, num_results, &[Value::Object(s)]);
+        Ok(())
     }
 
     /// Handle `tostring(v)`.
@@ -4358,6 +4544,17 @@ impl Vm {
     /// Check that a `table.move` argument is a table or can behave like
     /// one (has a metatable with the required metamethod).
     fn check_move_table(&self, v: Value, argn: usize, write: bool) -> Result<(), LuaError> {
+        self.check_tab_arg(v, argn, write, "move")
+    }
+
+    /// Check that an argument is a table (or has the needed metamethods).
+    fn check_tab_arg(
+        &self,
+        v: Value,
+        argn: usize,
+        write: bool,
+        fname: &str,
+    ) -> Result<(), LuaError> {
         if matches!(v, Value::Object(r) if r.as_object().as_table().is_some()) {
             return Ok(());
         }
@@ -4366,10 +4563,93 @@ impl Vm {
             return Ok(());
         }
         Err(LuaError::new(format!(
-            "bad argument #{} to 'move' (table expected, got {})",
+            "bad argument #{} to '{}' (table expected, got {})",
             argn,
+            fname,
             v.type_name()
         )))
+    }
+
+    /// Handle `table.concat(list [, sep [, i [, j]]])`, mirroring
+    /// `tconcat` from `ltablib.c`.
+    fn handle_table_concat(
+        &mut self,
+        args: &[Value],
+        result_base: usize,
+        num_results: i32,
+    ) -> Result<(), LuaError> {
+        fn check_int(args: &[Value], idx: usize) -> Result<i64, LuaError> {
+            let v = args.get(idx).copied().unwrap_or(Value::Nil);
+            match v {
+                Value::Integer(i) => Ok(i),
+                Value::Float(f) if f.floor() == f => Ok(f as i64),
+                _ => Err(LuaError::new(format!(
+                    "bad argument #{} to 'concat' (number expected, got {})",
+                    idx + 1,
+                    v.type_name()
+                ))),
+            }
+        }
+        let t = args.first().copied().unwrap_or(Value::Nil);
+        self.check_tab_arg(t, 1, false, "concat")?;
+        let mut last = self.lua_len_integer(t)?;
+        let sep: Vec<u8> = match args.get(1) {
+            None | Some(Value::Nil) => Vec::new(),
+            Some(Value::Object(r)) if r.as_object().as_string().is_some() => {
+                r.as_object().as_string().unwrap().as_bytes().to_vec()
+            }
+            Some(Value::Integer(n)) => n.to_string().into_bytes(),
+            Some(Value::Float(f)) => crate::value::lua_float_to_string(*f).into_bytes(),
+            Some(v) => {
+                return Err(LuaError::new(format!(
+                    "bad argument #2 to 'concat' (string expected, got {})",
+                    v.type_name()
+                )));
+            }
+        };
+        let i = if args.len() > 2 { check_int(args, 2)? } else { 1 };
+        if args.len() > 3 {
+            last = check_int(args, 3)?;
+        }
+        let mut out: Vec<u8> = Vec::new();
+        let mut k = i;
+        while k < last {
+            let v = self.table_get(t, Value::Integer(k))?;
+            Self::append_concat_field(&mut out, v, k)?;
+            out.extend_from_slice(&sep);
+            k += 1;
+        }
+        if k == last {
+            let v = self.table_get(t, Value::Integer(k))?;
+            Self::append_concat_field(&mut out, v, k)?;
+        }
+        let s = self.gc.new_string(&out);
+        self.place_results(result_base, num_results, &[Value::Object(s)]);
+        Ok(())
+    }
+
+    fn append_concat_field(
+        out: &mut Vec<u8>,
+        v: Value,
+        idx: i64,
+    ) -> Result<(), LuaError> {
+        match v {
+            Value::Object(r) if r.as_object().as_string().is_some() => {
+                out.extend_from_slice(r.as_object().as_string().unwrap().as_bytes());
+            }
+            Value::Integer(n) => out.extend_from_slice(n.to_string().as_bytes()),
+            Value::Float(f) => {
+                out.extend_from_slice(crate::value::lua_float_to_string(f).as_bytes())
+            }
+            _ => {
+                return Err(LuaError::new(format!(
+                    "invalid value ({}) at index {} in table for 'concat'",
+                    v.type_name(),
+                    idx
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// Handle `string.gsub(s, pat, repl [, n])`. Supports string, table and

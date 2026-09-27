@@ -184,26 +184,63 @@ impl PartialEq for Value {
     }
 }
 
+/// Format a float the way reference Lua does: try `%.15g`, and if reading
+/// the result back loses precision, redo it with `%.17g`; finally, add
+/// ".0" to values that look like integers.
+pub fn lua_float_to_string(n: f64) -> String {
+    if n.is_nan() {
+        return if n.is_sign_negative() { "-nan" } else { "nan" }.to_string();
+    }
+    if n.is_infinite() {
+        return if n < 0.0 { "-inf" } else { "inf" }.to_string();
+    }
+    let mut s = format_g(n, 15);
+    if s.parse::<f64>() != Ok(n) {
+        s = format_g(n, 17);
+    }
+    if s.bytes().all(|b| b == b'-' || b.is_ascii_digit()) {
+        s.push_str(".0");
+    }
+    s
+}
+
+/// A minimal emulation of C's `printf("%.*g", prec, n)`.
+fn format_g(n: f64, prec: usize) -> String {
+    let p = if prec == 0 { 1 } else { prec };
+    let e_str = format!("{:.*e}", p - 1, n);
+    let (mant, exp_str) = e_str.split_once('e').unwrap();
+    let exp: i32 = exp_str.parse().unwrap();
+    if exp >= -4 && (exp as i64) < p as i64 {
+        let dec = (p as i64 - 1 - exp as i64).max(0) as usize;
+        let mut s = format!("{n:.dec$}");
+        strip_g_zeros(&mut s);
+        s
+    } else {
+        let mut m = mant.to_string();
+        strip_g_zeros(&mut m);
+        let sign = if exp < 0 { '-' } else { '+' };
+        format!("{m}e{sign}{:02}", exp.abs())
+    }
+}
+
+fn strip_g_zeros(s: &mut String) {
+    if s.contains('.') {
+        while s.ends_with('0') {
+            s.pop();
+        }
+        if s.ends_with('.') {
+            s.pop();
+        }
+    }
+}
+
 impl fmt::Display for Value {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Value::Nil => write!(f, "nil"),
             Value::Boolean(b) => write!(f, "{b}"),
             Value::Integer(n) => write!(f, "{n}"),
-            Value::Float(n) => {
-                // Ensure floats display with a decimal point to distinguish from integers
-                let s = format!("{n}");
-                if s.contains('.')
-                    || s.contains('e')
-                    || s.contains('E')
-                    || s.contains("nan")
-                    || s.contains("inf")
-                {
-                    write!(f, "{s}")
-                } else {
-                    write!(f, "{s}.0")
-                }
-            }
+            Value::Float(n) => write!(f, "{}", lua_float_to_string(*n)),
             Value::Object(gc_ref) => {
                 let obj = gc_ref.as_object();
                 match &obj.kind {

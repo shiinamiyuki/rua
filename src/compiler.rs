@@ -168,6 +168,28 @@ impl FuncState {
         self.emit(encode_abx(op, a, bx), line)
     }
 
+    /// Emit `GETTABUP`, escaping to an EXTRAARG for constant indices that
+    /// do not fit in the 8-bit C field.
+    fn emit_gettabup(&mut self, dest: u8, env: u8, k: u16, line: u32) -> usize {
+        if (k as usize) < 255 {
+            self.emit_abc(OpCode::GetTabUp, dest, env, k as u8, line)
+        } else {
+            self.emit_abc(OpCode::GetTabUp, dest, env, 255, line);
+            self.emit(encode_extraarg(k as u32), line)
+        }
+    }
+
+    /// Emit `SETTABUP`, escaping to an EXTRAARG for constant indices that
+    /// do not fit in the 8-bit B field.
+    fn emit_settabup(&mut self, env: u8, k: u16, src: u8, line: u32) -> usize {
+        if (k as usize) < 255 {
+            self.emit_abc(OpCode::SetTabUp, env, k as u8, src, line)
+        } else {
+            self.emit_abc(OpCode::SetTabUp, env, 255, src, line);
+            self.emit(encode_extraarg(k as u32), line)
+        }
+    }
+
     fn emit_asbx(&mut self, op: OpCode, a: u8, sbx: i16, line: u32) -> usize {
         self.emit(encode_asbx(op, a, sbx), line)
     }
@@ -624,7 +646,7 @@ fn compile_assign(
             local_reg: Option<u8>,
             upval: Option<u8>,
             env: Option<u8>,
-            key: Option<u8>,
+            key: Option<u16>,
         },
         Table {
             tab: u8,
@@ -684,7 +706,7 @@ fn compile_assign(
                         local_reg: None,
                         upval: None,
                         env: Some(env),
-                        key: Some(k as u8),
+                        key: Some(k),
                     });
                 }
             }
@@ -747,13 +769,7 @@ fn compile_assign(
                 } else if let Some(uv) = upval {
                     fs.emit_abc(OpCode::SetUpval, src_reg, *uv, 0, line);
                 } else {
-                    fs.emit_abc(
-                        OpCode::SetTabUp,
-                        env.unwrap(),
-                        key.unwrap(),
-                        src_reg,
-                        line,
-                    );
+                    fs.emit_settabup(env.unwrap(), key.unwrap(), src_reg, line);
                 }
             }
             Prepared::Table { tab, key } => {
@@ -1294,7 +1310,7 @@ fn compile_func_def(
         } else {
             let env = env_upvalue(fs)?;
             let k = fs.string_constant(func_name.as_bytes());
-            fs.emit_abc(OpCode::SetTabUp, env, k as u8, dest, line);
+            fs.emit_settabup(env, k, dest, line);
         }
     } else {
         // Dotted name: function a.b.c() ... end
@@ -1308,7 +1324,7 @@ fn compile_func_def(
         } else {
             let env = env_upvalue(fs)?;
             let k = fs.string_constant(first_name.as_bytes());
-            fs.emit_abc(OpCode::GetTabUp, tab_reg, env, k as u8, line);
+            fs.emit_gettabup(tab_reg, env, k, line);
         }
 
         // Chain through intermediate .path elements (the last segment, or
@@ -1373,7 +1389,7 @@ fn compile_global_func_def(
     // Assign to _ENV[name]
     let env = env_upvalue(fs)?;
     let k = fs.string_constant(name.as_bytes());
-    fs.emit_abc(OpCode::SetTabUp, env, k as u8, dest, line);
+    fs.emit_settabup(env, k, dest, line);
 
     fs.free_reg_to(base);
     Ok(())
@@ -1839,12 +1855,12 @@ fn compile_global_decl(
         if i < nvalues || (nvalues > 0 && nnames > nvalues) {
             // Has a value
             let src_reg = base + i as u8;
-            fs.emit_abc(OpCode::SetTabUp, env, k as u8, src_reg, line);
+            fs.emit_settabup(env, k, src_reg, line);
         } else {
             // No value — assign nil
             let tmp = fs.alloc_reg()?;
             fs.emit_abc(OpCode::LoadNil, tmp, 0, 0, line);
-            fs.emit_abc(OpCode::SetTabUp, env, k as u8, tmp, line);
+            fs.emit_settabup(env, k, tmp, line);
             fs.free_reg_to(tmp);
         }
     }
@@ -2032,7 +2048,7 @@ fn compile_var_read(
                 // Global: _ENV[name]
                 let env = env_upvalue(fs)?;
                 let k = fs.string_constant(name.as_bytes());
-                fs.emit_abc(OpCode::GetTabUp, dest, env, k as u8, line);
+                fs.emit_gettabup(dest, env, k, line);
             }
         }
         Var::Index { table, key } => {
