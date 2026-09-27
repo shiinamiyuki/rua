@@ -31,13 +31,17 @@
 use crate::bytecode::{Constant, LocalVarInfo, Proto, UpvalueDesc};
 
 /// Chunk signature. The first byte (0x1b) marks the chunk as binary.
-pub const SIGNATURE: [u8; 4] = [0x1b, b'R', b'u', b'a'];
+pub const SIGNATURE: [u8; 4] = [0x1b, b'L', b'u', b'a'];
 
-/// Format version for Rua binary chunks.
-pub const VERSION: u8 = 1;
+/// Header format version (matches reference Lua 5.5's 0x55).
+pub const VERSION: u8 = 0x55;
 
-const INT_CHECK: u64 = 0x5678;
-const NUM_CHECK: f64 = 370.5;
+const FORMAT: u8 = 0;
+const LUAC_DATA: [u8; 6] = [0x19, 0x93, b'\r', b'\n', 0x1a, b'\n'];
+const INT_CHECK: i32 = -0x5678;
+const INST_CHECK: u32 = 0x1234_5678;
+const INTEGER_CHECK: i64 = -0x5678;
+const NUM_CHECK: f64 = -370.5;
 
 // ── Writing ────────────────────────────────────────────────────────
 
@@ -83,6 +87,9 @@ impl Writer {
         for &inst in &p.code {
             self.u32(inst);
         }
+
+        self.u32(p.stack_top_at.len() as u32);
+        self.buf.extend_from_slice(&p.stack_top_at);
 
         self.u32(p.constants.len() as u32);
         for k in &p.constants {
@@ -145,6 +152,8 @@ impl Writer {
         self.u8(p.num_params);
         self.u8(p.is_vararg as u8);
         self.u8(p.max_stack_size);
+        self.u32(p.line_defined);
+        self.u32(p.last_line_defined);
         match p.vararg_name_reg {
             Some(r) => {
                 self.u8(1);
@@ -160,15 +169,20 @@ impl Writer {
 /// omitted.
 pub fn dump(proto: &Proto, strip: bool) -> Vec<u8> {
     let mut w = Writer::new();
+    // Header compatible with the reference Lua 5.5 layout (the payload
+    // after the header is Rua-specific).
     w.buf.extend_from_slice(&SIGNATURE);
     w.u8(VERSION);
-    w.u8(if cfg!(target_endian = "little") { 1 } else { 0 });
+    w.u8(FORMAT);
+    w.buf.extend_from_slice(&LUAC_DATA);
     w.u8(std::mem::size_of::<i32>() as u8);
-    w.u8(std::mem::size_of::<usize>() as u8);
+    w.buf.extend_from_slice(&INT_CHECK.to_le_bytes());
+    w.u8(std::mem::size_of::<u32>() as u8);
+    w.buf.extend_from_slice(&INST_CHECK.to_le_bytes());
     w.u8(std::mem::size_of::<i64>() as u8);
+    w.buf.extend_from_slice(&INTEGER_CHECK.to_le_bytes());
     w.u8(std::mem::size_of::<f64>() as u8);
-    w.u64(INT_CHECK);
-    w.u64(NUM_CHECK.to_bits());
+    w.buf.extend_from_slice(&NUM_CHECK.to_le_bytes());
     w.proto(proto, strip);
     w.buf
 }
@@ -246,6 +260,9 @@ impl<'a> Reader<'a> {
             proto.code.push(self.u32()?);
         }
 
+        let ntop = self.count(1)?;
+        proto.stack_top_at.extend_from_slice(self.take(ntop)?);
+
         let nconst = self.count(1)?;
         proto.constants.reserve(nconst);
         for _ in 0..nconst {
@@ -306,6 +323,8 @@ impl<'a> Reader<'a> {
         proto.num_params = self.u8()?;
         proto.is_vararg = self.u8()? != 0;
         proto.max_stack_size = self.u8()?;
+        proto.line_defined = self.u32()?;
+        proto.last_line_defined = self.u32()?;
         proto.vararg_name_reg = match self.u8()? {
             0 => None,
             _ => Some(self.u8()?),
@@ -326,19 +345,40 @@ pub fn undump(data: &[u8], _chunkname: &str) -> ChunkResult<Proto> {
     if r.u8()? != VERSION {
         return Err("version mismatch".to_string());
     }
-    let endian_little = r.u8()?;
-    if endian_little != (cfg!(target_endian = "little") as u8) {
-        return Err("endianness mismatch".to_string());
+    if r.u8()? != FORMAT {
+        return Err("format mismatch".to_string());
     }
-    if r.u8()? != std::mem::size_of::<i32>() as u8
-        || r.u8()? != std::mem::size_of::<usize>() as u8
-        || r.u8()? != std::mem::size_of::<i64>() as u8
-        || r.u8()? != std::mem::size_of::<f64>() as u8
+    if r.take(LUAC_DATA.len())? != LUAC_DATA {
+        return Err("corrupted chunk".to_string());
+    }
+    if r.u8()? != std::mem::size_of::<i32>() as u8 {
+        return Err("int size mismatch".to_string());
+    }
+    let b = r.take(4)?;
+    if i32::from_le_bytes([b[0], b[1], b[2], b[3]]) != INT_CHECK {
+        return Err("int format mismatch".to_string());
+    }
+    if r.u8()? != std::mem::size_of::<u32>() as u8 {
+        return Err("instruction size mismatch".to_string());
+    }
+    let b = r.take(4)?;
+    if u32::from_le_bytes([b[0], b[1], b[2], b[3]]) != INST_CHECK {
+        return Err("instruction format mismatch".to_string());
+    }
+    if r.u8()? != std::mem::size_of::<i64>() as u8 {
+        return Err("Lua integer size mismatch".to_string());
+    }
+    let b = r.take(8)?;
+    if i64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]) != INTEGER_CHECK
     {
-        return Err("size mismatch".to_string());
+        return Err("Lua integer format mismatch".to_string());
     }
-    if r.u64()? != INT_CHECK || r.u64()? != NUM_CHECK.to_bits() {
-        return Err("numeric format mismatch".to_string());
+    if r.u8()? != std::mem::size_of::<f64>() as u8 {
+        return Err("Lua number size mismatch".to_string());
+    }
+    let b = r.take(8)?;
+    if f64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]) != NUM_CHECK {
+        return Err("Lua number format mismatch".to_string());
     }
 
     let proto = r.proto()?;

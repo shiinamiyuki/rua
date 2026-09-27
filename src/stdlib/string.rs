@@ -972,8 +972,37 @@ pub fn string_gsub(args: &[Value], gc: &mut Gc) -> Result<Vec<Value>, LuaError> 
                     let repl_str = r.as_object().as_string().unwrap().as_bytes().to_vec();
                     apply_string_replacement(&mut result, &repl_str, &ms, &s, si, end);
                 }
+                Value::Object(r) if r.as_object().as_table().is_some() => {
+                    // Table replacement: first capture (or whole match) is the key.
+                    let key = match ms.captures.first() {
+                        Some(cap) => capture_to_value(cap, &s, gc),
+                        None => {
+                            let whole = gc.new_string(&s[si..end]);
+                            Value::Object(whole)
+                        }
+                    };
+                    let val = r.as_object().as_table().unwrap().raw_get(&key);
+                    if val.is_truthy() {
+                        let bytes = match val {
+                            Value::Object(sr) if sr.as_object().as_string().is_some() => {
+                                sr.as_object().as_string().unwrap().as_bytes().to_vec()
+                            }
+                            Value::Integer(n) => format!("{n}").into_bytes(),
+                            Value::Float(n) => format!("{n}").into_bytes(),
+                            other => {
+                                return Err(LuaError::new(format!(
+                                    "invalid replacement value (a {})",
+                                    other.type_name()
+                                )))
+                            }
+                        };
+                        result.extend_from_slice(&bytes);
+                    } else {
+                        result.extend_from_slice(&s[si..end]);
+                    }
+                }
                 _ => {
-                    // For non-string replacements, use whole match
+                    // For other replacements, use the whole match
                     let whole = &s[si..end];
                     result.extend_from_slice(whole);
                 }

@@ -191,6 +191,9 @@ pub struct Gc {
     pub gc_threshold: usize,
     /// Shared metatable for file handles (userdata).
     pub file_metatable: Option<GcRef>,
+    /// Current default input/output file handles for the io library.
+    pub io_input: Option<GcRef>,
+    pub io_output: Option<GcRef>,
     /// Tables and userdata that have a `__gc` finalizer registered. Each
     /// object appears at most once. Removed when its finalizer runs (so it
     /// runs at most once) or when the object is swept.
@@ -210,6 +213,8 @@ impl Gc {
             bytes_allocated: 0,
             gc_threshold: GC_INITIAL_THRESHOLD,
             file_metatable: None,
+            io_input: None,
+            io_output: None,
             finalizable: Vec::new(),
             pending_finalizers: Vec::new(),
         }
@@ -688,6 +693,10 @@ impl Gc {
                     if let Value::Object(r) = guard.handler {
                         self.mark_object(r, gray);
                     }
+                }
+                // Trace the debug hook function
+                if let Some(hook) = co.hook_func {
+                    self.mark_object(hook, gray);
                 }
             }
             GcObjectKind::Userdata(ud) => {

@@ -32,6 +32,10 @@ pub fn lua_coroutine_create(args: &[Value], gc: &mut Gc) -> Result<Vec<Value>, L
         yield_num_results: 0,
         is_main: false,
         pcall_guards: Vec::new(),
+        hook_func: None,
+        hook_mask: 0,
+        hook_count: 0,
+        hook_counter: 0,
     };
     let thread_ref = gc.new_thread(co);
     Ok(vec![Value::Object(thread_ref)])
@@ -76,6 +80,10 @@ pub fn lua_coroutine_wrap(args: &[Value], gc: &mut Gc) -> Result<Vec<Value>, Lua
         yield_num_results: 0,
         is_main: false,
         pcall_guards: Vec::new(),
+        hook_func: None,
+        hook_mask: 0,
+        hook_count: 0,
+        hook_counter: 0,
     };
     let thread_ref = gc.new_thread(co);
     let wrap_closure = Closure::WrapIterator(thread_ref);

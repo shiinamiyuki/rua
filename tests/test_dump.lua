@@ -69,14 +69,15 @@ end
 local lo = assert(load(string.dump(outer), nil, "b"))
 check("nested", lo()(1), 101)
 
--- upvalues: fresh instances; first bound to env
+-- upvalues: fresh instances; first bound to env (whatever its name)
 local ux, uy = 1, 2
 local function multi() return ux, uy, _ENV end
-local lm = assert(load(string.dump(multi), nil, "b", {tag = 1}))
-local a1, b1, env = lm()
-check("upvalue 1 fresh", a1, nil)
-check("upvalue 2 fresh", b1, nil)
-check("first upvalue env", env.tag, 1)
+local env = {tag = 1}
+local lm = assert(load(string.dump(multi), nil, "b", env))
+local a1, b1, env2 = lm()
+check("first upvalue bound to env", a1, env)
+check("second upvalue fresh", b1, nil)
+check("_ENV upvalue fresh", env2, nil)
 
 -- recursion through _ENV
 function fact(n)

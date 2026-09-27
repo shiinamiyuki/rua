@@ -252,6 +252,14 @@ pub struct Proto {
     pub max_stack_size: u8,
     /// Register for named vararg table (`... name` syntax), if any.
     pub vararg_name_reg: Option<u8>,
+    /// Compiler-computed high-water register for each instruction: the
+    /// frame's temporary registers `[0, stack_top_at[pc])` are live when the
+    /// instruction starts. Used by the GC to root in-flight temporaries.
+    pub stack_top_at: Vec<u8>,
+    /// Line where the function body is defined (0 for the main chunk).
+    pub line_defined: u32,
+    /// Line of the function's closing `end` (last line for the main chunk).
+    pub last_line_defined: u32,
 }
 
 /// A constant in the constant pool.
@@ -330,6 +338,9 @@ impl Proto {
             is_vararg: false,
             max_stack_size: 2, // minimum usable stack
             vararg_name_reg: None,
+            stack_top_at: Vec::new(),
+            line_defined: 0,
+            last_line_defined: 0,
         }
     }
 

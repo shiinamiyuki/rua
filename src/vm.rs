@@ -41,6 +41,12 @@ const MM_CLOSE: &[u8] = b"__close";
 const MM_GC: &[u8] = b"__gc";
 const MM_MODE: &[u8] = b"__mode";
 
+// Debug hook mask bits.
+const HOOK_CALL: u8 = 1;
+const HOOK_RET: u8 = 2;
+const HOOK_LINE: u8 = 4;
+const HOOK_COUNT: u8 = 8;
+
 // ── Call frame ─────────────────────────────────────────────────────
 
 /// A single activation record on the call stack.
@@ -66,6 +72,20 @@ pub(crate) struct CallFrame {
     /// above the active-locals region (notably Call and Concat). The GC
     /// uses this to include in-flight temps as roots.
     pub(crate) runtime_top: usize,
+    /// True when this frame is a debug hook invocation.
+    pub(crate) is_hook: bool,
+    /// True when this frame was entered by a tail call.
+    pub(crate) is_tailcall: bool,
+    /// Number of extra arguments added by __call chains.
+    pub(crate) extraargs: u8,
+    /// Last line seen for line hooks (0 = none yet).
+    pub(crate) hook_last_line: u32,
+    /// Last executed pc, for the backward-jump line-hook rule.
+    pub(crate) hook_last_pc: usize,
+    /// True once a line event has fired for this frame.
+    pub(crate) hook_seen_event: bool,
+    /// Cached: does this proto have at most one distinct nonzero line?
+    pub(crate) hook_single_line: Option<bool>,
 }
 
 /// Saved pcall/xpcall context for yield-across-pcall support.
@@ -141,6 +161,26 @@ pub struct Vm {
     debug_setupvalue_ref: Option<GcRef>,
     debug_upvalueid_ref: Option<GcRef>,
     debug_upvaluejoin_ref: Option<GcRef>,
+    debug_getregistry_ref: Option<GcRef>,
+    debug_sethook_ref: Option<GcRef>,
+    debug_gethook_ref: Option<GcRef>,
+    /// The registry table returned by `debug.getregistry`.
+    registry: Option<GcRef>,
+    /// Active debug hook state (per-thread; swapped on coroutine switch).
+    hook_func: Option<GcRef>,
+    hook_mask: u8,
+    hook_count: i64,
+    hook_counter: i64,
+    /// Re-entrancy guard: true while a hook function runs.
+    in_hook: bool,
+    /// True while the first frame pushed belongs to a hook invocation.
+    calling_hook: bool,
+    /// True when the next Lua frame pushed is a tail call.
+    next_call_is_tail: bool,
+    /// Extra args already counted for the next pushed frame (tail calls).
+    next_call_extraargs: u8,
+    /// Nesting depth of protected calls (pcall/xpcall) for C-stack limits.
+    protected_depth: usize,
 
     // ── Package / require support ──────────────────────────────────
     require_ref: Option<GcRef>,
@@ -156,6 +196,17 @@ pub struct Vm {
 
     /// `collectgarbage` (VM-special, runs a real mark-and-sweep).
     collectgarbage_ref: Option<GcRef>,
+
+    /// `table.sort` (VM-special: needs to call the comparator).
+    sort_ref: Option<GcRef>,
+
+    // ── Warning system (`warn`) ────────────────────────────────────
+    warn_ref: Option<GcRef>,
+    /// Warnings are printed when true (`@on`).
+    warn_on: bool,
+    /// While true (`@store`), messages are accumulated in the `_WARN`
+    /// global instead of being printed.
+    warn_store: bool,
 
     /// Re-entrancy guard for `__gc` finalizer dispatch.
     in_finalizer: bool,
@@ -194,6 +245,19 @@ impl Vm {
             debug_setupvalue_ref: None,
             debug_upvalueid_ref: None,
             debug_upvaluejoin_ref: None,
+            debug_getregistry_ref: None,
+            debug_sethook_ref: None,
+            debug_gethook_ref: None,
+            registry: None,
+            hook_func: None,
+            hook_mask: 0,
+            hook_count: 0,
+            hook_counter: 0,
+            in_hook: false,
+            calling_hook: false,
+            next_call_is_tail: false,
+            next_call_extraargs: 0,
+            protected_depth: 0,
             require_ref: None,
             load_ref: None,
             loadfile_ref: None,
@@ -203,6 +267,10 @@ impl Vm {
             package_ref: None,
             globals_ref: None,
             collectgarbage_ref: None,
+            sort_ref: None,
+            warn_ref: None,
+            warn_on: false,
+            warn_store: false,
             in_finalizer: false,
         }
     }
@@ -225,9 +293,18 @@ impl Vm {
             yield_num_results: 0,
             is_main: true,
             pcall_guards: Vec::new(),
+            hook_func: None,
+            hook_mask: 0,
+            hook_count: 0,
+            hook_counter: 0,
         };
         let main_thread_ref = self.gc.new_thread(main_coro);
         self.main_thread = Some(main_thread_ref);
+        if let Some(reg) = self.registry {
+            if let Some(t) = reg.as_object_mut().as_table_mut() {
+                t.raw_set(Value::Integer(1), Value::Object(main_thread_ref));
+            }
+        }
 
         // Create the main closure from the proto
         let proto_rc = Rc::new(proto);
@@ -249,6 +326,13 @@ impl Vm {
             num_results: 0,
             varargs: Vec::new(),
             runtime_top: base,
+            is_hook: false,
+            is_tailcall: false,
+            extraargs: 0,
+            hook_last_line: 0,
+            hook_last_pc: 0,
+            hook_seen_event: false,
+            hook_single_line: None,
         });
 
         self.execute()
@@ -295,6 +379,15 @@ impl Vm {
             env.raw_set(Value::Object(key), Value::Object(cg_gc));
         }
 
+        // warn is special: it manages warning state and the `_WARN` store.
+        {
+            let warn_closure = Closure::new_native("warn", |_, _| Ok(vec![]));
+            let warn_gc = self.gc.new_closure(warn_closure);
+            self.warn_ref = Some(warn_gc);
+            let key = self.gc.new_string(b"warn");
+            env.raw_set(Value::Object(key), Value::Object(warn_gc));
+        }
+
         // pcall is special: handled by the VM directly, not as a regular native call.
         {
             let pcall_closure = Closure::new_native("pcall", |_, _| Ok(vec![]));
@@ -315,6 +408,7 @@ impl Vm {
 
         self.register_native(&mut env, "ipairs", crate::stdlib::lua_ipairs);
         self.register_native(&mut env, "pairs", crate::stdlib::lua_pairs);
+        self.register_native(&mut env, "next", crate::stdlib::lua_next);
         self.register_native(&mut env, "rawget", crate::stdlib::lua_rawget);
         self.register_native(&mut env, "rawset", crate::stdlib::lua_rawset);
         self.register_native(&mut env, "rawlen", crate::stdlib::lua_rawlen);
@@ -361,6 +455,15 @@ impl Vm {
         let mut table_table = Table::new();
         for (name, func) in crate::stdlib::table::table_functions() {
             self.register_native(&mut table_table, name, func);
+        }
+        // table.sort is VM-special: it needs to call Lua comparators and
+        // respect __lt/__len during the sort.
+        {
+            let sort_closure = Closure::new_native("sort", |_, _| Ok(vec![]));
+            let sort_gc = self.gc.new_closure(sort_closure);
+            self.sort_ref = Some(sort_gc);
+            let key = self.gc.new_string(b"sort");
+            table_table.raw_set(Value::Object(key), Value::Object(sort_gc));
         }
         let table_ref = self.gc.new_table(table_table);
         let table_key = self.gc.new_string(b"table");
@@ -430,7 +533,8 @@ impl Vm {
         }
         let file_method_ref = self.gc.new_table(file_method_table);
 
-        // Build file metatable: { __index = method_table, __close = close_fn }
+        // Build file metatable: { __index = method_table, __close = close_fn,
+        //                         __name = "FILE*" }
         let mut file_mt = Table::new();
         let index_key2 = self.gc.new_string(MM_INDEX);
         file_mt.raw_set(Value::Object(index_key2), Value::Object(file_method_ref));
@@ -438,6 +542,9 @@ impl Vm {
         let close_closure = Closure::new_native("file.__close", crate::stdlib::io::file_gc_close);
         let close_ref = self.gc.new_closure(close_closure);
         file_mt.raw_set(Value::Object(close_key), Value::Object(close_ref));
+        let name_key = self.gc.new_string(b"__name");
+        let file_name = self.gc.new_string(b"FILE*");
+        file_mt.raw_set(Value::Object(name_key), Value::Object(file_name));
         let file_mt_ref = self.gc.new_table(file_mt);
         self.gc.file_metatable = Some(file_mt_ref);
 
@@ -559,6 +666,27 @@ impl Vm {
             let k = self.gc.new_string(b"upvaluejoin");
             debug_table.raw_set(Value::Object(k), Value::Object(r));
         }
+        {
+            let c = Closure::new_native("getregistry", |_, _| Ok(vec![]));
+            let r = self.gc.new_closure(c);
+            self.debug_getregistry_ref = Some(r);
+            let k = self.gc.new_string(b"getregistry");
+            debug_table.raw_set(Value::Object(k), Value::Object(r));
+        }
+        {
+            let c = Closure::new_native("sethook", |_, _| Ok(vec![]));
+            let r = self.gc.new_closure(c);
+            self.debug_sethook_ref = Some(r);
+            let k = self.gc.new_string(b"sethook");
+            debug_table.raw_set(Value::Object(k), Value::Object(r));
+        }
+        {
+            let c = Closure::new_native("gethook", |_, _| Ok(vec![]));
+            let r = self.gc.new_closure(c);
+            self.debug_gethook_ref = Some(r);
+            let k = self.gc.new_string(b"gethook");
+            debug_table.raw_set(Value::Object(k), Value::Object(r));
+        }
 
         let debug_ref = self.gc.new_table(debug_table);
         let debug_key = self.gc.new_string(b"debug");
@@ -654,8 +782,56 @@ impl Vm {
             env.raw_set(Value::Object(k), Value::Object(r));
         }
 
+        // Standard libraries are pre-registered as loaded (`require "debug"`
+        // etc. must return the library table without searching files).
+        for name in [
+            b"_G".as_slice(),
+            b"coroutine",
+            b"debug",
+            b"io",
+            b"math",
+            b"os",
+            b"package",
+            b"string",
+            b"table",
+            b"utf8",
+        ] {
+            let k = self.gc.new_string(name);
+            let v = env.raw_get(&Value::Object(k));
+            if !v.is_nil() {
+                loaded_ref
+                    .as_object_mut()
+                    .as_table_mut()
+                    .unwrap()
+                    .raw_set(Value::Object(k), v);
+            }
+        }
+
         let env_ref = self.gc.new_table(env);
         self.globals_ref = Some(env_ref);
+
+        // Registry table (`debug.getregistry`): [1] = main thread (set in
+        // `execute_main`), [2] = global environment. It also holds the
+        // weak-keyed `_HOOKKEY` table (per-thread hooks).
+        {
+            let mut reg = Table::new();
+            reg.raw_set(Value::Integer(2), Value::Object(env_ref));
+
+            let mut hookkey = Table::new();
+            let mut hook_mt = Table::new();
+            let mode_key = self.gc.new_string(b"__mode");
+            let mode_val = self.gc.new_string(b"k");
+            hook_mt.raw_set(Value::Object(mode_key), Value::Object(mode_val));
+            let hook_mt_ref = self.gc.new_table(hook_mt);
+            hookkey.metatable = Some(hook_mt_ref);
+            hookkey.set_weak_mode(Some(b"k"));
+            let hookkey_ref = self.gc.new_table(hookkey);
+            let hk_key = self.gc.new_string(b"_HOOKKEY");
+            reg.raw_set(Value::Object(hk_key), Value::Object(hookkey_ref));
+
+            let reg_ref = self.gc.new_table(reg);
+            self.registry = Some(reg_ref);
+        }
 
         // Expose globals as `_G` (bound to the same table).
         {
@@ -701,35 +877,72 @@ impl Vm {
 
     fn get_upvalue_val(&self, upvalues: &[UpvalueRef], idx: usize) -> Value {
         match *upvalues[idx].borrow() {
-            Upvalue::Open(stack_idx) => self.stack[stack_idx],
+            Upvalue::Open(loc) => self.read_open_upvalue(loc),
             Upvalue::Closed(val) => val,
+        }
+    }
+
+    /// Read the value of an open upvalue, from whichever thread owns it.
+    fn read_open_upvalue(&self, loc: UpvalueLoc) -> Value {
+        if loc.thread == self.current_thread {
+            self.stack.get(loc.idx).copied().unwrap_or(Value::Nil)
+        } else {
+            match loc.thread.or(self.main_thread) {
+                Some(t) => t
+                    .as_object()
+                    .as_coroutine()
+                    .and_then(|co| co.stack.get(loc.idx).copied())
+                    .unwrap_or(Value::Nil),
+                None => Value::Nil,
+            }
+        }
+    }
+
+    /// Write the value of an open upvalue, into whichever thread owns it.
+    fn write_open_upvalue(&mut self, loc: UpvalueLoc, val: Value) {
+        if loc.thread == self.current_thread {
+            if loc.idx < self.stack.len() {
+                self.stack[loc.idx] = val;
+            }
+        } else if let Some(t) = loc.thread.or(self.main_thread) {
+            let mut t = t;
+            if let Some(co) = t.as_object_mut().as_coroutine_mut() {
+                if loc.idx < co.stack.len() {
+                    co.stack[loc.idx] = val;
+                }
+            }
         }
     }
 
     /// Find an existing open upvalue for the given stack index, or create one.
     fn find_or_create_upvalue(&mut self, stack_idx: usize) -> UpvalueRef {
+        let loc = UpvalueLoc {
+            thread: self.current_thread,
+            idx: stack_idx,
+        };
         for uv in &self.open_upvalues {
-            if let Upvalue::Open(idx) = *uv.borrow() {
-                if idx == stack_idx {
+            if let Upvalue::Open(existing) = *uv.borrow() {
+                if existing.thread == loc.thread && existing.idx == stack_idx {
                     return Rc::clone(uv);
                 }
             }
         }
-        let uv = Rc::new(RefCell::new(Upvalue::Open(stack_idx)));
+        let uv = Rc::new(RefCell::new(Upvalue::Open(loc)));
         self.open_upvalues.push(Rc::clone(&uv));
         uv
     }
 
-    /// Close all open upvalues with stack index >= `from`.
+    /// Close all open upvalues of the active thread with index >= `from`.
     fn close_upvalues(&mut self, from: usize) {
+        let current = self.current_thread;
         for uv in &self.open_upvalues {
             let should_close = match *uv.borrow() {
-                Upvalue::Open(idx) => idx >= from,
+                Upvalue::Open(loc) => loc.thread == current && loc.idx >= from,
                 Upvalue::Closed(_) => false,
             };
             if should_close {
                 let val = match *uv.borrow() {
-                    Upvalue::Open(idx) => self.stack[idx],
+                    Upvalue::Open(loc) => self.stack[loc.idx],
                     _ => unreachable!(),
                 };
                 *uv.borrow_mut() = Upvalue::Closed(val);
@@ -824,6 +1037,8 @@ impl Vm {
 
     /// Call a value (function or callable via __call) with args and return results.
     /// This handles synchronous native calls and pushes frames for Lua calls.
+    /// Going through `do_call` guarantees VM-special functions (pcall,
+    /// table.sort, require, ...) behave the same when passed as values.
     fn call_value(&mut self, func: Value, args: &[Value]) -> Result<Vec<Value>, LuaError> {
         // Find a place on the stack for this call
         let call_base = self.find_call_base();
@@ -834,59 +1049,12 @@ impl Vm {
         }
 
         let saved_depth = self.frames.len();
-
-        // Handle __call chain
-        let mut actual_func = func;
-        let mut call_limit = 16;
-        loop {
-            match actual_func {
-                Value::Object(r) if r.as_object().as_closure().is_some() => break,
-                _ => {
-                    call_limit -= 1;
-                    if call_limit == 0 {
-                        return Err(LuaError::new("'__call' chain too long"));
-                    }
-                    match self.get_metamethod(actual_func, MM_CALL) {
-                        Some(mm) => {
-                            // Shift args: prepend the original value
-                            let mut new_args = Vec::with_capacity(args.len() + 1);
-                            new_args.push(actual_func);
-                            new_args.extend_from_slice(args);
-                            // Recurse with the metamethod as the function
-                            return self.call_value(mm, &new_args);
-                        }
-                        None => {
-                            return Err(LuaError::new(format!(
-                                "attempt to call a {} value",
-                                actual_func.type_name()
-                            )));
-                        }
-                    }
-                }
-            }
-        }
-
-        let gc_ref = actual_func.as_gc_ref().unwrap();
-        let is_native = matches!(gc_ref.as_object().as_closure().unwrap(), Closure::Native(_) | Closure::NativeDyn(_) | Closure::WrapIterator(_));
-
-        if is_native {
-            // Intercept error() to add source:line annotation
-            if self.error_ref == Some(gc_ref) {
-                self.handle_error(args)?;
-                unreachable!();
-            }
-            return match gc_ref.as_object().as_closure().unwrap() {
-                Closure::Native(nc) => (nc.func)(args, &mut self.gc),
-                Closure::NativeDyn(nc) => (nc.func)(args, &mut self.gc),
-                Closure::WrapIterator(_) | Closure::Lua(_) => unreachable!(),
-            };
-        }
-
-        // Lua function: push frame and execute
         let result_base = call_base;
-        self.do_call(actual_func, call_base, args, result_base, -1)?;
+
+        self.do_call(func, call_base, args, result_base, -1)?;
 
         if self.frames.len() > saved_depth {
+            // Lua function: run the pushed frame to completion.
             self.execute_to_depth(saved_depth)?;
         }
 
@@ -1580,6 +1748,15 @@ impl Vm {
         if let Some(r) = self.gc.file_metatable {
             roots.push(r);
         }
+        if let Some(r) = self.gc.io_input {
+            roots.push(r);
+        }
+        if let Some(r) = self.gc.io_output {
+            roots.push(r);
+        }
+        if let Some(r) = self.hook_func {
+            roots.push(r);
+        }
 
         // Root: package / require special refs, package table, and globals.
         for r in [
@@ -1592,6 +1769,9 @@ impl Vm {
             self.package_ref,
             self.globals_ref,
             self.collectgarbage_ref,
+            self.sort_ref,
+            self.warn_ref,
+            self.registry,
         ] {
             if let Some(r) = r {
                 roots.push(r);
@@ -1627,7 +1807,9 @@ impl Vm {
             };
             if let Some(mm) = mm {
                 if let Err(e) = self.call_value(mm, &[val]) {
-                    eprintln!("Lua warning: error in __gc finalizer: {e}");
+                    let e = self.position_error(e);
+                    let msg = format!("error in __gc finalizer: {e}");
+                    self.warning(&msg);
                 }
             }
         }
@@ -1645,7 +1827,10 @@ impl Vm {
     // ── Main dispatch loop ─────────────────────────────────────────
 
     fn execute(&mut self) -> Result<(), LuaError> {
-        self.execute_to_depth(0)
+        match self.execute_to_depth(0) {
+            Ok(()) => Ok(()),
+            Err(e) => Err(self.position_error(e)),
+        }
     }
 
     fn  execute_to_depth(&mut self, min_depth: usize) -> Result<(), LuaError> {
@@ -1664,11 +1849,77 @@ impl Vm {
             let base = self.frames[fi].base;
             let inst = self.frames[fi].proto.code[pc];
             self.frames[fi].pc += 1;
-            // Between instructions, no temporaries are "in flight" — the
-            // active-locals region is the only live root in this frame.
-            // Individual opcodes that spill values into temps above locals
-            // (Call, Concat) will widen `runtime_top` before a GC point.
-            self.frames[fi].runtime_top = base;
+
+            // ── Debug hook triggers (count / line) ─────────────────
+            if self.hook_mask != 0 && !self.in_hook {
+                if self.hook_mask & HOOK_COUNT != 0 {
+                    self.hook_counter -= 1;
+                    if self.hook_counter <= 0 {
+                        self.hook_counter = self.hook_count;
+                        self.call_hook("count", None)?;
+                    }
+                }
+                if self.hook_mask & HOOK_LINE != 0 {
+                    let line = self.frames[fi]
+                        .proto
+                        .line_info
+                        .get(pc)
+                        .copied()
+                        .unwrap_or(0);
+                    let oldpc = self.frames[fi].hook_last_pc;
+                    let oldline = self.frames[fi].hook_last_line;
+                    let first = oldpc == 0 && pc == 0;
+                    self.frames[fi].hook_last_pc = pc;
+                    self.frames[fi].hook_last_line = line;
+                    // Line 0 means "no line information": no event.
+                    if line != 0 && (first || pc <= oldpc || line != oldline) {
+                        // Emulate reference Lua's changedline behaviour at
+                        // function entry: a proto with a single distinct line
+                        // produces no entry event.
+                        let single = match self.frames[fi].hook_single_line {
+                            Some(v) => v,
+                            None => {
+                                let mut seen: Option<u32> = None;
+                                let mut single = true;
+                                for &l in &self.frames[fi].proto.line_info {
+                                    if l == 0 {
+                                        continue;
+                                    }
+                                    match seen {
+                                        None => seen = Some(l),
+                                        Some(s0) if s0 != l => {
+                                            single = false;
+                                            break;
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                                // A one-instruction proto still fires on entry.
+                                if self.frames[fi].proto.code.len() <= 1 {
+                                    single = false;
+                                }
+                                self.frames[fi].hook_single_line = Some(single);
+                                single
+                            }
+                        };
+                        let entry = !self.frames[fi].hook_seen_event;
+                        let is_back = pc <= oldpc;
+                        if !(entry && single && !is_back) {
+                            self.frames[fi].hook_seen_event = true;
+                            self.call_hook("line", Some(line))?;
+                        }
+                    }
+                }
+            }
+            // Root the temporaries the compiler says are live at this
+            // instruction (locals plus in-flight expression operands).
+            let need = self.frames[fi]
+                .proto
+                .stack_top_at
+                .get(pc)
+                .copied()
+                .unwrap_or(self.frames[fi].proto.max_stack_size);
+            self.frames[fi].runtime_top = base + need as usize;
 
             let op = OpCode::from_u8(decode_op(inst))
                 .ok_or_else(|| LuaError::new(format!("invalid opcode: {}", decode_op(inst))))?;
@@ -1726,7 +1977,10 @@ impl Vm {
                     let val = self.reg(base, a);
                     let uv = Rc::clone(&self.frames[fi].upvalues[b]);
                     match &mut *uv.borrow_mut() {
-                        Upvalue::Open(stack_idx) => self.stack[*stack_idx] = val,
+                        Upvalue::Open(loc) => {
+                            let loc = *loc;
+                            self.write_open_upvalue(loc, val);
+                        }
                         Upvalue::Closed(v) => *v = val,
                     }
                 }
@@ -1909,39 +2163,8 @@ impl Vm {
 
                 OpCode::Len => {
                     let rb = self.reg(base, b);
-                    // __len is checked first for tables (if metatable exists), always for other types
-                    let has_mm = match rb {
-                        Value::Object(r) if r.as_object().as_string().is_some() => false,
-                        _ => self.get_metamethod(rb, MM_LEN).is_some(),
-                    };
-                    if has_mm {
-                        let mm = self.get_metamethod(rb, MM_LEN).unwrap();
-                        let result = self.call_metamethod(mm, &[rb, rb])?;
-                        self.set_reg(base, a, result);
-                    } else {
-                        match rb {
-                            Value::Object(r) => match &r.as_object().kind {
-                                GcObjectKind::String(s) => {
-                                    self.set_reg(base, a, Value::Integer(s.len() as i64));
-                                }
-                                GcObjectKind::Table(t) => {
-                                    self.set_reg(base, a, Value::Integer(t.length() as i64));
-                                }
-                                _ => {
-                                    return Err(LuaError::new(format!(
-                                        "attempt to get length of a {} value",
-                                        rb.type_name()
-                                    )))
-                                }
-                            },
-                            _ => {
-                                return Err(LuaError::new(format!(
-                                    "attempt to get length of a {} value",
-                                    rb.type_name()
-                                )))
-                            }
-                        }
-                    }
+                    let result = self.value_length(rb)?;
+                    self.set_reg(base, a, result);
                 }
 
                 // ── Comparison & Conditional ───────────────────────
@@ -2108,6 +2331,11 @@ impl Vm {
                         else if self.loadfile_ref == Some(r) { 20 }
                         else if self.dofile_ref == Some(r) { 21 }
                         else if self.collectgarbage_ref == Some(r) { 22 }
+                        else if self.warn_ref == Some(r) { 23 }
+                        else if self.sort_ref == Some(r) { 24 }
+                        else if self.debug_getregistry_ref == Some(r) { 25 }
+                        else if self.debug_sethook_ref == Some(r) { 26 }
+                        else if self.debug_gethook_ref == Some(r) { 27 }
                         else { 0 }
                     } else { 0 };
 
@@ -2256,6 +2484,35 @@ impl Vm {
                                 .collect();
                             self.handle_collectgarbage(&args, base + a, num_results)?;
                         }
+                        23 => { // warn
+                            let args: Vec<Value> = (0..num_args)
+                                .map(|i| self.stack[base + a + 1 + i])
+                                .collect();
+                            self.handle_warn(&args)?;
+                            self.place_results(base + a, num_results, &[]);
+                        }
+                        24 => { // table.sort
+                            let args: Vec<Value> = (0..num_args)
+                                .map(|i| self.stack[base + a + 1 + i])
+                                .collect();
+                            self.handle_sort(&args, base + a, num_results)?;
+                        }
+                        25 => { // debug.getregistry
+                            self.handle_debug_getregistry(base + a, num_results);
+                        }
+                        26 => { // debug.sethook
+                            let args: Vec<Value> = (0..num_args)
+                                .map(|i| self.stack[base + a + 1 + i])
+                                .collect();
+                            self.handle_debug_sethook(&args)?;
+                            self.place_results(base + a, num_results, &[]);
+                        }
+                        27 => { // debug.gethook
+                            let args: Vec<Value> = (0..num_args)
+                                .map(|i| self.stack[base + a + 1 + i])
+                                .collect();
+                            self.handle_debug_gethook(&args, base + a, num_results)?;
+                        }
                         _ => {
                             self.call_function(base + a, b, num_results)?;
                         }
@@ -2292,11 +2549,43 @@ impl Vm {
 
                     self.frames[fi].runtime_top = base + a + num_args + 1;
 
-                    // Check if the target is a Lua function for tail call optimization
-                    let is_lua_closure = matches!(func_val,
-                        Value::Object(r) if r.as_object().as_closure()
-                            .map_or(false, |c| matches!(c, Closure::Lua(_)))
-                    );
+                    // Resolve a __call chain so a callable object can still
+                    // be tail-call-optimized when it resolves to a Lua function.
+                    let mut actual_func = func_val;
+                    let mut actual_args = args.clone();
+                    let mut call_limit = 16;
+                    let is_lua_closure = loop {
+                        match actual_func {
+                            Value::Object(r) if r.as_object().as_closure().is_some() => {
+                                break matches!(
+                                    r.as_object().as_closure().unwrap(),
+                                    Closure::Lua(_)
+                                );
+                            }
+                            _ => {
+                                call_limit -= 1;
+                                if call_limit == 0 {
+                                    return Err(LuaError::new("'__call' chain too long"));
+                                }
+                                match self.get_metamethod(actual_func, MM_CALL) {
+                                    Some(mm) => {
+                                        let mut new_args =
+                                            Vec::with_capacity(actual_args.len() + 1);
+                                        new_args.push(actual_func);
+                                        new_args.extend(actual_args);
+                                        actual_func = mm;
+                                        actual_args = new_args;
+                                    }
+                                    None => {
+                                        return Err(LuaError::new(format!(
+                                            "attempt to call a {} value",
+                                            func_val.type_name()
+                                        )));
+                                    }
+                                }
+                            }
+                        }
+                    };
 
                     self.close_tbc_vars(base, None)?;
                     self.close_upvalues(base);
@@ -2309,16 +2598,22 @@ impl Vm {
                         self.frames.pop();
 
                         // Place arguments at the base for the new frame
-                        for (i, &arg) in args.iter().enumerate() {
+                        self.ensure_stack(base + actual_args.len() + 2);
+                        for (i, &arg) in actual_args.iter().enumerate() {
                             self.stack[base + 1 + i] = arg;
                         }
-                        self.stack[base] = func_val;
+                        self.stack[base] = actual_func;
 
-                        self.do_call(func_val, base, &args, result_base, num_results)?;
+                        self.next_call_is_tail = true;
+                        self.next_call_extraargs = actual_args.len().saturating_sub(num_args) as u8;
+                        self.do_call(actual_func, base, &actual_args, result_base, num_results)?;
                     } else {
                         // C/native function: keep current frame on stack during the call
                         // so debug functions can see the correct call stack, then pop after
-                        self.do_call(func_val, base + a, &args, result_base, num_results)?;
+                        self.do_call(actual_func, base + a, &actual_args, result_base, num_results)?;
+                        if self.hook_mask & HOOK_RET != 0 && !self.in_hook {
+                            self.call_hook("return", None)?;
+                        }
                         self.frames.pop();
                     }
                 }
@@ -2334,6 +2629,10 @@ impl Vm {
 
                     self.close_tbc_vars(base, None)?;
                     self.close_upvalues(base);
+
+                    if self.hook_mask & HOOK_RET != 0 && !self.in_hook {
+                        self.call_hook("return", None)?;
+                    }
 
                     let result_base = self.frames[fi].result_base;
                     let num_results = self.frames[fi].num_results;
@@ -2478,6 +2777,13 @@ impl Vm {
                 if self.error_ref == Some(gc_ref) {
                     return self.handle_error(&actual_args);
                 }
+                // Intercept protected calls (also reached from tail calls)
+                if self.pcall_ref == Some(gc_ref) {
+                    return self.handle_pcall(&actual_args, result_base, num_results);
+                }
+                if self.xpcall_ref == Some(gc_ref) {
+                    return self.handle_xpcall(&actual_args, result_base, num_results);
+                }
                 // Intercept coroutine special functions
                 if self.coro_resume_ref == Some(gc_ref) {
                     return self.handle_resume(&actual_args, result_base, num_results);
@@ -2529,6 +2835,26 @@ impl Vm {
                 if self.collectgarbage_ref == Some(gc_ref) {
                     return self.handle_collectgarbage(&actual_args, result_base, num_results);
                 }
+                if self.warn_ref == Some(gc_ref) {
+                    self.handle_warn(&actual_args)?;
+                    self.place_results(result_base, num_results, &[]);
+                    return Ok(());
+                }
+                if self.sort_ref == Some(gc_ref) {
+                    return self.handle_sort(&actual_args, result_base, num_results);
+                }
+                if self.debug_getregistry_ref == Some(gc_ref) {
+                    self.handle_debug_getregistry(result_base, num_results);
+                    return Ok(());
+                }
+                if self.debug_sethook_ref == Some(gc_ref) {
+                    self.handle_debug_sethook(&actual_args)?;
+                    self.place_results(result_base, num_results, &[]);
+                    return Ok(());
+                }
+                if self.debug_gethook_ref == Some(gc_ref) {
+                    return self.handle_debug_gethook(&actual_args, result_base, num_results);
+                }
                 let results = match gc_ref.as_object().as_closure().unwrap() {
                     Closure::Native(nc) => (nc.func)(&actual_args, &mut self.gc)?,
                     Closure::NativeDyn(nc) => (nc.func)(&actual_args, &mut self.gc)?,
@@ -2566,6 +2892,15 @@ impl Vm {
                     Vec::new()
                 };
 
+                let frame_is_hook = self.calling_hook;
+                let frame_is_tailcall = self.next_call_is_tail;
+                let frame_extraargs = self
+                    .next_call_extraargs
+                    .max(actual_args.len().saturating_sub(args.len()) as u8);
+                self.calling_hook = false;
+                self.next_call_is_tail = false;
+                self.next_call_extraargs = 0;
+
                 self.frames.push(CallFrame {
                     closure: gc_ref,
                     proto: Rc::clone(&proto),
@@ -2576,7 +2911,21 @@ impl Vm {
                     num_results,
                     varargs: varargs.clone(),
                     runtime_top: new_base,
+                    is_hook: frame_is_hook,
+                    is_tailcall: frame_is_tailcall,
+                    extraargs: frame_extraargs,
+                    hook_last_line: 0,
+                    hook_last_pc: 0,
+                    hook_seen_event: false,
+                    hook_single_line: None,
                 });
+
+                // Call hook (after the frame is in place so the hook can
+                // inspect it with debug.getinfo).
+                if self.hook_mask & HOOK_CALL != 0 && !self.in_hook {
+                    let event = if frame_is_tailcall { "tail call" } else { "call" };
+                    self.call_hook(event, None)?;
+                }
 
                 // Named vararg table: create table from varargs and store in register
                 if let Some(va_reg) = proto.vararg_name_reg {
@@ -2620,6 +2969,27 @@ impl Vm {
     /// result_base: where to place (true, results...) or (false, err)
     /// num_results: how many results the caller expects
     fn handle_pcall(
+        &mut self,
+        pcall_args: &[Value],
+        result_base: usize,
+        num_results: i32,
+    ) -> Result<(), LuaError> {
+        if self.protected_depth >= 200 {
+            let msg = self.gc.new_string(b"C stack overflow");
+            self.place_results(
+                result_base,
+                num_results,
+                &[Value::Boolean(false), Value::Object(msg)],
+            );
+            return Ok(());
+        }
+        self.protected_depth += 1;
+        let result = self.handle_pcall_inner(pcall_args, result_base, num_results);
+        self.protected_depth -= 1;
+        result
+    }
+
+    fn handle_pcall_inner(
         &mut self,
         pcall_args: &[Value],
         result_base: usize,
@@ -2689,6 +3059,7 @@ impl Vm {
                             }
                         }
                         Err(e) => {
+                            let e = self.position_error(e);
                             let err_val = e.to_value(&mut self.gc);
                             self.recover_from_error(saved_depth, saved_open_uv_len, Some(err_val));
                             self.place_results(
@@ -2710,6 +3081,7 @@ impl Vm {
             }
             Err(e) => {
                 // The call itself failed (e.g. calling a non-function)
+                let e = self.position_error(e);
                 let err_val = e.to_value(&mut self.gc);
                 self.recover_from_error(saved_depth, saved_open_uv_len, Some(err_val));
                 self.place_results(
@@ -2748,6 +3120,10 @@ impl Vm {
         co.open_upvalues = std::mem::take(&mut self.open_upvalues);
         co.tbc_slots = std::mem::take(&mut self.tbc_slots);
         co.pcall_guards = std::mem::take(&mut self.pcall_guards);
+        co.hook_func = self.hook_func.take();
+        co.hook_mask = self.hook_mask;
+        co.hook_count = self.hook_count;
+        co.hook_counter = self.hook_counter;
         co.top = self.top;
         self.top = 0;
     }
@@ -2760,6 +3136,10 @@ impl Vm {
         self.open_upvalues = std::mem::take(&mut co.open_upvalues);
         self.tbc_slots = std::mem::take(&mut co.tbc_slots);
         self.pcall_guards = std::mem::take(&mut co.pcall_guards);
+        self.hook_func = co.hook_func.take();
+        self.hook_mask = co.hook_mask;
+        self.hook_count = co.hook_count;
+        self.hook_counter = co.hook_counter;
         self.top = co.top;
         co.top = 0;
     }
@@ -2849,6 +3229,7 @@ impl Vm {
             match self.execute() {
                 Ok(()) => break Ok(()),
                 Err(e) => {
+                    let e = self.position_error(e);
                     // Check if a pcall guard can catch this error.
                     if let Some(guard) = self.pcall_guards.last() {
                         if guard.frame_depth <= self.frames.len() {
@@ -3011,6 +3392,7 @@ impl Vm {
             match self.execute() {
                 Ok(()) => break Ok(()),
                 Err(e) => {
+                    let e = self.position_error(e);
                     if let Some(guard) = self.pcall_guards.last() {
                         if guard.frame_depth <= self.frames.len() {
                             let guard = self.pcall_guards.pop().unwrap();
@@ -3154,10 +3536,47 @@ impl Vm {
         let frame = &self.frames[num_frames - 1 - level];
         let pc = if frame.pc > 0 { frame.pc - 1 } else { 0 };
         let line = frame.proto.line_info.get(pc).copied().unwrap_or(0);
-        let source = frame.proto.source.as_deref().unwrap_or("?");
-        // Strip leading '@' from source name (Lua convention for file names)
-        let source = source.strip_prefix('@').unwrap_or(source);
-        Some(format!("{}:{}", source, line))
+        match frame.proto.source.as_deref() {
+            Some(source) => Some(format!("{}:{}", chunkid(source), line)),
+            None => Some("?:?".to_string()),
+        }
+    }
+
+    /// Annotate a runtime error with the current source position, unless it
+    /// already carries one. Mirrors `luaG_runerror`/`luaG_addinfo`: only
+    /// string error objects get the `source:line: ` prefix.
+    fn position_error(&mut self, e: LuaError) -> LuaError {
+        if e.positioned {
+            return e;
+        }
+        // Determine the string message to annotate (non-strings pass through).
+        let msg: String = match e.value {
+            Some(Value::Object(r)) if r.as_object().as_string().is_some() => {
+                let s = r.as_object().as_string().unwrap();
+                match std::str::from_utf8(s.as_bytes()) {
+                    Ok(s) => s.to_string(),
+                    Err(_) => return e.mark_positioned(),
+                }
+            }
+            Some(_) => {
+                // Nil/table/other error objects are not annotated (nil is
+                // turned into "<no error object>" by `to_value`).
+                return e.mark_positioned();
+            }
+            None => e.message.clone(),
+        };
+        match self.get_source_line(0) {
+            Some(loc) => {
+                let annotated = format!("{loc}: {msg}");
+                let s = self.gc.new_string(annotated.as_bytes());
+                LuaError {
+                    message: annotated,
+                    value: Some(Value::Object(s)),
+                    positioned: true,
+                }
+            }
+            None => e.mark_positioned(),
+        }
     }
 
     /// Annotate a string error value with source:line prefix.
@@ -3195,13 +3614,42 @@ impl Vm {
         };
 
         let annotated = self.annotate_error(msg, level);
-        Err(LuaError::with_value(annotated))
+        Err(LuaError::with_value(annotated).mark_positioned())
     }
 
     // ── xpcall ─────────────────────────────────────────────────────
 
     /// Handle xpcall(f, msgh [, arg1, ...]).
     fn handle_xpcall(
+        &mut self,
+        xpcall_args: &[Value],
+        result_base: usize,
+        num_results: i32,
+    ) -> Result<(), LuaError> {
+        // The message handler must be a function.
+        let msgh = xpcall_args.get(1).copied().unwrap_or(Value::Nil);
+        if !msgh.is_function() {
+            return Err(LuaError::new(format!(
+                "bad argument #2 to 'xpcall' (function expected, got {})",
+                msgh.type_name()
+            )));
+        }
+        if self.protected_depth >= 200 {
+            let msg = self.gc.new_string(b"C stack overflow");
+            self.place_results(
+                result_base,
+                num_results,
+                &[Value::Boolean(false), Value::Object(msg)],
+            );
+            return Ok(());
+        }
+        self.protected_depth += 1;
+        let result = self.handle_xpcall_inner(xpcall_args, result_base, num_results);
+        self.protected_depth -= 1;
+        result
+    }
+
+    fn handle_xpcall_inner(
         &mut self,
         xpcall_args: &[Value],
         result_base: usize,
@@ -3261,6 +3709,7 @@ impl Vm {
                             self.stack[result_base] = Value::Boolean(true);
                         }
                         Err(e) => {
+                            let e = self.position_error(e);
                             let err_val = e.to_value(&mut self.gc);
                             // Call message handler before unwinding
                             let handled = self.call_message_handler(msgh, err_val);
@@ -3277,6 +3726,7 @@ impl Vm {
                 }
             }
             Err(e) => {
+                let e = self.position_error(e);
                 let err_val = e.to_value(&mut self.gc);
                 let handled = self.call_message_handler(msgh, err_val);
                 self.recover_from_error(saved_depth, saved_open_uv_len, Some(err_val));
@@ -3293,10 +3743,14 @@ impl Vm {
     /// Call a message handler for xpcall. If the handler itself errors,
     /// return the original error.
     fn call_message_handler(&mut self, msgh: Value, err_val: Value) -> Value {
-        // Try to call the handler; if it fails, return original error
+        // If the handler itself errors, reference Lua reports
+        // "error in error handling".
         match self.call_value(msgh, &[err_val]) {
             Ok(results) => results.into_iter().next().unwrap_or(Value::Nil),
-            Err(_) => err_val, // handler failed, return original error
+            Err(_) => {
+                let msg = self.gc.new_string(b"error in error handling");
+                Value::Object(msg)
+            }
         }
     }
 
@@ -3312,17 +3766,25 @@ impl Vm {
         result.push_str("stack traceback:");
 
         let num_frames = self.frames.len();
-        let start = if level < num_frames { num_frames - level } else { 0 };
+        // Level 1 = the function that called `debug.traceback` (which is
+        // handled inline and has no frame of its own).
+        let start = if level <= num_frames {
+            num_frames - level + 1
+        } else {
+            0
+        };
 
         for i in (0..start).rev() {
             let frame = &self.frames[i];
             let pc = if frame.pc > 0 { frame.pc - 1 } else { 0 };
             let line = frame.proto.line_info.get(pc).copied().unwrap_or(0);
-            let source = frame.proto.source.as_deref().unwrap_or("?");
-            let source = source.strip_prefix('@').unwrap_or(source);
+            let source = match frame.proto.source.as_deref() {
+                Some(s) => chunkid(s),
+                None => "?".to_string(),
+            };
 
             result.push_str("\n\t");
-            result.push_str(source);
+            result.push_str(&source);
             result.push(':');
             result.push_str(&line.to_string());
             result.push_str(": in ");
@@ -3331,10 +3793,24 @@ impl Vm {
             let closure = frame.closure.as_object().as_closure().unwrap();
             match closure {
                 Closure::Lua(_) => {
-                    if i == 0 {
+                    if frame.is_hook {
+                        result.push_str("hook '?'");
+                    } else if i == 0 {
                         result.push_str("main chunk");
                     } else {
-                        result.push_str("local function");
+                        let (name, namewhat) = self.function_name_at(i);
+                        if !namewhat.is_empty() {
+                            result.push_str(namewhat);
+                            result.push_str(" '");
+                            result.push_str(&name.unwrap_or_default());
+                            result.push('\'');
+                        } else {
+                            result.push_str("function <");
+                            result.push_str(&source);
+                            result.push(':');
+                            result.push_str(&frame.proto.line_defined.to_string());
+                            result.push('>');
+                        }
                     }
                 }
                 Closure::Native(nc) => {
@@ -3356,6 +3832,190 @@ impl Vm {
     }
 
     // ── Debug library handlers ─────────────────────────────────────
+
+    /// Handle debug.getregistry().
+    fn handle_debug_getregistry(&mut self, result_base: usize, num_results: i32) {
+        let val = match self.registry {
+            Some(r) => Value::Object(r),
+            None => Value::Nil,
+        };
+        self.place_results(result_base, num_results, &[val]);
+    }
+
+    /// Invoke the active debug hook with an event name and optional line.
+    fn call_hook(&mut self, event: &str, line: Option<u32>) -> Result<(), LuaError> {
+        let hook = match self.hook_func {
+            Some(h) => Value::Object(h),
+            None => return Ok(()),
+        };
+        let saved_in_hook = self.in_hook;
+        self.in_hook = true;
+        self.calling_hook = true;
+
+        let ev = self.gc.new_string(event.as_bytes());
+        let line_val = line
+            .map(|l| Value::Integer(l as i64))
+            .unwrap_or(Value::Nil);
+        let res = self.call_value(hook, &[Value::Object(ev), line_val]);
+
+        self.calling_hook = false;
+        self.in_hook = saved_in_hook;
+        res.map(|_| ())
+    }
+
+    /// Decode a hook mask string + count into mask bits.
+    fn hook_mask_from(mask_bytes: &[u8], count: i64) -> u8 {
+        let mut mask = 0u8;
+        if mask_bytes.contains(&b'c') {
+            mask |= HOOK_CALL;
+        }
+        if mask_bytes.contains(&b'r') {
+            mask |= HOOK_RET;
+        }
+        if mask_bytes.contains(&b'l') {
+            mask |= HOOK_LINE;
+        }
+        if count > 0 {
+            mask |= HOOK_COUNT;
+        }
+        mask
+    }
+
+    fn hook_mask_string(mask: u8) -> String {
+        let mut s = String::new();
+        if mask & HOOK_CALL != 0 {
+            s.push('c');
+        }
+        if mask & HOOK_RET != 0 {
+            s.push('r');
+        }
+        if mask & HOOK_LINE != 0 {
+            s.push('l');
+        }
+        s
+    }
+
+    /// Handle debug.sethook([thread,] hook, mask [, count]).
+    fn handle_debug_sethook(&mut self, args: &[Value]) -> Result<(), LuaError> {
+        let (target, base) = match args.first().copied() {
+            Some(Value::Object(r)) if r.as_object().as_coroutine().is_some() => (Some(r), 1),
+            _ => (None, 0),
+        };
+
+        let hook = args.get(base).copied().unwrap_or(Value::Nil);
+        let running = self.running_thread();
+        let is_current = target.map_or(true, |t| t == running);
+
+        // Allow clearing with no arguments or nil.
+        if hook.is_nil() {
+            if target.is_some() && !is_current {
+                let t = target.unwrap();
+                let co = t.as_object_mut().as_coroutine_mut().unwrap();
+                co.hook_func = None;
+                co.hook_mask = 0;
+                co.hook_count = 0;
+                co.hook_counter = 0;
+            } else {
+                self.hook_func = None;
+                self.hook_mask = 0;
+                self.hook_count = 0;
+                self.hook_counter = 0;
+            }
+            return Ok(());
+        }
+
+        let hook_ref = match hook {
+            Value::Object(r) if r.as_object().as_closure().is_some() => r,
+            _ => {
+                return Err(LuaError::new(
+                    "bad argument #1 to 'sethook' (function expected)",
+                ))
+            }
+        };
+
+        let mask_bytes = match args.get(base + 1).and_then(|v| v.as_str_bytes()) {
+            Some(b) => b.to_vec(),
+            None => {
+                return Err(LuaError::new(
+                    "bad argument #2 to 'sethook' (string expected)",
+                ))
+            }
+        };
+        let count = args
+            .get(base + 2)
+            .and_then(|v| v.as_integer())
+            .unwrap_or(0);
+        let mask = Self::hook_mask_from(&mask_bytes, count);
+
+        if is_current {
+            self.hook_func = Some(hook_ref);
+            self.hook_mask = mask;
+            self.hook_count = count;
+            self.hook_counter = count;
+            // Seed the current frame's line state so installing a hook
+            // mid-line does not immediately fire a spurious line event.
+            if let Some(f) = self.frames.last_mut() {
+                let pc = f.pc.saturating_sub(1);
+                f.hook_last_pc = pc;
+                f.hook_last_line = f.proto.line_info.get(pc).copied().unwrap_or(0);
+            }
+        } else {
+            let t = target.unwrap();
+            let co = t.as_object_mut().as_coroutine_mut().unwrap();
+            co.hook_func = Some(hook_ref);
+            co.hook_mask = mask;
+            co.hook_count = count;
+            co.hook_counter = count;
+        }
+        Ok(())
+    }
+
+    /// Handle debug.gethook([thread]).
+    fn handle_debug_gethook(
+        &mut self,
+        args: &[Value],
+        result_base: usize,
+        num_results: i32,
+    ) -> Result<(), LuaError> {
+        let target = match args.first().copied() {
+            Some(Value::Object(r)) if r.as_object().as_coroutine().is_some() => Some(r),
+            _ => None,
+        };
+        let is_current = match target {
+            None => true,
+            Some(t) => t == self.running_thread(),
+        };
+
+        let (func, mask, count, counter) = if is_current {
+            (self.hook_func, self.hook_mask, self.hook_count, self.hook_counter)
+        } else {
+            let t = target.unwrap();
+            let co = t.as_object().as_coroutine().unwrap();
+            (co.hook_func, co.hook_mask, co.hook_count, co.hook_counter)
+        };
+
+        match func {
+            Some(f) => {
+                let mask_str = Self::hook_mask_string(mask);
+                let mask_val = Value::Object(self.gc.new_string(mask_str.as_bytes()));
+                let count_val = if mask & HOOK_COUNT != 0 {
+                    Value::Integer(count)
+                } else {
+                    Value::Integer(0)
+                };
+                let _ = counter;
+                self.place_results(
+                    result_base,
+                    num_results,
+                    &[Value::Object(f), mask_val, count_val],
+                );
+            }
+            None => {
+                self.place_results(result_base, num_results, &[Value::Nil]);
+            }
+        }
+        Ok(())
+    }
 
     /// Handle debug.traceback([message [, level]])
     fn handle_debug_traceback(&mut self, args: &[Value], result_base: usize, num_results: i32) {
@@ -3430,6 +4090,15 @@ impl Vm {
         // Default what = "flnStu"
         let what = what_str.unwrap_or_else(|| "flnStu".to_string());
 
+        // Validate the option string.
+        for ch in what.chars() {
+            if !matches!(ch, 'S' | 'l' | 'u' | 't' | 'n' | 'r' | 'f' | 'L') {
+                return Err(LuaError::new(
+                    "bad argument #2 to 'getinfo' (invalid option)",
+                ));
+            }
+        }
+
         match func_or_level {
             Ok(level) => {
                 // Level 0 = getinfo itself (which is not on the stack), so
@@ -3444,8 +4113,25 @@ impl Vm {
                 let proto = frame.proto.clone();
                 let closure_ref = frame.closure;
                 let pc = if frame.pc > 0 { frame.pc - 1 } else { 0 };
+                let (name, namewhat) = if frame.is_hook {
+                    (Some("?".to_string()), "hook")
+                } else {
+                    self.function_name_at(fi)
+                };
+                let istailcall = frame.is_tailcall;
+                let extraargs = frame.extraargs;
 
-                let info = self.build_getinfo_table(&proto, Some(closure_ref), Some(pc), fi == 0, &what);
+                let info = self.build_getinfo_table(
+                    &proto,
+                    Some(closure_ref),
+                    Some(pc),
+                    fi == 0,
+                    &what,
+                    name,
+                    namewhat,
+                    istailcall,
+                    extraargs,
+                );
                 let info_ref = self.gc.new_table(info);
                 self.place_results(result_base, num_results, &[Value::Object(info_ref)]);
             }
@@ -3453,7 +4139,17 @@ impl Vm {
                 let closure = closure_ref.as_object().as_closure().unwrap();
                 match closure {
                     Closure::Lua(lc) => {
-                        let info = self.build_getinfo_table(&lc.proto, Some(closure_ref), None, false, &what);
+                        let info = self.build_getinfo_table(
+                            &lc.proto,
+                            Some(closure_ref),
+                            None,
+                            false,
+                            &what,
+                            None,
+                            "",
+                            false,
+                            0,
+                        );
                         let info_ref = self.gc.new_table(info);
                         self.place_results(result_base, num_results, &[Value::Object(info_ref)]);
                     }
@@ -3477,6 +4173,111 @@ impl Vm {
         Ok(())
     }
 
+    /// Try to determine the name under which the function of frame `fi`
+    /// was called, by inspecting the call instruction in the caller.
+    fn function_name_at(&self, fi: usize) -> (Option<String>, &'static str) {
+        if fi == 0 {
+            return (None, "");
+        }
+        let caller = &self.frames[fi - 1];
+        let proto = &caller.proto;
+        if caller.pc == 0 {
+            return (None, "");
+        }
+        let call_pc = caller.pc - 1;
+        let call_inst = proto.code[call_pc];
+        let op = decode_op(call_inst);
+        if op != OpCode::Call as u8 && op != OpCode::TailCall as u8 {
+            return (None, "");
+        }
+        let a = decode_a(call_inst);
+        if call_pc == 0 {
+            return (None, "");
+        }
+
+        // Find the instruction that produced the function value in register
+        // `a`, scanning backwards past argument setup.
+        let mut source_inst: Option<(OpCode, u32)> = None;
+        let limit = call_pc.saturating_sub(32);
+        let mut idx = call_pc;
+        while idx > limit {
+            idx -= 1;
+            let inst = proto.code[idx];
+            let op = match OpCode::from_u8(decode_op(inst)) {
+                Some(op) => op,
+                None => break,
+            };
+            if decode_a(inst) == a && inst_writes_reg(op) {
+                match op {
+                    OpCode::GetTabUp
+                    | OpCode::GetTable
+                    | OpCode::GetUpval
+                    | OpCode::Move => {
+                        source_inst = Some((op, inst));
+                    }
+                    _ => {}
+                }
+                break;
+            }
+        }
+
+        let (op, inst) = match source_inst {
+            Some(pair) => pair,
+            None => return (None, ""),
+        };
+        match op {
+            OpCode::GetTabUp => {
+                let up = decode_b(inst);
+                let k = decode_c(inst);
+                if let Some(key) = constant_string(&proto.constants, k as usize) {
+                    let what = if proto
+                        .upvalues
+                        .get(up as usize)
+                        .and_then(|u| u.name.as_deref())
+                        == Some("_ENV")
+                    {
+                        "global"
+                    } else {
+                        "field"
+                    };
+                    return (Some(key), what);
+                }
+            }
+            OpCode::GetTable => {
+                let key_reg = decode_c(inst);
+                // Look back for the constant loaded into the key register.
+                let start = call_pc.saturating_sub(12);
+                for idx in (start..call_pc.saturating_sub(1)).rev() {
+                    let inst = proto.code[idx];
+                    if decode_op(inst) == OpCode::LoadK as u8 && decode_a(inst) == key_reg {
+                        if let Some(key) =
+                            constant_string(&proto.constants, decode_bx(inst) as usize)
+                        {
+                            return (Some(key), "field");
+                        }
+                        break;
+                    }
+                }
+            }
+            OpCode::GetUpval => {
+                let uv = decode_b(inst);
+                if let Some(u) = proto.upvalues.get(uv as usize) {
+                    if let Some(name) = &u.name {
+                        return (Some(name.clone()), "upvalue");
+                    }
+                }
+            }
+            OpCode::Move => {
+                let rb = decode_b(inst);
+                if let Some(local) = local_at_reg(proto, rb, call_pc as u32) {
+                    return (Some(local), "local");
+                }
+            }
+            _ => {}
+        }
+        (None, "")
+    }
+
     fn build_getinfo_table(
         &mut self,
         proto: &Proto,
@@ -3484,6 +4285,10 @@ impl Vm {
         pc: Option<usize>,
         is_main: bool,
         what: &str,
+        name: Option<String>,
+        namewhat: &str,
+        istailcall: bool,
+        extraargs: u8,
     ) -> Table {
         let mut t = Table::new();
 
@@ -3493,21 +4298,20 @@ impl Vm {
             let key = self.gc.new_string(b"source");
             t.raw_set(Value::Object(key), Value::Object(source_ref));
 
-            // short_src: strip leading @ for file names
-            let short_src = source.strip_prefix('@').unwrap_or(source);
+            let short_src = chunkid(source);
             let short_src_ref = self.gc.new_string(short_src.as_bytes());
             let key = self.gc.new_string(b"short_src");
             t.raw_set(Value::Object(key), Value::Object(short_src_ref));
 
-            // linedefined
-            let first_line = proto.line_info.first().copied().unwrap_or(0);
+            // linedefined / lastlinedefined
             let key = self.gc.new_string(b"linedefined");
-            t.raw_set(Value::Object(key), Value::Integer(first_line as i64));
+            t.raw_set(Value::Object(key), Value::Integer(proto.line_defined as i64));
 
-            // lastlinedefined
-            let last_line = proto.line_info.last().copied().unwrap_or(0);
             let key = self.gc.new_string(b"lastlinedefined");
-            t.raw_set(Value::Object(key), Value::Integer(last_line as i64));
+            t.raw_set(
+                Value::Object(key),
+                Value::Integer(proto.last_line_defined as i64),
+            );
 
             // what
             let what_val = if is_main { "main" } else { "Lua" };
@@ -3539,19 +4343,26 @@ impl Vm {
         }
 
         if what.contains('n') {
-            // We don't have rich name info, but we can try
+            let name_val = match &name {
+                Some(n) => {
+                    let r = self.gc.new_string(n.as_bytes());
+                    Value::Object(r)
+                }
+                None => Value::Nil,
+            };
             let key = self.gc.new_string(b"name");
-            t.raw_set(Value::Object(key), Value::Nil);
+            t.raw_set(Value::Object(key), name_val);
 
             let key = self.gc.new_string(b"namewhat");
-            let val = self.gc.new_string(b"");
+            let val = self.gc.new_string(namewhat.as_bytes());
             t.raw_set(Value::Object(key), Value::Object(val));
         }
 
         if what.contains('t') {
-            // istailcall
             let key = self.gc.new_string(b"istailcall");
-            t.raw_set(Value::Object(key), Value::Boolean(false));
+            t.raw_set(Value::Object(key), Value::Boolean(istailcall));
+            let key = self.gc.new_string(b"extraargs");
+            t.raw_set(Value::Object(key), Value::Integer(extraargs as i64));
         }
 
         if what.contains('f') {
@@ -3562,9 +4373,11 @@ impl Vm {
         }
 
         if what.contains('L') {
-            // activelines
+            // activelines: same as reference Lua, skipping the VARARGPREP
+            // instruction of vararg functions.
             let mut lines_table = Table::new();
-            for &line in &proto.line_info {
+            let start = if proto.is_vararg { 1 } else { 0 };
+            for &line in proto.line_info.iter().skip(start) {
                 if line > 0 {
                     lines_table.raw_set(Value::Integer(line as i64), Value::Boolean(true));
                 }
@@ -3653,45 +4466,79 @@ impl Vm {
         result_base: usize,
         num_results: i32,
     ) -> Result<(), LuaError> {
-        // Parse: level (integer), local (integer)
-        let (level, local_idx) = match (args.first(), args.get(1)) {
-            (Some(Value::Integer(lvl)), Some(Value::Integer(idx))) => (*lvl as usize, *idx),
-            (Some(Value::Object(r)), Some(Value::Integer(idx))) => {
-                // f is a function: return only the name of parameter
-                if let Some(closure) = r.as_object().as_closure() {
-                    if let Closure::Lua(lc) = closure {
-                        let i = *idx as usize;
-                        if i >= 1 && i <= lc.proto.num_params as usize {
-                            if let Some(local) = lc.proto.locals.get(i - 1) {
-                                let name = self.gc.new_string(local.name.as_bytes());
-                                self.place_results(result_base, num_results, &[Value::Object(name)]);
-                                return Ok(());
-                            }
-                        }
+        // Optional leading thread argument.
+        let (target, base) = match args.first().copied() {
+            Some(Value::Object(r)) if r.as_object().as_coroutine().is_some() => (Some(r), 1),
+            _ => (None, 0),
+        };
+
+        // Function form: return parameter (or vararg) names.
+        if let Some(Value::Object(r)) = args.get(base).copied() {
+            if let Some(Closure::Lua(lc)) = r.as_object().as_closure() {
+                let idx = args
+                    .get(base + 1)
+                    .and_then(|v| v.as_integer())
+                    .unwrap_or(0);
+                if idx > 0 && idx <= lc.proto.num_params as i64 {
+                    if let Some(local) = lc.proto.locals.get(idx as usize - 1) {
+                        let name = self.gc.new_string(local.name.as_bytes());
+                        self.place_results(result_base, num_results, &[Value::Object(name)]);
+                        return Ok(());
                     }
+                } else if idx < 0 && lc.proto.is_vararg {
+                    let name = self.gc.new_string(b"(vararg)");
+                    self.place_results(result_base, num_results, &[Value::Object(name)]);
+                    return Ok(());
                 }
-                self.place_results(result_base, num_results, &[Value::Nil]);
-                return Ok(());
             }
+            self.place_results(result_base, num_results, &[Value::Nil]);
+            return Ok(());
+        }
+
+        let level = match args.get(base).copied() {
+            Some(Value::Integer(lvl)) => lvl,
             _ => {
                 self.place_results(result_base, num_results, &[Value::Nil]);
                 return Ok(());
             }
         };
+        let local_idx = args
+            .get(base + 1)
+            .and_then(|v| v.as_integer())
+            .unwrap_or(0);
 
-        let num_frames = self.frames.len();
-        if level == 0 || level > num_frames {
-            return Err(LuaError::new("bad argument #1 to 'getlocal' (level out of range)"));
+        if level <= 0 {
+            return Err(LuaError::new(
+                "bad argument #1 to 'getlocal' (level out of range)",
+            ));
         }
-        let fi = num_frames - level;
-        let frame = &self.frames[fi];
+
+        // Choose the current thread or the (suspended) target coroutine.
+        let (frames, stack): (&[CallFrame], &[Value]) = match target {
+            Some(t) if t != self.running_thread() => {
+                // SAFETY: the coroutine object is kept alive by the VM stack
+                // (it is the function argument being inspected).
+                let obj: &crate::gc::GcObject =
+                    unsafe { &*(t.ptr_value() as *const crate::gc::GcObject) };
+                let co = obj.as_coroutine().unwrap();
+                (&co.frames, &co.stack)
+            }
+            _ => (&self.frames, &self.stack),
+        };
+
+        if level as usize > frames.len() {
+            return Err(LuaError::new(
+                "bad argument #1 to 'getlocal' (level out of range)",
+            ));
+        }
+        let frame = &frames[frames.len() - level as usize];
         let pc = if frame.pc > 0 { frame.pc - 1 } else { 0 };
 
         if local_idx < 0 {
-            // Negative indices: vararg arguments
-            let vararg_idx = (-(local_idx)) as usize - 1;
+            // Negative indices: vararg arguments.
+            let vararg_idx = (-local_idx) as usize - 1;
             if vararg_idx < frame.varargs.len() {
-                let name = self.gc.new_string(b"(*vararg)");
+                let name = self.gc.new_string(b"(vararg)");
                 let val = frame.varargs[vararg_idx];
                 self.place_results(result_base, num_results, &[Value::Object(name), val]);
             } else {
@@ -3699,21 +4546,22 @@ impl Vm {
             }
             return Ok(());
         }
-
-        let local_idx = local_idx as usize;
         if local_idx == 0 {
             self.place_results(result_base, num_results, &[Value::Nil]);
             return Ok(());
         }
 
-        // Find the local active at the current pc
+        // Find the local active at the current pc.
         let mut active_count = 0usize;
         for local in &frame.proto.locals {
-            if pc as u32 >= local.start_pc && pc as u32 <= local.end_pc {
+            if pc as u32 >= local.start_pc && (pc as u32) < local.end_pc {
                 active_count += 1;
-                if active_count == local_idx {
+                if active_count == local_idx as usize {
                     let name = self.gc.new_string(local.name.as_bytes());
-                    let val = self.stack[frame.base + active_count - 1];
+                    let val = stack
+                        .get(frame.base + active_count - 1)
+                        .copied()
+                        .unwrap_or(Value::Nil);
                     self.place_results(result_base, num_results, &[Value::Object(name), val]);
                     return Ok(());
                 }
@@ -3731,37 +4579,122 @@ impl Vm {
         result_base: usize,
         num_results: i32,
     ) -> Result<(), LuaError> {
-        let (level, local_idx, value) = match (args.first(), args.get(1), args.get(2)) {
-            (Some(Value::Integer(lvl)), Some(Value::Integer(idx)), Some(val)) => {
-                (*lvl as usize, *idx as usize, *val)
-            }
+        // Optional leading thread argument.
+        let (target, base) = match args.first().copied() {
+            Some(Value::Object(r)) if r.as_object().as_coroutine().is_some() => (Some(r), 1),
+            _ => (None, 0),
+        };
+
+        let level = match args.get(base).copied() {
+            Some(Value::Integer(lvl)) => lvl,
             _ => {
                 self.place_results(result_base, num_results, &[Value::Nil]);
                 return Ok(());
             }
         };
+        let local_idx = args
+            .get(base + 1)
+            .and_then(|v| v.as_integer())
+            .unwrap_or(0);
+        let value = args.get(base + 2).copied().unwrap_or(Value::Nil);
 
-        let num_frames = self.frames.len();
-        if level == 0 || level > num_frames {
-            return Err(LuaError::new("bad argument #1 to 'setlocal' (level out of range)"));
+        if level <= 0 {
+            return Err(LuaError::new(
+                "bad argument #1 to 'setlocal' (level out of range)",
+            ));
         }
+
+        let use_target = match target {
+            Some(t) if t != self.running_thread() => true,
+            _ => false,
+        };
+
         if local_idx == 0 {
             self.place_results(result_base, num_results, &[Value::Nil]);
             return Ok(());
         }
-        let fi = num_frames - level;
-        let frame = &self.frames[fi];
-        let pc = if frame.pc > 0 { frame.pc - 1 } else { 0 };
-        let frame_base = frame.base;
 
-        // Find the local active at the current pc
+        // Access the chosen thread's state.
+        let (num_frames, fi, frame_base, pc, locals, varargs_len) = if use_target {
+            let t = target.unwrap();
+            let obj: &crate::gc::GcObject =
+                unsafe { &*(t.ptr_value() as *const crate::gc::GcObject) };
+            let co = obj.as_coroutine().unwrap();
+            if level as usize > co.frames.len() {
+                return Err(LuaError::new(
+                    "bad argument #1 to 'setlocal' (level out of range)",
+                ));
+            }
+            let fi = co.frames.len() - level as usize;
+            let frame = &co.frames[fi];
+            let pc = if frame.pc > 0 { frame.pc - 1 } else { 0 };
+            (
+                co.frames.len(),
+                fi,
+                frame.base,
+                pc,
+                frame.proto.locals.clone(),
+                frame.varargs.len(),
+            )
+        } else {
+            if level as usize > self.frames.len() {
+                return Err(LuaError::new(
+                    "bad argument #1 to 'setlocal' (level out of range)",
+                ));
+            }
+            let fi = self.frames.len() - level as usize;
+            let frame = &self.frames[fi];
+            let pc = if frame.pc > 0 { frame.pc - 1 } else { 0 };
+            (
+                self.frames.len(),
+                fi,
+                frame.base,
+                pc,
+                frame.proto.locals.clone(),
+                frame.varargs.len(),
+            )
+        };
+        let _ = (num_frames, fi);
+
+        // Negative indices refer to vararg arguments.
+        if local_idx < 0 {
+            let vararg_idx = (-local_idx) as usize - 1;
+            if vararg_idx < varargs_len {
+                if use_target {
+                    let t = target.unwrap();
+                    let obj = t.ptr_value() as *mut crate::gc::GcObject;
+                    let co = unsafe { (*obj).as_coroutine_mut().unwrap() };
+                    let idx = co.frames.len() - level as usize;
+                    co.frames[idx].varargs[vararg_idx] = value;
+                } else {
+                    let idx = self.frames.len() - level as usize;
+                    self.frames[idx].varargs[vararg_idx] = value;
+                }
+                let name = self.gc.new_string(b"(vararg)");
+                self.place_results(result_base, num_results, &[Value::Object(name)]);
+                return Ok(());
+            }
+            self.place_results(result_base, num_results, &[Value::Nil]);
+            return Ok(());
+        }
+
+        // Find the local active at the current pc.
         let mut active_count = 0usize;
-        let locals = frame.proto.locals.clone();
         for local in &locals {
-            if pc as u32 >= local.start_pc && pc as u32 <= local.end_pc {
+            if pc as u32 >= local.start_pc && (pc as u32) < local.end_pc {
                 active_count += 1;
-                if active_count == local_idx {
-                    self.stack[frame_base + active_count - 1] = value;
+                if active_count == local_idx as usize {
+                    let slot = frame_base + active_count - 1;
+                    if use_target {
+                        let t = target.unwrap();
+                        let obj = t.ptr_value() as *mut crate::gc::GcObject;
+                        let co = unsafe { (*obj).as_coroutine_mut().unwrap() };
+                        if slot < co.stack.len() {
+                            co.stack[slot] = value;
+                        }
+                    } else {
+                        self.stack[slot] = value;
+                    }
                     let name = self.gc.new_string(local.name.as_bytes());
                     self.place_results(result_base, num_results, &[Value::Object(name)]);
                     return Ok(());
@@ -3799,7 +4732,7 @@ impl Vm {
                 }
                 let uv_ref = &lc.upvalues[up_idx - 1];
                 let val = match &*uv_ref.borrow() {
-                    Upvalue::Open(idx) => self.stack[*idx],
+                    Upvalue::Open(loc) => self.read_open_upvalue(*loc),
                     Upvalue::Closed(v) => *v,
                 };
                 let name = lc.proto.upvalues.get(up_idx - 1)
@@ -3847,8 +4780,9 @@ impl Vm {
                     .to_string();
                 let uv_ref = lc.upvalues[up_idx - 1].clone();
                 match &mut *uv_ref.borrow_mut() {
-                    Upvalue::Open(idx) => {
-                        self.stack[*idx] = value;
+                    Upvalue::Open(loc) => {
+                        let loc = *loc;
+                        self.write_open_upvalue(loc, value);
                     }
                     Upvalue::Closed(v) => {
                         *v = value;
@@ -3959,20 +4893,21 @@ impl Vm {
         &mut self,
         source: &[u8],
         chunk_name: &str,
-        env: GcRef,
+        env: Value,
     ) -> Result<GcRef, LuaError> {
         let mut lexer = crate::lexer::Lexer::new(source, chunk_name);
         let tokens = lexer
             .tokenize()
-            .map_err(|e| LuaError::new(format!("{e}")))?;
+            .map_err(|e| LuaError::new(format!("{e}")).mark_positioned())?;
         let mut parser = crate::parser::Parser::new(tokens);
         let block = parser
             .parse_chunk()
-            .map_err(|e| LuaError::new(format!("{e}")))?;
-        let proto = crate::compiler::compile(&block, Some(chunk_name.to_string()))?;
+            .map_err(|e| LuaError::new(format!("{e}")).mark_positioned())?;
+        let proto = crate::compiler::compile(&block, Some(chunk_name.to_string()))
+            .map_err(|e| e.mark_positioned())?;
 
         let proto_rc = Rc::new(proto);
-        let env_upvalue = Rc::new(RefCell::new(Upvalue::Closed(Value::Object(env))));
+        let env_upvalue = Rc::new(RefCell::new(Upvalue::Closed(env)));
         let closure = Closure::new_lua(proto_rc, vec![env_upvalue]);
         Ok(self.gc.new_closure(closure))
     }
@@ -3986,7 +4921,7 @@ impl Vm {
         bytes: &[u8],
         chunk_name: &str,
         mode: &str,
-        env: GcRef,
+        env: Value,
     ) -> Result<GcRef, LuaError> {
         let is_binary = bytes.first() == Some(&0x1b);
         if is_binary && !mode.contains('b') {
@@ -4014,7 +4949,7 @@ impl Vm {
             .map(|_| Rc::new(RefCell::new(Upvalue::Closed(Value::Nil))))
             .collect();
         if num_upvalues > 0 {
-            upvalues[0] = Rc::new(RefCell::new(Upvalue::Closed(Value::Object(env))));
+            upvalues[0] = Rc::new(RefCell::new(Upvalue::Closed(env)));
         }
 
         let closure = Closure::new_lua(Rc::new(proto), upvalues);
@@ -4115,7 +5050,7 @@ impl Vm {
             }
         };
 
-        let env = self.globals_ref.expect("globals ref not set");
+        let env = Value::Object(self.globals_ref.expect("globals ref not set"));
         let chunk_name = format!("@{filename}");
         let closure_ref = self.load_chunk(&source, &chunk_name, "bt", env)?;
         let fname_val = Value::Object(self.gc.new_string(filename.as_bytes()));
@@ -4227,7 +5162,7 @@ impl Vm {
     }
 
     /// Handle `load(chunk [, chunkname [, mode [, env]]])`.
-    /// Only the string-chunk form is supported (function-reader form is TODO).
+    /// `chunk` may be a string or a reader function returning pieces.
     fn handle_load(
         &mut self,
         args: &[Value],
@@ -4235,19 +5170,68 @@ impl Vm {
         num_results: i32,
     ) -> Result<(), LuaError> {
         let chunk = args.first().copied().unwrap_or(Value::Nil);
-        let chunk_bytes = match chunk.as_str_bytes() {
-            Some(b) => b.to_vec(),
-            None => {
-                // Function-reader form not yet supported
-                let err = self.gc.new_string(
-                    b"bad argument #1 to 'load' (string expected; function reader not supported)",
-                );
-                self.place_results(
-                    result_base,
-                    num_results,
-                    &[Value::Nil, Value::Object(err)],
-                );
-                return Ok(());
+
+        let is_reader = matches!(chunk, Value::Object(r) if r.as_object().as_closure().is_some());
+
+        let chunk_bytes = if is_reader {
+            // Call the reader repeatedly until it returns nil or an empty
+            // string. Reader errors become load failures (nil + message).
+            let mut buf: Vec<u8> = Vec::new();
+            loop {
+                let results = match self.call_value(chunk, &[]) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        let msg = e.to_value(&mut self.gc);
+                        let msg = if msg.is_nil() {
+                            Value::Object(self.gc.new_string(b"<no error object>"))
+                        } else {
+                            msg
+                        };
+                        self.place_results(
+                            result_base,
+                            num_results,
+                            &[Value::Nil, msg],
+                        );
+                        return Ok(());
+                    }
+                };
+                match results.first().copied().unwrap_or(Value::Nil) {
+                    Value::Nil => break,
+                    Value::Object(r) if r.as_object().as_string().is_some() => {
+                        let piece = r.as_object().as_string().unwrap().as_bytes();
+                        if piece.is_empty() {
+                            break;
+                        }
+                        buf.extend_from_slice(piece);
+                    }
+                    _ => {
+                        let err = self
+                            .gc
+                            .new_string(b"reader function must return a string");
+                        self.place_results(
+                            result_base,
+                            num_results,
+                            &[Value::Nil, Value::Object(err)],
+                        );
+                        return Ok(());
+                    }
+                }
+            }
+            buf
+        } else {
+            match chunk.as_str_bytes() {
+                Some(b) => b.to_vec(),
+                None => {
+                    let err = self
+                        .gc
+                        .new_string(b"bad argument #1 to 'load' (string expected)");
+                    self.place_results(
+                        result_base,
+                        num_results,
+                        &[Value::Nil, Value::Object(err)],
+                    );
+                    return Ok(());
+                }
             }
         };
 
@@ -4255,7 +5239,14 @@ impl Vm {
             .get(1)
             .and_then(|v| v.as_str_bytes())
             .map(|b| String::from_utf8_lossy(b).to_string())
-            .unwrap_or_else(|| "=(load)".to_string());
+            .unwrap_or_else(|| {
+                if is_reader {
+                    "=(load)".to_string()
+                } else {
+                    // Reference Lua uses the chunk itself as the name.
+                    String::from_utf8_lossy(&chunk_bytes).to_string()
+                }
+            });
 
         let mode = args
             .get(2)
@@ -4263,20 +5254,12 @@ impl Vm {
             .map(|b| String::from_utf8_lossy(b).to_string())
             .unwrap_or_else(|| "bt".to_string());
 
+        // Any value is valid as the environment (`_ENV` can be anything).
+        // An explicitly given nil is used as-is; only an absent argument
+        // falls back to the global environment.
         let env = match args.get(3).copied() {
-            Some(Value::Object(r)) if r.as_object().as_table().is_some() => r,
-            Some(Value::Nil) | None => self.globals_ref.expect("globals ref not set"),
-            _ => {
-                let err = self
-                    .gc
-                    .new_string(b"bad argument #4 to 'load' (table expected)");
-                self.place_results(
-                    result_base,
-                    num_results,
-                    &[Value::Nil, Value::Object(err)],
-                );
-                return Ok(());
-            }
+            None => Value::Object(self.globals_ref.expect("globals ref not set")),
+            Some(v) => v,
         };
 
         match self.load_chunk(&chunk_bytes, &chunkname, &mode, env) {
@@ -4346,13 +5329,8 @@ impl Vm {
             .unwrap_or_else(|| "bt".to_string());
 
         let env = match args.get(2).copied() {
-            Some(Value::Object(r)) if r.as_object().as_table().is_some() => r,
-            Some(Value::Nil) | None => self.globals_ref.expect("globals ref not set"),
-            _ => {
-                return Err(LuaError::new(
-                    "bad argument #3 to 'loadfile' (table expected)",
-                ));
-            }
+            None => Value::Object(self.globals_ref.expect("globals ref not set")),
+            Some(v) => v,
         };
 
         let chunk_name = format!("@{filename}");
@@ -4398,12 +5376,300 @@ impl Vm {
         let source = std::fs::read(&filename)
             .map_err(|e| LuaError::new(format!("cannot open {filename}: {e}")))?;
 
-        let env = self.globals_ref.expect("globals ref not set");
+        let env = Value::Object(self.globals_ref.expect("globals ref not set"));
         let chunk_name = format!("@{filename}");
         let closure_ref = self.load_chunk(&source, &chunk_name, "bt", env)?;
 
         let results = self.call_value(Value::Object(closure_ref), &[])?;
         self.place_results(result_base, num_results, &results);
+        Ok(())
+    }
+
+    // ── table.sort (VM-special) ────────────────────────────────────
+
+    /// Compute `#v`, honoring a `__len` metamethod.
+    fn value_length(&mut self, v: Value) -> Result<Value, LuaError> {
+        let has_mm = match v {
+            Value::Object(r) if r.as_object().as_string().is_some() => false,
+            _ => self.get_metamethod(v, MM_LEN).is_some(),
+        };
+        if has_mm {
+            let mm = self.get_metamethod(v, MM_LEN).unwrap();
+            return self.call_metamethod(mm, &[v, v]);
+        }
+        match v {
+            Value::Object(r) => match &r.as_object().kind {
+                GcObjectKind::String(s) => Ok(Value::Integer(s.len() as i64)),
+                GcObjectKind::Table(t) => Ok(Value::Integer(t.length() as i64)),
+                _ => Err(LuaError::new(format!(
+                    "attempt to get length of a {} value",
+                    v.type_name()
+                ))),
+            },
+            _ => Err(LuaError::new(format!(
+                "attempt to get length of a {} value",
+                v.type_name()
+            ))),
+        }
+    }
+
+    /// `table.sort(t [, comp])` — a port of reference Lua's quicksort so
+    /// invalid order functions and comparator side effects behave the same.
+    fn handle_sort(
+        &mut self,
+        args: &[Value],
+        result_base: usize,
+        num_results: i32,
+    ) -> Result<(), LuaError> {
+        let tv = args.first().copied().unwrap_or(Value::Nil);
+        let table_ref = match tv {
+            Value::Object(r) if r.as_object().as_table().is_some() => r,
+            _ => {
+                return Err(LuaError::new(
+                    "bad argument #1 to 'table.sort' (table expected)",
+                ))
+            }
+        };
+
+        let len_val = self.value_length(tv)?;
+        let n = match len_val {
+            Value::Integer(i) => i,
+            Value::Float(f) if f == f.floor() => f as i64,
+            _ => return Err(LuaError::new("object length is not an integer")),
+        };
+
+        if n > 1 {
+            if n >= i32::MAX as i64 {
+                return Err(LuaError::new(
+                    "bad argument #1 to 'table.sort' (array too big)",
+                ));
+            }
+            let comp = args.get(1).copied().unwrap_or(Value::Nil);
+            if !comp.is_nil() && !comp.is_function() {
+                return Err(LuaError::new(format!(
+                    "bad argument #2 to 'table.sort' (function expected, got {})",
+                    comp.type_name()
+                )));
+            }
+            self.auxsort(table_ref, 1, n as u32, 0, comp)?;
+        }
+
+        self.place_results(result_base, num_results, &[]);
+        Ok(())
+    }
+
+    fn sort_get(&self, table: GcRef, i: u32) -> Value {
+        table
+            .as_object()
+            .as_table()
+            .map(|t| t.raw_get(&Value::Integer(i as i64)))
+            .unwrap_or(Value::Nil)
+    }
+
+    fn sort_set(&mut self, table: GcRef, i: u32, v: Value) {
+        if let Some(t) = table.as_object_mut().as_table_mut() {
+            t.raw_set(Value::Integer(i as i64), v);
+        }
+    }
+
+    fn sort_comp(&mut self, a: Value, b: Value, comp: Value) -> Result<bool, LuaError> {
+        if comp.is_nil() {
+            self.compare_lt(a, b)
+        } else {
+            let res = self.call_value(comp, &[a, b])?;
+            Ok(res.first().copied().unwrap_or(Value::Nil).is_truthy())
+        }
+    }
+
+    fn auxsort(
+        &mut self,
+        table: GcRef,
+        mut lo: u32,
+        mut up: u32,
+        mut rnd: u32,
+        comp: Value,
+    ) -> Result<(), LuaError> {
+        while lo < up {
+            let a_lo = self.sort_get(table, lo);
+            let a_up = self.sort_get(table, up);
+            if self.sort_comp(a_up, a_lo, comp)? {
+                self.sort_set(table, lo, a_up);
+                self.sort_set(table, up, a_lo);
+            }
+            if up - lo == 1 {
+                return Ok(());
+            }
+
+            let mut p = if up - lo < 100 || rnd == 0 {
+                (lo + up) / 2
+            } else {
+                choose_pivot(lo, up, rnd)
+            };
+
+            let a_p = self.sort_get(table, p);
+            let a_lo = self.sort_get(table, lo);
+            if self.sort_comp(a_p, a_lo, comp)? {
+                self.sort_set(table, p, a_lo);
+                self.sort_set(table, lo, a_p);
+            } else {
+                let a_up = self.sort_get(table, up);
+                if self.sort_comp(a_up, a_p, comp)? {
+                    self.sort_set(table, p, a_up);
+                    self.sort_set(table, up, a_p);
+                }
+            }
+            if up - lo == 2 {
+                return Ok(());
+            }
+
+            let pivot = self.sort_get(table, p);
+            let a_up1 = self.sort_get(table, up - 1);
+            self.sort_set(table, p, a_up1);
+            self.sort_set(table, up - 1, pivot);
+
+            p = self.partition(table, lo, up, comp, pivot)?;
+
+            let n;
+            if p - lo < up - p {
+                self.auxsort(table, lo, p - 1, rnd, comp)?;
+                n = p - lo;
+                lo = p + 1;
+            } else {
+                self.auxsort(table, p + 1, up, rnd, comp)?;
+                n = up - p;
+                up = p - 1;
+            }
+            if (up.wrapping_sub(lo)) / 128 > n {
+                rnd = random_u32();
+            }
+        }
+        Ok(())
+    }
+
+    fn partition(
+        &mut self,
+        table: GcRef,
+        lo: u32,
+        up: u32,
+        comp: Value,
+        pivot: Value,
+    ) -> Result<u32, LuaError> {
+        let mut i = lo;
+        let mut j = up - 1;
+        loop {
+            let ai = loop {
+                i += 1;
+                let v = self.sort_get(table, i);
+                if !self.sort_comp(v, pivot, comp)? {
+                    break v;
+                }
+                if i == up - 1 {
+                    return Err(LuaError::new("invalid order function for sorting"));
+                }
+            };
+            let aj = loop {
+                j -= 1;
+                let v = self.sort_get(table, j);
+                if !self.sort_comp(pivot, v, comp)? {
+                    break v;
+                }
+                if j < i {
+                    return Err(LuaError::new("invalid order function for sorting"));
+                }
+            };
+            if j < i {
+                self.sort_set(table, up - 1, ai);
+                self.sort_set(table, i, pivot);
+                return Ok(i);
+            }
+            self.sort_set(table, i, aj);
+            self.sort_set(table, j, ai);
+        }
+    }
+
+    // ── Warning system ─────────────────────────────────────────────
+    /// Emit a warning message (already composed). Handles the `@store`
+    /// mode that accumulates messages in the `_WARN` global; otherwise
+    /// prints `Lua warning: <msg>` to stderr when warnings are on.
+    fn warning(&mut self, msg: &str) {
+        if self.warn_store {
+            let globals = match self.globals_ref {
+                Some(g) => g,
+                None => return,
+            };
+            let key = self.gc.new_string(b"_WARN");
+            let cur = globals
+                .as_object()
+                .as_table()
+                .map(|t| t.raw_get(&Value::Object(key)))
+                .unwrap_or(Value::Nil);
+            let mut buf = match cur {
+                Value::Object(r) if r.as_object().as_string().is_some() => {
+                    r.as_object().as_string().unwrap().as_bytes().to_vec()
+                }
+                _ => Vec::new(),
+            };
+            buf.extend_from_slice(msg.as_bytes());
+            let s = self.gc.new_string(&buf);
+            globals
+                .as_object_mut()
+                .as_table_mut()
+                .unwrap()
+                .raw_set(Value::Object(key), Value::Object(s));
+            return;
+        }
+        if self.warn_on {
+            eprintln!("Lua warning: {msg}");
+        }
+    }
+
+    /// Handle `warn(msg1, ...)`. All arguments must be strings (numbers
+    /// are accepted and converted). A single argument starting with `@`
+    /// is a control message (`@on`, `@off`, `@store`, `@normal`).
+    fn handle_warn(&mut self, args: &[Value]) -> Result<(), LuaError> {
+        if args.is_empty() {
+            return Err(LuaError::new(
+                "bad argument #1 to 'warn' (string expected, got no value)",
+            ));
+        }
+
+        let mut pieces: Vec<String> = Vec::with_capacity(args.len());
+        for (i, arg) in args.iter().enumerate() {
+            match arg {
+                Value::Object(r) if r.as_object().as_string().is_some() => {
+                    let s = r.as_object().as_string().unwrap();
+                    pieces.push(String::from_utf8_lossy(s.as_bytes()).to_string());
+                }
+                Value::Integer(n) => pieces.push(format!("{n}")),
+                Value::Float(n) => pieces.push(format!("{n}")),
+                v => {
+                    return Err(LuaError::new(format!(
+                        "bad argument #{} to 'warn' (string expected, got {})",
+                        i + 1,
+                        v.type_name()
+                    )));
+                }
+            }
+        }
+
+        if pieces.len() == 1 {
+            if let Some(control) = pieces[0].strip_prefix('@') {
+                match control {
+                    "on" => {
+                        self.warn_on = true;
+                        self.warn_store = false;
+                    }
+                    "off" => self.warn_on = false,
+                    "store" => self.warn_store = true,
+                    "normal" => self.warn_store = false,
+                    _ => {} // unknown control messages are ignored
+                }
+                return Ok(());
+            }
+        }
+
+        let msg = pieces.concat();
+        self.warning(&msg);
         Ok(())
     }
 
@@ -4499,21 +5765,23 @@ impl Vm {
 
 // ── Lua integer arithmetic helpers ─────────────────────────────────
 
-/// Lua floor division for integers.
+/// Lua floor division for integers (wrapping, like reference Lua).
 fn lua_idiv(a: i64, b: i64) -> i64 {
-    let d = a / b;
-    if (a ^ b) < 0 && d * b != a {
-        d - 1
+    // The only overflowing case is MININTEGER // -1, which wraps to
+    // MININTEGER in Lua.
+    let d = a.wrapping_div(b);
+    if (a ^ b) < 0 && d.wrapping_mul(b) != a {
+        d.wrapping_sub(1)
     } else {
         d
     }
 }
 
-/// Lua modulo for integers.
+/// Lua modulo for integers (wrapping, like reference Lua).
 fn lua_imod(a: i64, b: i64) -> i64 {
-    let r = a % b;
+    let r = a.wrapping_rem(b);
     if r != 0 && (r ^ b) < 0 {
-        r + b
+        r.wrapping_add(b)
     } else {
         r
     }
@@ -4541,8 +5809,136 @@ fn lua_shl(x: i64, y: i64) -> i64 {
 }
 
 /// Lua right shift.
+/// Format a chunk source name the way `luaO_chunkid` does:
+///   `@file`  → the file name (truncated with a leading `...`)
+///   `=name`  → the literal name (truncated)
+///   other    → `[string "..."]` (stopping at the first newline)
+pub fn chunkid(source: &str) -> String {
+    const IDSIZE: usize = 60;
+    let bytes = source.as_bytes();
+    // Reference Lua passes the length including the terminating NUL.
+    let srclen = bytes.len() + 1;
+    match bytes.first() {
+        Some(b'=') => {
+            if srclen <= IDSIZE {
+                source[1..].to_string()
+            } else {
+                String::from_utf8_lossy(&bytes[1..IDSIZE]).to_string()
+            }
+        }
+        Some(b'@') => {
+            if srclen <= IDSIZE {
+                source[1..].to_string()
+            } else {
+                let keep = IDSIZE - 3; // space left after "..."
+                let body = &bytes[1..];
+                let tail = &body[body.len() - (keep - 1)..];
+                format!("...{}", String::from_utf8_lossy(tail))
+            }
+        }
+        _ => {
+            const PRE: &str = "[string \"";
+            const POS: &str = "\"]";
+            const RETS: &str = "...";
+            let bufflen = IDSIZE - (PRE.len() + RETS.len() + POS.len()) - 1;
+            let nl = source.find('\n');
+            if srclen < bufflen && nl.is_none() {
+                format!("{PRE}{source}{POS}")
+            } else {
+                let mut body = match nl {
+                    Some(nl) => &source[..nl],
+                    None => source,
+                };
+                if body.len() > bufflen {
+                    body = &body[..bufflen];
+                }
+                format!("{PRE}{body}{RETS}{POS}")
+            }
+        }
+    }
+}
+
+/// True if executing `op` may write the A register.
+fn inst_writes_reg(op: OpCode) -> bool {
+    matches!(
+        op,
+        OpCode::Move
+            | OpCode::LoadI
+            | OpCode::LoadK
+            | OpCode::LoadKX
+            | OpCode::LoadBool
+            | OpCode::LoadNil
+            | OpCode::GetUpval
+            | OpCode::GetTabUp
+            | OpCode::GetTable
+            | OpCode::NewTable
+            | OpCode::Add
+            | OpCode::Sub
+            | OpCode::Mul
+            | OpCode::Div
+            | OpCode::IDiv
+            | OpCode::Mod
+            | OpCode::Pow
+            | OpCode::Unm
+            | OpCode::BAnd
+            | OpCode::BOr
+            | OpCode::BXor
+            | OpCode::Shl
+            | OpCode::Shr
+            | OpCode::BNot
+            | OpCode::Not
+            | OpCode::Concat
+            | OpCode::Len
+            | OpCode::TestSet
+            | OpCode::Closure
+            | OpCode::Call
+            | OpCode::VarArg
+    )
+}
+
+/// String constant at `idx`, if it is a string.
+fn constant_string(constants: &[Constant], idx: usize) -> Option<String> {
+    match constants.get(idx) {
+        Some(Constant::String(s)) => Some(String::from_utf8_lossy(s).to_string()),
+        _ => None,
+    }
+}
+
+/// Name of the local that occupies register `reg` at `pc`, if any. Locals
+/// map 1:1 to registers in declaration order.
+fn local_at_reg(proto: &Proto, reg: u8, pc: u32) -> Option<String> {
+    let mut active: Vec<&LocalVarInfo> = proto
+        .locals
+        .iter()
+        .filter(|l| l.start_pc <= pc && pc < l.end_pc)
+        .collect();
+    active.sort_by_key(|l| l.start_pc);
+    active.get(reg as usize).map(|l| l.name.clone())
+}
+
 fn lua_shr(x: i64, y: i64) -> i64 {
     lua_shl(x, -y)
+}
+
+/// Choose a pivot in the middle half of `[lo, up]`, "randomized" by `rnd`
+/// (matches reference Lua's `choosePivot`).
+fn choose_pivot(lo: u32, up: u32, rnd: u32) -> u32 {
+    let r4 = (up - lo) / 4;
+    (rnd ^ lo ^ up) % (r4 * 2) + (lo + r4)
+}
+
+/// Produce a pseudo-random value used to break up imbalanced partitions.
+fn random_u32() -> u32 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let t = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let mut x = (t ^ (t >> 32)) as u32;
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    x
 }
 
 impl Default for Vm {

@@ -11,11 +11,20 @@ use crate::value::Value;
 /// A native function: takes arguments + GC reference, returns results.
 pub type NativeFn = fn(&[Value], &mut Gc) -> Result<Vec<Value>, LuaError>;
 
+/// Location of an open upvalue: a stack slot in a specific thread.
+#[derive(Debug, Clone, Copy)]
+pub struct UpvalueLoc {
+    /// Owning thread (None = main thread).
+    pub thread: Option<GcRef>,
+    /// Stack index in the owning thread's stack.
+    pub idx: usize,
+}
+
 /// Runtime upvalue: may be open (on stack) or closed (captured).
 #[derive(Debug)]
 pub enum Upvalue {
-    /// Points to a stack slot (still on the stack).
-    Open(usize),
+    /// Points to a stack slot in the owning thread.
+    Open(UpvalueLoc),
     /// Value has been captured off the stack.
     Closed(Value),
 }

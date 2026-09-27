@@ -47,7 +47,7 @@ end
 do
     local ok, err = pcall(error, nil)
     check("error nil", ok, false)
-    check("error nil value", err, nil)
+    check("error nil value", err, "<no error object>")
 end
 
 -- error with table
@@ -223,7 +223,7 @@ end
 do
     local ok, err = pcall(assert, false, "custom assert")
     check("assert error ok", ok, false)
-    check("assert error msg", err, "custom assert")
+    check_match("assert error msg", err, "custom assert")
 end
 
 -- ============================================================
@@ -234,7 +234,7 @@ end
 do
     local ok, err = pcall(error)
     check("error no args ok", ok, false)
-    check("error no args nil", err, nil)
+    check("error no args nil", err, "<no error object>")
 end
 
 -- pcall with no function (pcall(nil) should return false + error)
@@ -244,12 +244,39 @@ do
     check_match("pcall no func err", err, "attempt to call a nil value")
 end
 
--- xpcall with non-function handler
+-- xpcall with non-function handler errors (Lua 5.5: handler must be a function)
 do
-    local ok, err = xpcall(function() error("test", 0) end, "not a function")
+    local ok, err = pcall(xpcall, function() error("test", 0) end, "not a function")
     check("xpcall bad handler type ok", ok, false)
-    -- When handler fails, return original error
-    check("xpcall bad handler type err", err, "test")
+    check_match("xpcall bad handler type err", err, "function expected")
+end
+
+-- a message handler that errors produces "error in error handling"
+do
+    local ok, err = xpcall(function() error("test", 0) end, function() error("boom") end)
+    check("xpcall handler error ok", ok, false)
+    check("xpcall handler error msg", err, "error in error handling")
+end
+
+-- Regression: pcall/xpcall in tail position must propagate all results
+do
+    local function f() return pcall(function() return 1, 2, 3 end) end
+    local a, b, c, d = f()
+    check("return pcall ok", a, true)
+    check("return pcall 1", b, 1)
+    check("return pcall 2", c, 2)
+    check("return pcall 3", d, 3)
+
+    local function g() return xpcall(function() return "x", "y" end, error) end
+    local e, h, i = g()
+    check("return xpcall ok", e, true)
+    check("return xpcall 1", h, "x")
+    check("return xpcall 2", i, "y")
+
+    local function bad() return pcall(function() error("boom") end) end
+    local ok, err = bad()
+    check("return pcall err ok", ok, false)
+    check_match("return pcall err msg", err, "boom")
 end
 
 -- ============================================================

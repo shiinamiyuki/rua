@@ -30,6 +30,9 @@ pub fn lua_print(args: &[Value], _gc: &mut Gc) -> Result<Vec<Value>, LuaError> {
 
 /// type(v) — Return the type of v as a string.
 pub fn lua_type(args: &[Value], gc: &mut Gc) -> Result<Vec<Value>, LuaError> {
+    if args.is_empty() {
+        return Err(LuaError::new("bad argument #1 to 'type' (value expected)"));
+    }
     let v = args.first().copied().unwrap_or(Value::Nil);
     let name = v.type_name();
     Ok(vec![Value::Object(gc.new_string(name.as_bytes()))])
@@ -37,6 +40,11 @@ pub fn lua_type(args: &[Value], gc: &mut Gc) -> Result<Vec<Value>, LuaError> {
 
 /// tostring(v) — Convert v to a string.
 pub fn lua_tostring(args: &[Value], gc: &mut Gc) -> Result<Vec<Value>, LuaError> {
+    if args.is_empty() {
+        return Err(LuaError::new(
+            "bad argument #1 to 'tostring' (value expected)",
+        ));
+    }
     let v = args.first().copied().unwrap_or(Value::Nil);
     let s = format!("{v}");
     Ok(vec![Value::Object(gc.new_string(s.as_bytes()))])
@@ -137,6 +145,21 @@ pub fn lua_ipairs(args: &[Value], gc: &mut Gc) -> Result<Vec<Value>, LuaError> {
     }
 }
 
+/// next(table [, index]) — Return the next key/value pair of a table.
+pub fn lua_next(args: &[Value], _gc: &mut Gc) -> Result<Vec<Value>, LuaError> {
+    let table = args.first().copied().unwrap_or(Value::Nil);
+    let key = args.get(1).copied().unwrap_or(Value::Nil);
+    match table {
+        Value::Object(r) if r.as_object().as_table().is_some() => {
+            match r.as_object().as_table().unwrap().next(&key) {
+                Some((k, v)) => Ok(vec![k, v]),
+                None => Ok(vec![Value::Nil]),
+            }
+        }
+        _ => Err(LuaError::new("bad argument #1 to 'next' (table expected)")),
+    }
+}
+
 /// pairs(t) — Return next, t, nil for generic for.
 pub fn lua_pairs(args: &[Value], gc: &mut Gc) -> Result<Vec<Value>, LuaError> {
     let table = args.first().copied().unwrap_or(Value::Nil);
@@ -197,6 +220,9 @@ pub fn lua_rawset(args: &[Value], _gc: &mut Gc) -> Result<Vec<Value>, LuaError> 
 
 /// rawlen(v) — Length without metamethods.
 pub fn lua_rawlen(args: &[Value], _gc: &mut Gc) -> Result<Vec<Value>, LuaError> {
+    if args.is_empty() {
+        return Err(LuaError::new("bad argument #1 to 'rawlen' (table or string expected)"));
+    }
     let v = args.first().copied().unwrap_or(Value::Nil);
     match v {
         Value::Object(r) => match &r.as_object().kind {
@@ -313,24 +339,27 @@ pub fn lua_setmetatable(args: &[Value], _gc: &mut Gc) -> Result<Vec<Value>, LuaE
 /// getmetatable(object) — Get metatable (returns __metatable field if set).
 pub fn lua_getmetatable(args: &[Value], _gc: &mut Gc) -> Result<Vec<Value>, LuaError> {
     let v = args.first().copied().unwrap_or(Value::Nil);
-    match v {
-        Value::Object(r) if r.as_object().as_table().is_some() => {
-            match r.as_object().as_table().unwrap().metatable {
-                Some(mt) => {
-                    // Check for __metatable field — return it instead of the actual metatable
-                    if let Some(mt_table) = mt.as_object().as_table() {
-                        if let Some(key_ref) = _gc.find_string(b"__metatable") {
-                            let mm_val = mt_table.raw_get(&Value::Object(key_ref));
-                            if !mm_val.is_nil() {
-                                return Ok(vec![mm_val]);
-                            }
-                        }
+    let mt = match v {
+        Value::Object(r) => match &r.as_object().kind {
+            GcObjectKind::Table(t) => t.metatable,
+            GcObjectKind::Userdata(ud) => ud.metatable,
+            _ => None,
+        },
+        _ => None,
+    };
+    match mt {
+        Some(mt) => {
+            // Check for __metatable field — return it instead of the actual metatable
+            if let Some(mt_table) = mt.as_object().as_table() {
+                if let Some(key_ref) = _gc.find_string(b"__metatable") {
+                    let mm_val = mt_table.raw_get(&Value::Object(key_ref));
+                    if !mm_val.is_nil() {
+                        return Ok(vec![mm_val]);
                     }
-                    Ok(vec![Value::Object(mt)])
                 }
-                None => Ok(vec![Value::Nil]),
             }
+            Ok(vec![Value::Object(mt)])
         }
-        _ => Ok(vec![Value::Nil]),
+        None => Ok(vec![Value::Nil]),
     }
 }

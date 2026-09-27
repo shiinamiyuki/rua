@@ -235,79 +235,6 @@ pub fn table_unpack(args: &[Value], _gc: &mut Gc) -> Result<Vec<Value>, LuaError
 }
 
 /// table.sort(list [, comp])
-/// Note: Custom comparator requires calling Lua functions from Rust.
-/// For now, we only support the default (< operator) comparison.
-/// Custom comparators will be handled via a flag-based approach.
-pub fn table_sort(args: &[Value], _gc: &mut Gc) -> Result<Vec<Value>, LuaError> {
-    let mut t = check_table(args, 0, "sort")?;
-    let has_comp = args.len() > 1 && !args[1].is_nil();
-
-    if has_comp {
-        return Err(LuaError::new(
-            "table.sort with custom comparator not yet supported",
-        ));
-    }
-
-    let tbl = t.as_object_mut().as_table_mut().unwrap();
-    let len = tbl.array.len();
-    if len <= 1 {
-        return Ok(vec![]);
-    }
-
-    // Default sort: use < comparison
-    // We need a stable sort for Lua semantics
-    let mut err: Option<LuaError> = None;
-    tbl.array[..len].sort_by(|a, b| {
-        if err.is_some() {
-            return std::cmp::Ordering::Equal;
-        }
-        match default_lt(*a, *b) {
-            Ok(true) => std::cmp::Ordering::Less,
-            Ok(false) => match default_lt(*b, *a) {
-                Ok(true) => std::cmp::Ordering::Greater,
-                Ok(false) => std::cmp::Ordering::Equal,
-                Err(e) => {
-                    err = Some(e);
-                    std::cmp::Ordering::Equal
-                }
-            },
-            Err(e) => {
-                err = Some(e);
-                std::cmp::Ordering::Equal
-            }
-        }
-    });
-
-    if let Some(e) = err {
-        return Err(e);
-    }
-    Ok(vec![])
-}
-
-/// Default less-than comparison for table.sort.
-fn default_lt(a: Value, b: Value) -> Result<bool, LuaError> {
-    match (a, b) {
-        (Value::Integer(x), Value::Integer(y)) => Ok(x < y),
-        (Value::Float(x), Value::Float(y)) => Ok(x < y),
-        (Value::Integer(x), Value::Float(y)) => Ok((x as f64) < y),
-        (Value::Float(x), Value::Integer(y)) => Ok(x < (y as f64)),
-        (Value::Object(ra), Value::Object(rb)) => {
-            let sa = ra.as_object().as_string();
-            let sb = rb.as_object().as_string();
-            if let (Some(a), Some(b)) = (sa, sb) {
-                Ok(a.as_bytes() < b.as_bytes())
-            } else {
-                Err(LuaError::new(
-                    "attempt to compare two non-comparable values in sort",
-                ))
-            }
-        }
-        _ => Err(LuaError::new(
-            "attempt to compare two non-comparable values in sort",
-        )),
-    }
-}
-
 /// table.create(narr [, nrec]) → table
 /// Lua 5.5 extension: pre-allocate array and hash parts.
 pub fn table_create(args: &[Value], gc: &mut Gc) -> Result<Vec<Value>, LuaError> {
@@ -326,7 +253,6 @@ pub fn table_functions() -> Vec<(&'static str, NativeFn)> {
         ("move", table_move),
         ("pack", table_pack),
         ("unpack", table_unpack),
-        ("sort", table_sort),
         ("create", table_create),
     ]
 }

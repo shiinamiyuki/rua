@@ -139,7 +139,14 @@ impl Parser {
             while self.eat(&TokenKind::Semicolon) {}
         }
 
-        Ok(Block { stmts, ret })
+        // Line of the last consumed token (the token that terminated the
+        // block, e.g. `end`), matching reference Lua's `close_func` lastline.
+        let end_line = if self.pos > 0 {
+            self.tokens[self.pos - 1].location.line
+        } else {
+            self.current_location().line
+        };
+        Ok(Block { stmts, ret, end_line })
     }
 
     // ── Return statement ───────────────────────────────────────────
@@ -429,12 +436,13 @@ impl Parser {
         let (params, has_varargs, vararg_name) = self.parse_parlist()?;
         self.expect(TokenKind::RParen)?;
         let body = self.parse_block()?;
-        self.expect(TokenKind::End)?;
+        let end_tok = self.expect(TokenKind::End)?;
         Ok(FuncBody {
             params,
             has_varargs,
             vararg_name,
             body,
+            end_line: end_tok.location.line,
         })
     }
 
@@ -640,25 +648,9 @@ impl Parser {
                 self.advance();
                 let inner = self.parse_expr()?;
                 self.expect(TokenKind::RParen)?;
-                // Wrap in a parenthesized form — but we just return the
-                // inner expression. The key is that this resets it from being
-                // a Var to not being one (no multi-return).
-                // We keep the inner but strip Var/FunctionCall wrappers
-                // by just returning it plainly. For the parser's purposes,
-                // we don't need a special "paren" node — but we must not
-                // treat `(f(x))` as a Var. We handle this by wrapping in
-                // a "group" that prevents assignment.
-                // We'll use a trick: wrap in UnOp with no-op? No. Let's
-                // just return inner expression but ensure expr_to_var fails.
-                // Actually the simplest approach: "(expr)" is not a Var,
-                // so we need to make sure the expr is NOT ExprKind::Var
-                // or ExprKind::FunctionCall. We can do this by keeping the
-                // expression as-is; it's already parsed and suffix chain
-                // will re-wrap it. The parenthesized form means we need
-                // special handling only when this is used as an lvalue.
-                // For now, let's just note that `(exp)` adjusts to 1 value.
-                // We keep a simple approach: return the inner expr as is for now.
-                inner
+                // `(expr)` adjusts to exactly one value and is not a
+                // valid assignment target / tail call.
+                Expr::new(ExprKind::Paren(Box::new(inner)), loc)
             }
             _ => {
                 return Err(self.error(format!(

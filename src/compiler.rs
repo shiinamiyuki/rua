@@ -23,14 +23,16 @@ pub fn compile(block: &Block, source: Option<String>) -> Result<Proto, LuaError>
         in_stack: true,
         index: 0,
     });
-    // Emit VARARGPREP for the top-level chunk (0 fixed params)
-    fs.emit_abc(OpCode::VarArgPrep, 0, 0, 0, 1);
+    // Emit VARARGPREP for the top-level chunk (0 fixed params). Line 0
+    // means "no line information" (it must not produce a line event).
+    fs.emit_abc(OpCode::VarArgPrep, 0, 0, 0, 0);
 
     compile_block(&mut fs, block)?;
 
     // Ensure the function ends with RETURN
-    let last_line = fs.last_line();
+    let last_line = block.end_line;
     fs.emit_abc(OpCode::Return, 0, 1, 0, last_line);
+    fs.proto.last_line_defined = last_line;
 
     Ok(fs.finish())
 }
@@ -145,6 +147,9 @@ impl FuncState {
         let pc = self.proto.code.len();
         self.proto.code.push(inst);
         self.proto.line_info.push(line);
+        // Record the current temporary high-water mark so the GC can root
+        // in-flight operands if this instruction triggers a collection.
+        self.proto.stack_top_at.push(self.free_reg);
         pc
     }
 
@@ -252,6 +257,17 @@ impl FuncState {
     }
 
     fn leave_scope(&mut self, line: u32) -> Result<(), LuaError> {
+        let breaks = self.leave_scope_unpatched(line)?;
+        let target = self.current_pc();
+        for pc in breaks {
+            self.patch_jmp(pc, target);
+        }
+        Ok(())
+    }
+
+    /// Pop the current scope, emit its CLOSE if needed, resolve its gotos,
+    /// and return the list of break jumps to be patched by the caller.
+    fn leave_scope_unpatched(&mut self, line: u32) -> Result<Vec<usize>, LuaError> {
         let scope = self.scopes.pop().expect("unbalanced scopes");
 
         // Check if any locals in this scope are <close> or capture upvalues
@@ -269,11 +285,7 @@ impl FuncState {
             self.emit_abc(OpCode::Close, first_reg, 0, 0, line);
         }
 
-        // Patch break jumps
-        let target = self.current_pc();
-        for pc in &scope.break_jumps {
-            self.patch_jmp(*pc, target);
-        }
+        // Break jumps are returned to the caller for patching.
 
         // Check for unresolved gotos
         let remaining_gotos: Vec<_> = self.pending_gotos.drain(scope.first_goto..).collect();
@@ -323,7 +335,7 @@ impl FuncState {
             self.free_reg_to(first_reg);
         }
 
-        Ok(())
+        Ok(scope.break_jumps)
     }
 
     fn add_local(&mut self, name: String) -> Result<u8, LuaError> {
@@ -540,10 +552,83 @@ fn compile_assign(
     let ntargets = targets.len();
     let nvalues = values.len();
 
-    // First, evaluate all values into consecutive temp registers
-    let base = fs.free_reg;
-    let temps_base = base;
+    // Reference Lua evaluates the target expressions (and resolves the
+    // names they use) before the right-hand side. This matters for both
+    // side effects and the order in which upvalues are captured.
+    enum Prepared {
+        Name {
+            local_reg: Option<u8>,
+            upval: Option<u8>,
+            env: Option<u8>,
+            key: Option<u8>,
+        },
+        Table {
+            tab: u8,
+            key: u8,
+        },
+    }
 
+    let base = fs.free_reg;
+    let mut prepared: Vec<Prepared> = Vec::with_capacity(ntargets);
+    for target in targets {
+        match target {
+            Var::Name(name) => {
+                if let Some(local_reg) = fs.find_local(name) {
+                    // Check const
+                    for local in fs.locals.iter().rev() {
+                        if local.name == *name {
+                            if local.is_const {
+                                return Err(LuaError::new(format!(
+                                    "attempt to assign to const variable '{name}'"
+                                )));
+                            }
+                            break;
+                        }
+                    }
+                    prepared.push(Prepared::Name {
+                        local_reg: Some(local_reg),
+                        upval: None,
+                        env: None,
+                        key: None,
+                    });
+                } else if let Some(uv) = fs.find_upvalue(name) {
+                    prepared.push(Prepared::Name {
+                        local_reg: None,
+                        upval: Some(uv),
+                        env: None,
+                        key: None,
+                    });
+                } else {
+                    let env = env_upvalue(fs)?;
+                    let k = fs.string_constant(name.as_bytes());
+                    prepared.push(Prepared::Name {
+                        local_reg: None,
+                        upval: None,
+                        env: Some(env),
+                        key: Some(k as u8),
+                    });
+                }
+            }
+            Var::Index { table, key } => {
+                let tab = fs.alloc_reg()?;
+                compile_expr_to_reg(fs, table, tab)?;
+                let key_reg = fs.alloc_reg()?;
+                compile_expr_to_reg(fs, key, key_reg)?;
+                prepared.push(Prepared::Table { tab, key: key_reg });
+            }
+            Var::Field { table, name } => {
+                let tab = fs.alloc_reg()?;
+                compile_expr_to_reg(fs, table, tab)?;
+                let key_reg = fs.alloc_reg()?;
+                let k = fs.string_constant(name.as_bytes());
+                fs.emit_abx(OpCode::LoadK, key_reg, k, line);
+                prepared.push(Prepared::Table { tab, key: key_reg });
+            }
+        }
+    }
+
+    // Evaluate all values into consecutive temp registers.
+    let temps_base = fs.free_reg;
     for (i, val) in values.iter().enumerate() {
         let is_last = i == nvalues - 1;
         if is_last && ntargets > nvalues {
@@ -566,67 +651,39 @@ fn compile_assign(
         fs.emit_abc(OpCode::LoadNil, reg, (ntargets - 1) as u8, 0, line);
     }
 
-    // Now assign from temps to targets (in reverse to handle overlapping correctly)
-    for (i, target) in targets.iter().enumerate() {
+    // Assign from temps to targets.
+    for (i, prep) in prepared.iter().enumerate() {
         let src_reg = temps_base + i as u8;
-        compile_assign_var(fs, target, src_reg, line)?;
+        match prep {
+            Prepared::Name {
+                local_reg,
+                upval,
+                env,
+                key,
+            } => {
+                if let Some(local_reg) = local_reg {
+                    if *local_reg != src_reg {
+                        fs.emit_abc(OpCode::Move, *local_reg, src_reg, 0, line);
+                    }
+                } else if let Some(uv) = upval {
+                    fs.emit_abc(OpCode::SetUpval, src_reg, *uv, 0, line);
+                } else {
+                    fs.emit_abc(
+                        OpCode::SetTabUp,
+                        env.unwrap(),
+                        key.unwrap(),
+                        src_reg,
+                        line,
+                    );
+                }
+            }
+            Prepared::Table { tab, key } => {
+                fs.emit_abc(OpCode::SetTable, *tab, *key, src_reg, line);
+            }
+        }
     }
 
     fs.free_reg_to(base);
-    Ok(())
-}
-
-fn compile_assign_var(
-    fs: &mut FuncState,
-    var: &Var,
-    src_reg: u8,
-    line: u32,
-) -> Result<(), LuaError> {
-    match var {
-        Var::Name(name) => {
-            if let Some(local_reg) = fs.find_local(name) {
-                // Check const
-                for local in fs.locals.iter().rev() {
-                    if local.name == *name {
-                        if local.is_const {
-                            return Err(LuaError::new(format!(
-                                "attempt to assign to const variable '{name}'"
-                            )));
-                        }
-                        break;
-                    }
-                }
-                if local_reg != src_reg {
-                    fs.emit_abc(OpCode::Move, local_reg, src_reg, 0, line);
-                }
-            } else if let Some(uv) = fs.find_upvalue(name) {
-                fs.emit_abc(OpCode::SetUpval, src_reg, uv, 0, line);
-            } else {
-                // Global: _ENV[name]
-                let k = fs.string_constant(name.as_bytes());
-                fs.emit_abc(OpCode::SetTabUp, 0, k as u8, src_reg, line);
-            }
-        }
-        Var::Index { table, key } => {
-            let base = fs.free_reg;
-            let tab_reg = fs.alloc_reg()?;
-            compile_expr_to_reg(fs, table, tab_reg)?;
-            let key_reg = fs.alloc_reg()?;
-            compile_expr_to_reg(fs, key, key_reg)?;
-            fs.emit_abc(OpCode::SetTable, tab_reg, key_reg, src_reg, line);
-            fs.free_reg_to(base);
-        }
-        Var::Field { table, name } => {
-            let base = fs.free_reg;
-            let tab_reg = fs.alloc_reg()?;
-            compile_expr_to_reg(fs, table, tab_reg)?;
-            let key_reg = fs.alloc_reg()?;
-            let k = fs.string_constant(name.as_bytes());
-            fs.emit_abx(OpCode::LoadK, key_reg, k, line);
-            fs.emit_abc(OpCode::SetTable, tab_reg, key_reg, src_reg, line);
-            fs.free_reg_to(base);
-        }
-    }
     Ok(())
 }
 
@@ -658,25 +715,35 @@ fn compile_while(
     let base = fs.free_reg;
     let cond_reg = fs.alloc_reg()?;
     compile_expr_to_reg(fs, cond, cond_reg)?;
+    let cond_line = fs.last_line();
     // TEST cond_reg, 0 — skip next if falsy
-    fs.emit_abc(OpCode::Test, cond_reg, 0, 0, line);
-    let exit_jmp = fs.emit_jmp(line);
+    fs.emit_abc(OpCode::Test, cond_reg, 0, 0, cond_line);
+    let exit_jmp = fs.emit_jmp(cond_line);
     fs.free_reg_to(base);
 
     // Body
     fs.enter_scope(true);
     compile_block(fs, body)?;
-    fs.leave_scope(line)?;
+    // Close the scope before looping back; break jumps must land *after*
+    // the back-jump, so patch them explicitly below.
+    let breaks = fs.leave_scope_unpatched(line)?;
 
-    // Jump back to condition
-    let loop_jmp = fs.emit_jmp(line);
+    // Jump back to condition. The jump carries the line of the last body
+    // instruction (no line event); the line event is produced when the
+    // backward jump reaches the condition.
+    let back_line = fs.last_line();
+    let loop_jmp = fs.emit_jmp(back_line);
     fs.patch_sbx(loop_jmp, loop_start.wrapping_sub(1)); // -1 because PC is post-increment
     // Patch to jump back: the offset should be loop_start - (loop_jmp + 1)
     let offset = loop_start as i32 - (loop_jmp as i32 + 1);
     fs.proto.code[loop_jmp] = encode_asbx(OpCode::Jmp, 0, offset as i16);
 
-    // Patch exit jump to here
-    fs.patch_jmp(exit_jmp, fs.current_pc());
+    // Patch exit jump and all breaks to the loop exit.
+    let exit = fs.current_pc();
+    fs.patch_jmp(exit_jmp, exit);
+    for pc in breaks {
+        fs.patch_jmp(pc, exit);
+    }
 
     Ok(())
 }
@@ -697,10 +764,11 @@ fn compile_repeat(
     let cond_reg = fs.alloc_reg()?;
     compile_expr_to_reg(fs, cond, cond_reg)?;
 
+    let cond_line = fs.last_line();
     // TEST cond_reg, 0 — skip if falsy (i.e., repeat body)
-    fs.emit_abc(OpCode::Test, cond_reg, 0, 0, line);
+    fs.emit_abc(OpCode::Test, cond_reg, 0, 0, cond_line);
     // If falsy, jump back to loop_start
-    let back_jmp = fs.emit_jmp(line);
+    let back_jmp = fs.emit_jmp(cond_line);
     let offset = loop_start as i32 - (back_jmp as i32 + 1);
     fs.proto.code[back_jmp] = encode_asbx(OpCode::Jmp, 0, offset as i16);
 
@@ -724,16 +792,17 @@ fn compile_if(
     let base = fs.free_reg;
     let cond_reg = fs.alloc_reg()?;
     compile_expr_to_reg(fs, cond, cond_reg)?;
-    fs.emit_abc(OpCode::Test, cond_reg, 0, 0, line);
-    let false_jmp = fs.emit_jmp(line);
+    let cond_line = fs.last_line();
+    fs.emit_abc(OpCode::Test, cond_reg, 0, 0, cond_line);
+    let false_jmp = fs.emit_jmp(cond_line);
     fs.free_reg_to(base);
 
     fs.enter_scope(false);
     compile_block(fs, then_block)?;
-    fs.leave_scope(line)?;
+    fs.leave_scope(cond_line)?;
 
     if !elseif_clauses.is_empty() || else_block.is_some() {
-        end_jumps.push(fs.emit_jmp(line));
+        end_jumps.push(fs.emit_jmp(fs.last_line()));
     }
     fs.patch_jmp(false_jmp, fs.current_pc());
 
@@ -743,15 +812,16 @@ fn compile_if(
         let base = fs.free_reg;
         let cond_reg = fs.alloc_reg()?;
         compile_expr_to_reg(fs, elseif_cond, cond_reg)?;
-        fs.emit_abc(OpCode::Test, cond_reg, 0, 0, elseif_line);
-        let false_jmp = fs.emit_jmp(elseif_line);
+        let cond_line = fs.last_line();
+        fs.emit_abc(OpCode::Test, cond_reg, 0, 0, cond_line);
+        let false_jmp = fs.emit_jmp(cond_line);
         fs.free_reg_to(base);
 
         fs.enter_scope(false);
         compile_block(fs, elseif_body)?;
-        fs.leave_scope(elseif_line)?;
+        fs.leave_scope(cond_line)?;
 
-        end_jumps.push(fs.emit_jmp(elseif_line));
+        end_jumps.push(fs.emit_jmp(fs.last_line()));
         fs.patch_jmp(false_jmp, fs.current_pc());
     }
 
@@ -759,7 +829,7 @@ fn compile_if(
     if let Some(else_blk) = else_block {
         fs.enter_scope(false);
         compile_block(fs, else_blk)?;
-        fs.leave_scope(line)?;
+        fs.leave_scope(fs.last_line())?;
     }
 
     // Patch all end jumps to here
@@ -811,14 +881,6 @@ fn compile_numeric_for(
     let body_start = fs.current_pc();
     compile_block(fs, body)?;
 
-    // FORLOOP: step + compare + branch back
-    let forloop_pc = fs.emit_asbx(OpCode::ForLoop, base, 0, line);
-
-    // Patch FORPREP to jump to FORLOOP
-    fs.patch_sbx(forprep_pc, forloop_pc);
-    // Patch FORLOOP to jump back to body start
-    fs.patch_sbx(forloop_pc, body_start);
-
     // Remove the loop variable local
     let local = fs.locals.pop().unwrap();
     fs.proto.locals.push(LocalVarInfo {
@@ -827,7 +889,21 @@ fn compile_numeric_for(
         end_pc: fs.proto.code.len() as u32,
     });
 
-    fs.leave_scope(line)?;
+    // Close the scope before the loop-back test; breaks exit past FORLOOP.
+    let breaks = fs.leave_scope_unpatched(line)?;
+
+    // FORLOOP: step + compare + branch back
+    let forloop_pc = fs.emit_asbx(OpCode::ForLoop, base, 0, line);
+
+    // Patch FORPREP to jump to FORLOOP
+    fs.patch_sbx(forprep_pc, forloop_pc);
+    // Patch FORLOOP to jump back to body start
+    fs.patch_sbx(forloop_pc, body_start);
+
+    let exit = fs.current_pc();
+    for pc in breaks {
+        fs.patch_jmp(pc, exit);
+    }
 
     Ok(())
 }
@@ -1049,7 +1125,8 @@ fn compile_func_body(
 
     // VARARGPREP if variadic
     if body.has_varargs {
-        child_fs.emit_abc(OpCode::VarArgPrep, body.params.len() as u8, 0, 0, line);
+        // Line 0: no line information for VARARGPREP.
+        child_fs.emit_abc(OpCode::VarArgPrep, body.params.len() as u8, 0, 0, 0);
     }
 
     // Register parameters as locals
@@ -1071,7 +1148,7 @@ fn compile_func_body(
     compile_block(&mut child_fs, &body.body)?;
 
     // Ensure function ends with RETURN
-    let last_line = child_fs.last_line();
+    let last_line = body.end_line;
     child_fs.emit_abc(OpCode::Return, 0, 1, 0, last_line);
 
     child_fs.leave_scope(line)?;
@@ -1097,7 +1174,7 @@ fn compile_func_def(
 
     let base = fs.free_reg;
     let dest = fs.alloc_reg()?;
-    fs.emit_abx(OpCode::Closure, dest, proto_idx, line);
+    fs.emit_abx(OpCode::Closure, dest, proto_idx, body.end_line);
 
     // Assign to the name path: name.path[0].path[1]...
     if name.path.len() == 1 && name.method.is_none() {
@@ -1108,8 +1185,9 @@ fn compile_func_def(
         } else if let Some(uv) = fs.find_upvalue(func_name) {
             fs.emit_abc(OpCode::SetUpval, dest, uv, 0, line);
         } else {
+            let env = env_upvalue(fs)?;
             let k = fs.string_constant(func_name.as_bytes());
-            fs.emit_abc(OpCode::SetTabUp, 0, k as u8, dest, line);
+            fs.emit_abc(OpCode::SetTabUp, env, k as u8, dest, line);
         }
     } else {
         // Dotted name: function a.b.c() ... end
@@ -1121,12 +1199,19 @@ fn compile_func_def(
         } else if let Some(uv) = fs.find_upvalue(first_name) {
             fs.emit_abc(OpCode::GetUpval, tab_reg, uv, 0, line);
         } else {
+            let env = env_upvalue(fs)?;
             let k = fs.string_constant(first_name.as_bytes());
-            fs.emit_abc(OpCode::GetTabUp, tab_reg, 0, k as u8, line);
+            fs.emit_abc(OpCode::GetTabUp, tab_reg, env, k as u8, line);
         }
 
-        // Chain through .path elements
-        for seg in &name.path[1..] {
+        // Chain through intermediate .path elements (the last segment, or
+        // the method name, is the field being assigned below).
+        let chain_end = if name.method.is_some() {
+            name.path.len()
+        } else {
+            name.path.len().saturating_sub(1)
+        };
+        for seg in &name.path[1..chain_end] {
             let key_reg = fs.alloc_reg()?;
             let k = fs.string_constant(seg.as_bytes());
             fs.emit_abx(OpCode::LoadK, key_reg, k, line);
@@ -1159,7 +1244,7 @@ fn compile_local_func_def(
     let proto_idx = fs.proto.protos.len() as u16;
     fs.proto.protos.push(proto);
 
-    fs.emit_abx(OpCode::Closure, reg, proto_idx, line);
+    fs.emit_abx(OpCode::Closure, reg, proto_idx, body.end_line);
     Ok(())
 }
 
@@ -1176,11 +1261,12 @@ fn compile_global_func_def(
     let proto_idx = fs.proto.protos.len() as u16;
     fs.proto.protos.push(proto);
 
-    fs.emit_abx(OpCode::Closure, dest, proto_idx, line);
+    fs.emit_abx(OpCode::Closure, dest, proto_idx, body.end_line);
 
     // Assign to _ENV[name]
+    let env = env_upvalue(fs)?;
     let k = fs.string_constant(name.as_bytes());
-    fs.emit_abc(OpCode::SetTabUp, 0, k as u8, dest, line);
+    fs.emit_abc(OpCode::SetTabUp, env, k as u8, dest, line);
 
     fs.free_reg_to(base);
     Ok(())
@@ -1200,13 +1286,12 @@ fn compile_func_body_with_parent(
 
     child_fs.proto.num_params = body.params.len() as u8;
     child_fs.proto.is_vararg = body.has_varargs;
-
-    // _ENV as upvalue[0] — resolve from parent
-    let env_uv = resolve_parent_upvalue(parent_fs, "_ENV");
-    child_fs.proto.upvalues.push(env_uv);
+    child_fs.proto.line_defined = line;
+    child_fs.proto.last_line_defined = body.end_line;
 
     if body.has_varargs {
-        child_fs.emit_abc(OpCode::VarArgPrep, body.params.len() as u8, 0, 0, line);
+        // Line 0: no line information for VARARGPREP.
+        child_fs.emit_abc(OpCode::VarArgPrep, body.params.len() as u8, 0, 0, 0);
     }
 
     child_fs.enter_scope(false);
@@ -1230,6 +1315,8 @@ fn compile_func_body_with_parent(
     // has one level of context, so deeply-nested references would otherwise
     // fail to resolve through the grandparent chain.
     let free_names = collect_free_names(&body.body, &body.params);
+    // Ensure the parent chain has _ENV available for implicit global access.
+    parent_fs.find_upvalue("_ENV");
     for name in &free_names {
         // Only resolve if the parent doesn't already have it as a local or upvalue
         if parent_fs.find_local(name).is_none() {
@@ -1256,15 +1343,14 @@ fn compile_func_body_with_parent(
 
     compile_block(&mut child_fs, &body.body)?;
 
-    let last_line = child_fs.last_line();
+    let last_line = body.end_line;
     child_fs.emit_abc(OpCode::Return, 0, 1, 0, last_line);
 
-    child_fs.leave_scope(line)?;
+    child_fs.leave_scope(last_line)?;
 
     // Now reconcile upvalues: the child may have added upvalues referencing
     // the parent. We need to mirror those additions into the real parent_fs.
-    // upvalues[0] is _ENV (already handled).
-    for uv in &child_fs.proto.upvalues[1..] {
+    for uv in &child_fs.proto.upvalues {
         if uv.in_stack {
             // This upvalue captures a parent local. Mark the parent scope.
             let name = uv.name.as_deref().unwrap_or("");
@@ -1426,6 +1512,9 @@ fn collect_free_names_expr(expr: &ExprKind, locals: &mut Vec<String>, names: &mu
         }
         ExprKind::UnOp { operand, .. } => {
             collect_free_names_expr(&operand.node, locals, names);
+        }
+        ExprKind::Paren(inner) => {
+            collect_free_names_expr(&inner.node, locals, names);
         }
         ExprKind::Nil | ExprKind::True | ExprKind::False
         | ExprKind::Integer(_) | ExprKind::Float(_)
@@ -1620,18 +1709,24 @@ fn compile_global_decl(
         }
     }
 
-    // Assign to _ENV for each name
+    // Assign to _ENV for each name. A declaration without a value
+    // (`global foo`) emits no runtime code: it only declares the name.
+    if nvalues == 0 {
+        fs.free_reg_to(base);
+        return Ok(());
+    }
+    let env = env_upvalue(fs)?;
     for (i, att_name) in names.iter().enumerate() {
         let k = fs.string_constant(att_name.name.as_bytes());
         if i < nvalues || (nvalues > 0 && nnames > nvalues) {
             // Has a value
             let src_reg = base + i as u8;
-            fs.emit_abc(OpCode::SetTabUp, 0, k as u8, src_reg, line);
+            fs.emit_abc(OpCode::SetTabUp, env, k as u8, src_reg, line);
         } else {
             // No value — assign nil
             let tmp = fs.alloc_reg()?;
             fs.emit_abc(OpCode::LoadNil, tmp, 0, 0, line);
-            fs.emit_abc(OpCode::SetTabUp, 0, k as u8, tmp, line);
+            fs.emit_abc(OpCode::SetTabUp, env, k as u8, tmp, line);
             fs.free_reg_to(tmp);
         }
     }
@@ -1645,6 +1740,9 @@ fn compile_global_decl(
 fn compile_return(fs: &mut FuncState, ret: &RetStat) -> Result<(), LuaError> {
     let line = ret.location.line;
     let nvals = ret.values.len();
+    if nvals > 254 {
+        return Err(LuaError::new("too many returns"));
+    }
 
     if nvals == 0 {
         fs.emit_abc(OpCode::Return, 0, 1, 0, line);
@@ -1734,11 +1832,16 @@ fn compile_expr_to_reg(fs: &mut FuncState, expr: &Expr, dest: u8) -> Result<(), 
         ExprKind::FunctionCall(call) => {
             compile_funcall(fs, call, dest, 2, false, line)?; // C=2: one result
         }
+        ExprKind::Paren(inner) => {
+            compile_expr_to_reg(fs, inner, dest)?;
+        }
         ExprKind::FunctionDef(body) => {
             let proto = compile_func_body_with_parent(fs, body, line)?;
             let proto_idx = fs.proto.protos.len() as u16;
             fs.proto.protos.push(proto);
-            fs.emit_abx(OpCode::Closure, dest, proto_idx, line);
+            // Reference Lua emits CLOSURE after parsing the body, so the
+            // instruction carries the line of the closing `end`.
+            fs.emit_abx(OpCode::Closure, dest, proto_idx, body.end_line);
         }
         ExprKind::TableConstructor(fields) => {
             compile_table_constructor(fs, fields, dest, line)?;
@@ -1786,6 +1889,13 @@ fn compile_expr_multi(
 
 // ── Variable read ──────────────────────────────────────────────────
 
+/// The upvalue index holding `_ENV` in the current function. Global
+/// accesses resolve it lazily so upvalues appear in first-use order.
+fn env_upvalue(fs: &mut FuncState) -> Result<u8, LuaError> {
+    fs.find_upvalue("_ENV")
+        .ok_or_else(|| LuaError::new("cannot resolve '_ENV' upvalue"))
+}
+
 fn compile_var_read(
     fs: &mut FuncState,
     var: &Var,
@@ -1802,8 +1912,9 @@ fn compile_var_read(
                 fs.emit_abc(OpCode::GetUpval, dest, uv, 0, line);
             } else {
                 // Global: _ENV[name]
+                let env = env_upvalue(fs)?;
                 let k = fs.string_constant(name.as_bytes());
-                fs.emit_abc(OpCode::GetTabUp, dest, 0, k as u8, line);
+                fs.emit_abc(OpCode::GetTabUp, dest, env, k as u8, line);
             }
         }
         Var::Index { table, key } => {

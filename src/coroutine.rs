@@ -52,4 +52,12 @@ pub struct Coroutine {
     pub is_main: bool,
     /// Pcall/xpcall guards (swapped with Vm on resume/yield).
     pub pcall_guards: Vec<PcallGuard>,
+    /// Debug hook function (None = no hook).
+    pub hook_func: Option<GcRef>,
+    /// Debug hook mask (call/return/line/count bits).
+    pub hook_mask: u8,
+    /// Count-hook interval (0 = none).
+    pub hook_count: i64,
+    /// Remaining instructions until the next count hook fires.
+    pub hook_counter: i64,
 }

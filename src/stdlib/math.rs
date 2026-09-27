@@ -207,8 +207,12 @@ fn lua_less_than(a: Value, b: Value) -> Result<bool, LuaError> {
 
 pub fn math_modf(args: &[Value], _gc: &mut Gc) -> Result<Vec<Value>, LuaError> {
     let x = check_number(args, 0, "modf")?;
-    let trunc = x.trunc();
-    let frac = x.fract();
+    // C's modf returns a signed zero fractional part for infinities.
+    let (trunc, frac) = if x.is_infinite() {
+        (x, 0.0 * x.signum())
+    } else {
+        (x.trunc(), x.fract())
+    };
     let i = trunc as i64;
     let int_part = if i as f64 == trunc && trunc >= i64::MIN as f64 && trunc <= i64::MAX as f64 {
         Value::Integer(i)

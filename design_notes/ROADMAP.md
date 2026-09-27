@@ -244,7 +244,7 @@ Goal: Full language coverage except FFI. All standard libraries functional.
 - [x] `debug.sethook`, `debug.gethook` (stubs — no-op / returns nil)
 - [x] `debug.upvalueid`, `debug.upvaluejoin`
 - [x] `debug.getuservalue`, `debug.setuservalue`
-- [ ] `debug.getregistry`
+- [x] `debug.getregistry`
 
 **Milestone check:** Full Lua 5.5 test suite passes (excluding C-API tests).
 
@@ -299,7 +299,7 @@ Goal: Performance comparable to PUC-Rio Lua. Production-ready interpreter.
 - [x] Precompiled chunk load/dump (binary format compatible or custom)
 - [x] `string.dump` / `load` binary chunk support
 - [ ] Complete CLI: `rua -i` interactive REPL, `rua -l lib`, `rua -W` warnings
-- [ ] `warn()` function and control messages (`@on`, `@off`)
+- [x] `warn()` function and control messages (`@on`, `@off`, `@store`, `@normal`)
 - [ ] Comprehensive error messages with source locations
 - [ ] Documentation: README, usage guide, architecture docs
 

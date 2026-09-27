@@ -2,6 +2,7 @@
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
+use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
 use crate::closure::{Closure, NativeFn};
 use crate::error::LuaError;
@@ -22,6 +23,10 @@ enum FileKind {
     Stdout,
     Stderr,
     Closed,
+    /// `io.popen(cmd, "r")`: read the child's stdout.
+    ReadPipe(Child, BufReader<ChildStdout>),
+    /// `io.popen(cmd, "w")`: write to the child's stdin.
+    WritePipe(Child, ChildStdin),
 }
 
 impl LuaFile {
@@ -48,6 +53,7 @@ impl LuaFile {
         let n = match &mut self.kind {
             FileKind::Regular(r) => r.read_line(&mut buf)?,
             FileKind::Stdin => io::stdin().lock().read_line(&mut buf)?,
+            FileKind::ReadPipe(_, r) => r.read_line(&mut buf)?,
             FileKind::Closed => return Err(io::Error::new(io::ErrorKind::Other, "file is closed")),
             _ => return Err(io::Error::new(io::ErrorKind::Other, "not open for reading")),
         };
@@ -66,6 +72,7 @@ impl LuaFile {
         match &mut self.kind {
             FileKind::Regular(r) => { r.read_to_end(&mut buf)?; }
             FileKind::Stdin => { io::stdin().lock().read_to_end(&mut buf)?; }
+            FileKind::ReadPipe(_, r) => { r.read_to_end(&mut buf)?; }
             FileKind::Closed => return Err(io::Error::new(io::ErrorKind::Other, "file is closed")),
             _ => return Err(io::Error::new(io::ErrorKind::Other, "not open for reading")),
         }
@@ -77,6 +84,7 @@ impl LuaFile {
         let bytes_read = match &mut self.kind {
             FileKind::Regular(r) => r.read(&mut buf)?,
             FileKind::Stdin => io::stdin().lock().read(&mut buf)?,
+            FileKind::ReadPipe(_, r) => r.read(&mut buf)?,
             FileKind::Closed => return Err(io::Error::new(io::ErrorKind::Other, "file is closed")),
             _ => return Err(io::Error::new(io::ErrorKind::Other, "not open for reading")),
         };
@@ -118,6 +126,7 @@ impl LuaFile {
         let n = match &mut self.kind {
             FileKind::Regular(r) => r.read(&mut buf)?,
             FileKind::Stdin => io::stdin().lock().read(&mut buf)?,
+            FileKind::ReadPipe(_, r) => r.read(&mut buf)?,
             FileKind::Closed => return Err(io::Error::new(io::ErrorKind::Other, "file is closed")),
             _ => return Err(io::Error::new(io::ErrorKind::Other, "not open for reading")),
         };
@@ -131,8 +140,12 @@ impl LuaFile {
             FileKind::Regular(r) => r.get_mut().write_all(data)?,
             FileKind::Stdout => io::stdout().write_all(data)?,
             FileKind::Stderr => io::stderr().write_all(data)?,
+            FileKind::WritePipe(_, w) => w.write_all(data)?,
             FileKind::Closed => return Err(io::Error::new(io::ErrorKind::Other, "file is closed")),
             FileKind::Stdin => return Err(io::Error::new(io::ErrorKind::Other, "not open for writing")),
+            FileKind::ReadPipe(..) => {
+                return Err(io::Error::new(io::ErrorKind::Other, "not open for writing"))
+            }
         }
         Ok(())
     }
@@ -142,6 +155,7 @@ impl LuaFile {
             FileKind::Regular(r) => r.get_mut().flush(),
             FileKind::Stdout => io::stdout().flush(),
             FileKind::Stderr => io::stderr().flush(),
+            FileKind::WritePipe(_, w) => w.flush(),
             _ => Ok(()),
         }
     }
@@ -159,8 +173,21 @@ impl LuaFile {
         }
     }
 
-    fn close(&mut self) {
-        self.kind = FileKind::Closed;
+    /// Close the file. For pipes, waits for the child and returns its
+    /// termination info as `(what, code)` where `what` is "exit" or "signal".
+    fn close(&mut self) -> Option<(String, i64)> {
+        let old = std::mem::replace(&mut self.kind, FileKind::Closed);
+        match old {
+            FileKind::ReadPipe(mut child, reader) => {
+                drop(reader); // close the read end first so the child sees EOF
+                child.wait().ok().map(pclose_result)
+            }
+            FileKind::WritePipe(mut child, writer) => {
+                drop(writer); // close the write end first
+                child.wait().ok().map(pclose_result)
+            }
+            _ => None,
+        }
     }
 }
 
@@ -187,6 +214,39 @@ fn get_file_mut<'a>(args: &[Value], idx: usize, fname: &str) -> Result<&'a mut L
         _ => Err(LuaError::new(format!(
             "bad argument #{} to '{}' (FILE* expected)", idx + 1, fname))),
     }
+}
+
+/// Borrow a `LuaFile` from a `GcRef`, breaking the artificial lifetime tie
+/// (same raw-pointer approach as `get_file_mut`).
+fn file_mut_from_ref<'a>(r: GcRef, fname: &str) -> Result<&'a mut LuaFile, LuaError> {
+    let obj: &mut crate::gc::GcObject =
+        unsafe { &mut *(r.ptr_value() as *mut crate::gc::GcObject) };
+    let ud = obj
+        .as_userdata_mut()
+        .ok_or_else(|| LuaError::new(format!("bad argument to '{fname}' (FILE* expected)")))?;
+    ud.data
+        .downcast_mut::<LuaFile>()
+        .ok_or_else(|| LuaError::new(format!("bad argument to '{fname}' (FILE* expected)")))
+}
+
+/// Current default input handle, creating the stdin handle lazily.
+fn ensure_default_input(gc: &mut Gc) -> GcRef {
+    if let Some(r) = gc.io_input {
+        return r;
+    }
+    let r = new_file_handle(gc, LuaFile::stdin());
+    gc.io_input = Some(r);
+    r
+}
+
+/// Current default output handle, creating the stdout handle lazily.
+fn ensure_default_output(gc: &mut Gc) -> GcRef {
+    if let Some(r) = gc.io_output {
+        return r;
+    }
+    let r = new_file_handle(gc, LuaFile::stdout());
+    gc.io_output = Some(r);
+    r
 }
 
 /// Perform a read operation on a LuaFile for one format argument.
@@ -313,8 +373,17 @@ pub fn file_close(args: &[Value], _gc: &mut Gc) -> Result<Vec<Value>, LuaError> 
     if !file.closable {
         return Err(LuaError::new("cannot close standard file"));
     }
-    file.close();
-    Ok(vec![Value::Boolean(true)])
+    match file.close() {
+        Some((what, code)) => {
+            let ok = what == "exit" && code == 0;
+            Ok(vec![
+                if ok { Value::Boolean(true) } else { Value::Nil },
+                Value::Object(_gc.new_string(what.as_bytes())),
+                Value::Integer(code),
+            ])
+        }
+        None => Ok(vec![Value::Boolean(true)]),
+    }
 }
 
 pub fn file_seek(args: &[Value], gc: &mut Gc) -> Result<Vec<Value>, LuaError> {
@@ -343,7 +412,21 @@ pub fn file_flush(args: &[Value], _gc: &mut Gc) -> Result<Vec<Value>, LuaError> 
 }
 
 pub fn file_setvbuf(args: &[Value], _gc: &mut Gc) -> Result<Vec<Value>, LuaError> {
-    // Stub: Rust handles its own buffering
+    // Validate the mode ("no", "full", "line") and size, then accept it.
+    // Buffering is managed by Rust; the mode is treated as advisory.
+    let mode = match args.get(1) {
+        Some(Value::Object(r)) if r.as_object().as_string().is_some() => {
+            String::from_utf8_lossy(r.as_object().as_string().unwrap().as_bytes()).to_string()
+        }
+        _ => {
+            return Err(LuaError::new(
+                "bad argument #2 to 'setvbuf' (string expected)",
+            ))
+        }
+    };
+    if !matches!(mode.as_str(), "no" | "full" | "line") {
+        return Err(LuaError::new(format!("invalid option '{mode}'")));
+    }
     let file_val = args.first().copied().unwrap_or(Value::Nil);
     Ok(vec![file_val])
 }
@@ -433,34 +516,51 @@ pub fn io_open(args: &[Value], gc: &mut Gc) -> Result<Vec<Value>, LuaError> {
     Ok(vec![Value::Object(handle)])
 }
 
-pub fn io_close(args: &[Value], _gc: &mut Gc) -> Result<Vec<Value>, LuaError> {
+pub fn io_close(args: &[Value], gc: &mut Gc) -> Result<Vec<Value>, LuaError> {
     if args.is_empty() {
-        // Close default output (stdout) — no-op for standard files
+        // Close the default output file (standard handles are not closable).
+        let fref = ensure_default_output(gc);
+        let file = file_mut_from_ref(fref, "close")?;
+        if file.closable {
+            file.close();
+        }
         return Ok(vec![Value::Boolean(true)]);
     }
     let file = get_file_mut(args, 0, "close")?;
     if !file.closable {
         return Err(LuaError::new("cannot close standard file"));
     }
-    file.close();
-    Ok(vec![Value::Boolean(true)])
+    match file.close() {
+        Some((what, code)) => {
+            let ok = what == "exit" && code == 0;
+            Ok(vec![
+                if ok { Value::Boolean(true) } else { Value::Nil },
+                Value::Object(gc.new_string(what.as_bytes())),
+                Value::Integer(code),
+            ])
+        }
+        None => Ok(vec![Value::Boolean(true)]),
+    }
 }
 
 pub fn io_read(args: &[Value], gc: &mut Gc) -> Result<Vec<Value>, LuaError> {
-    let mut stdin_file = LuaFile::stdin();
+    let fref = ensure_default_input(gc);
+    let file = file_mut_from_ref(fref, "read")?;
     if args.is_empty() {
-        let v = do_read_one(&mut stdin_file, Value::Nil, gc)?;
+        let v = do_read_one(file, Value::Nil, gc)?;
         return Ok(vec![v]);
     }
     let mut results = Vec::new();
     for arg in args {
-        let v = do_read_one(&mut stdin_file, *arg, gc)?;
+        let v = do_read_one(file, *arg, gc)?;
         results.push(v);
     }
     Ok(results)
 }
 
-pub fn io_write(args: &[Value], _gc: &mut Gc) -> Result<Vec<Value>, LuaError> {
+pub fn io_write(args: &[Value], gc: &mut Gc) -> Result<Vec<Value>, LuaError> {
+    let fref = ensure_default_output(gc);
+    let file = file_mut_from_ref(fref, "write")?;
     for arg in args {
         let data = match arg {
             Value::Object(r) if r.as_object().as_string().is_some() => {
@@ -470,15 +570,16 @@ pub fn io_write(args: &[Value], _gc: &mut Gc) -> Result<Vec<Value>, LuaError> {
             Value::Float(n) => format!("{n}").into_bytes(),
             _ => return Err(LuaError::new("bad argument to 'write' (string or number expected)")),
         };
-        io::stdout().write_all(&data).map_err(|e| LuaError::new(e.to_string()))?;
+        file.write_bytes(&data).map_err(|e| LuaError::new(e.to_string()))?;
     }
-    // Return io.stdout handle... but we don't have it here.
-    // Return true for compatibility.
-    Ok(vec![Value::Boolean(true)])
+    // On success, return the file handle (matches reference Lua).
+    Ok(vec![Value::Object(fref)])
 }
 
-pub fn io_flush(_args: &[Value], _gc: &mut Gc) -> Result<Vec<Value>, LuaError> {
-    io::stdout().flush().map_err(|e| LuaError::new(e.to_string()))?;
+pub fn io_flush(_args: &[Value], gc: &mut Gc) -> Result<Vec<Value>, LuaError> {
+    let fref = ensure_default_output(gc);
+    let file = file_mut_from_ref(fref, "flush")?;
+    file.flush().map_err(|e| LuaError::new(e.to_string()))?;
     Ok(vec![Value::Boolean(true)])
 }
 
@@ -512,19 +613,17 @@ pub fn io_tmpfile(_args: &[Value], gc: &mut Gc) -> Result<Vec<Value>, LuaError> 
 
 pub fn io_lines(args: &[Value], gc: &mut Gc) -> Result<Vec<Value>, LuaError> {
     if args.is_empty() {
-        // io.lines() — iterate lines from stdin
+        // io.lines() — iterate lines from the default input file.
+        let fref = ensure_default_input(gc);
         let iter_fn = move |_args: &[Value], gc: &mut Gc| -> Result<Vec<Value>, LuaError> {
-            let mut line = String::new();
-            let n = io::stdin().lock().read_line(&mut line)
-                .map_err(|e| LuaError::new(e.to_string()))?;
-            if n == 0 {
-                return Ok(vec![Value::Nil]);
+            let file = file_mut_from_ref(fref, "lines")?;
+            match file.read_line(false) {
+                Ok(Some(bytes)) => Ok(vec![Value::Object(gc.new_string(&bytes))]),
+                Ok(None) => Ok(vec![Value::Nil]),
+                Err(e) => Err(LuaError::new(e.to_string())),
             }
-            if line.ends_with('\n') { line.pop(); }
-            if line.ends_with('\r') { line.pop(); }
-            Ok(vec![Value::Object(gc.new_string(line.as_bytes()))])
         };
-        let closure = Closure::new_native_dyn("io_lines_stdin".into(), iter_fn);
+        let closure = Closure::new_native_dyn("io_lines_default".into(), iter_fn);
         let closure_ref = gc.new_closure(closure);
         return Ok(vec![Value::Object(closure_ref)]);
     }
@@ -567,20 +666,121 @@ pub fn io_lines(args: &[Value], gc: &mut Gc) -> Result<Vec<Value>, LuaError> {
     Ok(vec![Value::Object(closure_ref)])
 }
 
-pub fn io_input(_args: &[Value], gc: &mut Gc) -> Result<Vec<Value>, LuaError> {
-    // Simplified: always returns stdin handle
-    let handle = new_file_handle(gc, LuaFile::stdin());
-    Ok(vec![Value::Object(handle)])
+pub fn io_input(args: &[Value], gc: &mut Gc) -> Result<Vec<Value>, LuaError> {
+    match args.first().copied() {
+        None | Some(Value::Nil) => {
+            Ok(vec![Value::Object(ensure_default_input(gc))])
+        }
+        Some(Value::Object(r)) if r.as_object().as_userdata().is_some() => {
+            // Must be a file handle.
+            file_mut_from_ref(r, "input")?;
+            gc.io_input = Some(r);
+            Ok(vec![Value::Object(r)])
+        }
+        Some(Value::Object(r)) if r.as_object().as_string().is_some() => {
+            let filename = String::from_utf8_lossy(
+                r.as_object().as_string().unwrap().as_bytes(),
+            )
+            .to_string();
+            let file = File::open(&filename)
+                .map_err(|e| LuaError::new(format!("{filename}: {e}")))?;
+            let handle = new_file_handle(gc, LuaFile::from_file(file));
+            gc.io_input = Some(handle);
+            Ok(vec![Value::Object(handle)])
+        }
+        Some(v) => Err(LuaError::new(format!(
+            "bad argument #1 to 'input' (FILE* expected, got {})",
+            v.type_name()
+        ))),
+    }
 }
 
-pub fn io_output(_args: &[Value], gc: &mut Gc) -> Result<Vec<Value>, LuaError> {
-    // Simplified: always returns stdout handle
-    let handle = new_file_handle(gc, LuaFile::stdout());
-    Ok(vec![Value::Object(handle)])
+pub fn io_output(args: &[Value], gc: &mut Gc) -> Result<Vec<Value>, LuaError> {
+    match args.first().copied() {
+        None | Some(Value::Nil) => {
+            Ok(vec![Value::Object(ensure_default_output(gc))])
+        }
+        Some(Value::Object(r)) if r.as_object().as_userdata().is_some() => {
+            file_mut_from_ref(r, "output")?;
+            gc.io_output = Some(r);
+            Ok(vec![Value::Object(r)])
+        }
+        Some(Value::Object(r)) if r.as_object().as_string().is_some() => {
+            let filename = String::from_utf8_lossy(
+                r.as_object().as_string().unwrap().as_bytes(),
+            )
+            .to_string();
+            let file = File::create(&filename)
+                .map_err(|e| LuaError::new(format!("{filename}: {e}")))?;
+            let handle = new_file_handle(gc, LuaFile::from_file(file));
+            gc.io_output = Some(handle);
+            Ok(vec![Value::Object(handle)])
+        }
+        Some(v) => Err(LuaError::new(format!(
+            "bad argument #1 to 'output' (FILE* expected, got {})",
+            v.type_name()
+        ))),
+    }
 }
 
-pub fn io_popen(_args: &[Value], _gc: &mut Gc) -> Result<Vec<Value>, LuaError> {
-    Err(LuaError::new("io.popen is not supported"))
+/// Interpret a child's exit status the way `pclose` does.
+fn pclose_result(status: std::process::ExitStatus) -> (String, i64) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(sig) = status.signal() {
+            return ("signal".to_string(), sig as i64);
+        }
+    }
+    ("exit".to_string(), status.code().unwrap_or(0) as i64)
+}
+
+pub fn io_popen(args: &[Value], gc: &mut Gc) -> Result<Vec<Value>, LuaError> {
+    let cmd = match args.first() {
+        Some(Value::Object(r)) if r.as_object().as_string().is_some() => {
+            String::from_utf8_lossy(r.as_object().as_string().unwrap().as_bytes()).to_string()
+        }
+        _ => {
+            return Err(LuaError::new(
+                "bad argument #1 to 'popen' (string expected)",
+            ))
+        }
+    };
+    let mode = args
+        .get(1)
+        .and_then(|v| v.as_str_bytes())
+        .map(|b| String::from_utf8_lossy(b).to_string())
+        .unwrap_or_else(|| "r".to_string());
+
+    let mut command = Command::new("/bin/sh");
+    command.arg("-c").arg(&cmd);
+
+    let file = if mode == "r" {
+        command.stdout(Stdio::piped());
+        let mut child = command
+            .spawn()
+            .map_err(|e| LuaError::new(format!("{cmd}: {e}")))?;
+        let out = child.stdout.take().unwrap();
+        LuaFile {
+            kind: FileKind::ReadPipe(child, BufReader::new(out)),
+            closable: true,
+        }
+    } else if mode == "w" {
+        command.stdin(Stdio::piped());
+        let mut child = command
+            .spawn()
+            .map_err(|e| LuaError::new(format!("{cmd}: {e}")))?;
+        let inp = child.stdin.take().unwrap();
+        LuaFile {
+            kind: FileKind::WritePipe(child, inp),
+            closable: true,
+        }
+    } else {
+        return Err(LuaError::new(format!("invalid mode '{mode}'")));
+    };
+
+    let handle = new_file_handle(gc, file);
+    Ok(vec![Value::Object(handle)])
 }
 
 // ── Registration helpers ───────────────────────────────────────────

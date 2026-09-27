@@ -190,16 +190,6 @@ pub fn debug_setuservalue(args: &[Value], _gc: &mut Gc) -> Result<Vec<Value>, Lu
     }
 }
 
-/// debug.sethook — stub (no-op)
-pub fn debug_sethook(_args: &[Value], _gc: &mut Gc) -> Result<Vec<Value>, LuaError> {
-    Ok(vec![])
-}
-
-/// debug.gethook — stub (returns nil)
-pub fn debug_gethook(_args: &[Value], _gc: &mut Gc) -> Result<Vec<Value>, LuaError> {
-    Ok(vec![Value::Nil])
-}
-
 /// Return (name, NativeFn) pairs for debug functions that don't need VM access.
 pub fn debug_native_functions() -> Vec<(&'static str, crate::closure::NativeFn)> {
     vec![
@@ -207,7 +197,5 @@ pub fn debug_native_functions() -> Vec<(&'static str, crate::closure::NativeFn)>
         ("setmetatable", debug_setmetatable),
         ("getuservalue", debug_getuservalue),
         ("setuservalue", debug_setuservalue),
-        ("sethook", debug_sethook),
-        ("gethook", debug_gethook),
     ]
 }

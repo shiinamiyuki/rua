@@ -335,9 +335,53 @@ pub fn os_tmpname(_args: &[Value], gc: &mut Gc) -> Result<Vec<Value>, LuaError> 
     Ok(vec![Value::Object(gc.new_string(s.as_bytes()))])
 }
 
-pub fn os_setlocale(_args: &[Value], gc: &mut Gc) -> Result<Vec<Value>, LuaError> {
-    // Stub: always return "C" locale
-    Ok(vec![Value::Object(gc.new_string(b"C"))])
+/// `os.setlocale([locale [, category]])`.
+///
+/// Only the "C"/"POSIX" locale is available; requests for other locales
+/// fail (return nil) without changing anything, so locale-dependent tests
+/// are skipped just like on a system without those locales installed.
+pub fn os_setlocale(args: &[Value], gc: &mut Gc) -> Result<Vec<Value>, LuaError> {
+    const CATEGORIES: [&[u8]; 6] = [
+        b"all",
+        b"collate",
+        b"ctype",
+        b"monetary",
+        b"numeric",
+        b"time",
+    ];
+
+    // Validate the category option (defaults to "all").
+    let category = args.get(1).copied().unwrap_or(Value::Nil);
+    let category_ok = match category {
+        Value::Nil => true,
+        Value::Object(r) if r.as_object().as_string().is_some() => {
+            let b = r.as_object().as_string().unwrap().as_bytes();
+            CATEGORIES.iter().any(|c| *c == b)
+        }
+        _ => false,
+    };
+    if !category_ok {
+        return Err(LuaError::new(format!(
+            "bad argument #2 to 'setlocale' (invalid option '{}')",
+            category
+        )));
+    }
+
+    let locale = args.first().copied().unwrap_or(Value::Nil);
+    let available = match locale {
+        Value::Nil => true, // query the current locale
+        Value::Object(r) if r.as_object().as_string().is_some() => {
+            let b = r.as_object().as_string().unwrap().as_bytes();
+            b.is_empty() || b == b"C" || b == b"POSIX"
+        }
+        _ => false,
+    };
+
+    if available {
+        Ok(vec![Value::Object(gc.new_string(b"C"))])
+    } else {
+        Ok(vec![Value::Nil])
+    }
 }
 
 // ── Registration helpers ───────────────────────────────────────────

@@ -22,6 +22,9 @@ impl<T> Spanned<T> {
 pub struct Block {
     pub stmts: Vec<Stat>,
     pub ret: Option<RetStat>,
+    /// Line of the token that terminated the block (`end`/`until`/`else`/
+    /// `elseif`/EOF). Used for final RETURN line info like reference Lua.
+    pub end_line: u32,
 }
 
 /// `return [explist] [';']`
@@ -159,6 +162,8 @@ pub struct FuncBody {
     /// Lua 5.5: optional name for the vararg table (`... name`).
     pub vararg_name: Option<String>,
     pub body: Block,
+    /// Line of the closing `end` token (for `lastlinedefined`).
+    pub end_line: u32,
 }
 
 // ── Expressions ────────────────────────────────────────────────────
@@ -182,6 +187,9 @@ pub enum ExprKind {
 
     /// A function call expression.
     FunctionCall(FunctionCall),
+
+    /// `(expr)` — adjusts to exactly one value and inhibits tail calls.
+    Paren(Box<Expr>),
 
     /// `function funcbody`
     FunctionDef(FuncBody),
