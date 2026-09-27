@@ -20,8 +20,10 @@ pub struct Table {
     /// Hash part: open-addressing with power-of-2 sizing.
     /// None = empty slot, Some = occupied.
     pub(crate) hash: Vec<Option<HashEntry>>,
-    /// Number of entries in the hash part.
+    /// Number of occupied slots in the hash part (including dead keys).
     hash_used: usize,
+    /// Number of live (non-nil) entries in the hash part.
+    hash_live: usize,
     /// log2 of hash capacity (capacity = 1 << hash_log2). 0 means empty hash.
     hash_log2: u8,
     /// Metatable (if any)
@@ -39,6 +41,7 @@ impl Table {
             array: Vec::new(),
             hash: Vec::new(),
             hash_used: 0,
+            hash_live: 0,
             hash_log2: 0,
             metatable: None,
             weak_keys: false,
@@ -59,6 +62,7 @@ impl Table {
             array: Vec::with_capacity(array_cap),
             hash,
             hash_used: 0,
+            hash_live: 0,
             hash_log2,
             metatable: None,
             weak_keys: false,
@@ -196,26 +200,42 @@ impl Table {
 
     /// Set a value in the hash part. Handles insert, update, and delete (nil value).
     fn hash_set(&mut self, key: Value, value: Value) {
-        // Delete case: setting to nil
+        // Delete case: setting to nil leaves a "dead" key behind so that
+        // `next` can continue iterating after deletions (like reference Lua).
         if value.is_nil() {
-            self.hash_remove(&key);
+            if let Some((idx, true)) = self.hash_find(&key) {
+                let entry = self.hash[idx].as_mut().unwrap();
+                if !entry.val.is_nil() {
+                    entry.val = Value::Nil;
+                    self.hash_live -= 1;
+                }
+            }
             return;
         }
 
-        // Check if we need to grow (load factor > 75%)
-        if self.hash.is_empty() || self.hash_used * 4 >= self.hash.len() * 3 {
+        // Check if we need to grow (load factor > 75%, or no free slot
+        // because of dead keys).
+        if self.hash.is_empty()
+            || self.hash_live * 4 >= self.hash.len() * 3
+            || self.hash_used == self.hash.len()
+        {
             self.hash_grow();
         }
 
         match self.hash_find(&key) {
             Some((idx, true)) => {
-                // Update existing entry
-                self.hash[idx].as_mut().unwrap().val = value;
+                // Update existing entry (possibly resurrecting a dead key).
+                let entry = self.hash[idx].as_mut().unwrap();
+                if entry.val.is_nil() {
+                    self.hash_live += 1;
+                }
+                entry.val = value;
             }
             Some((idx, false)) => {
                 // Insert into empty slot
                 self.hash[idx] = Some(HashEntry { key, val: value });
                 self.hash_used += 1;
+                self.hash_live += 1;
             }
             None => {
                 // Table is full — shouldn't happen after grow, but safety fallback
@@ -229,6 +249,9 @@ impl Table {
     fn hash_remove(&mut self, key: &Value) {
         if let Some((idx, true)) = self.hash_find(key) {
             // Remove the entry and re-insert displaced entries (backward shift deletion)
+            if !self.hash[idx].as_ref().unwrap().val.is_nil() {
+                self.hash_live -= 1;
+            }
             self.hash[idx] = None;
             self.hash_used -= 1;
             let mask = (1usize << self.hash_log2) - 1;
@@ -261,11 +284,16 @@ impl Table {
         let new_log2 = if self.hash_log2 == 0 { 2 } else { self.hash_log2 + 1 };
         let new_cap = 1usize << new_log2;
         let old_hash = std::mem::replace(&mut self.hash, vec![None; new_cap]);
-        let old_used = self.hash_used;
         self.hash_log2 = new_log2;
         self.hash_used = 0;
 
         for entry in old_hash.into_iter().flatten() {
+            // Dead keys are dropped; their iteration position is reset by
+            // the growth itself.
+            if entry.val.is_nil() {
+                self.hash_live -= 0;
+                continue;
+            }
             let mask = new_cap - 1;
             let h = Self::hash_value(&entry.key) as usize;
             let mut i = h & mask;
@@ -278,7 +306,7 @@ impl Table {
                 i = (i + 1) & mask;
             }
         }
-        debug_assert_eq!(self.hash_used, old_used);
+        debug_assert_eq!(self.hash_used, self.hash_live);
     }
 
     // ── Public API ─────────────────────────────────────────────────
@@ -344,7 +372,47 @@ impl Table {
 
     /// Get the "length" of the table (# operator).
     pub fn length(&self) -> usize {
-        self.array.len()
+        let n = self.array.len();
+        if n == 0 {
+            return 0;
+        }
+        if self.array[n - 1].is_nil() {
+            // The last array slot is empty: binary-search for a border.
+            let mut lo = 0usize;
+            let mut hi = n;
+            while hi - lo > 1 {
+                let mid = (lo + hi) / 2;
+                if self.array[mid - 1].is_nil() {
+                    hi = mid;
+                } else {
+                    lo = mid;
+                }
+            }
+            return lo;
+        }
+        // Array end is a border; look for a longer border in the hash part.
+        let mut i = n;
+        while !self.hash_get(&Value::Integer(i as i64 + 1)).is_nil() {
+            if i == usize::MAX {
+                break;
+            }
+            i += 1;
+        }
+        i
+    }
+
+    /// Whether a key is present in the table (including dead keys).
+    pub fn has_key(&self, key: &Value) -> bool {
+        let key = match Self::normalize_key(*key) {
+            Some(k) => k,
+            None => return false,
+        };
+        if let Value::Integer(i) = key {
+            if i >= 1 && (i as usize) <= self.array.len() {
+                return !self.array[i as usize - 1].is_nil();
+            }
+        }
+        matches!(self.hash_find(&key), Some((_, true)))
     }
 
     /// Get the next key-value pair after the given key (for `next()` / `pairs()`).
@@ -359,7 +427,9 @@ impl Table {
             // First occupied hash entry
             for entry in &self.hash {
                 if let Some(e) = entry {
-                    return Some((e.key, e.val));
+                    if !e.val.is_nil() {
+                        return Some((e.key, e.val));
+                    }
                 }
             }
             return None;
@@ -379,7 +449,9 @@ impl Table {
                 // End of array, start of hash
                 for entry in &self.hash {
                     if let Some(e) = entry {
-                        return Some((e.key, e.val));
+                        if !e.val.is_nil() {
+                            return Some((e.key, e.val));
+                        }
                     }
                 }
                 return None;
@@ -390,7 +462,9 @@ impl Table {
         if let Some((idx, true)) = self.hash_find(&normalized) {
             for entry in &self.hash[idx + 1..] {
                 if let Some(e) = entry {
-                    return Some((e.key, e.val));
+                    if !e.val.is_nil() {
+                        return Some((e.key, e.val));
+                    }
                 }
             }
         }

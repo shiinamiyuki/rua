@@ -68,8 +68,9 @@ pub enum OpCode {
     Jmp = 36,       // AsBx: PC += sBx
     ForPrep = 37,   // AsBx: init numeric for, jump to FORLOOP
     ForLoop = 38,   // AsBx: step numeric for, branch back
-    TForPrep = 39,  // AsBx: init generic for, jump to TFORLOOP
-    TForLoop = 40,  // ABC:  call iter + test nil + branch
+    TForPrep = 39,  // AsBx: init generic for, jump to TFORCALL
+    TForCall = 50,  // ABC:  call iterator with (state, control), C results
+    TForLoop = 40,  // ABC:  test first result + branch back
 
     // Functions
     Closure = 41,   // ABx:  R[A] := closure(Proto[Bx])
@@ -88,8 +89,8 @@ pub enum OpCode {
 impl OpCode {
     /// Convert from u8 to OpCode.
     pub fn from_u8(v: u8) -> Option<OpCode> {
-        if v <= 49 {
-            // SAFETY: all values 0..=49 are valid OpCode variants with repr(u8).
+        if v <= 49 || v == 50 {
+            // SAFETY: all values 0..=49 and 50 are valid OpCode variants with repr(u8).
             Some(unsafe { std::mem::transmute(v) })
         } else {
             None
@@ -139,6 +140,7 @@ impl OpCode {
             OpCode::ForPrep => "FORPREP",
             OpCode::ForLoop => "FORLOOP",
             OpCode::TForPrep => "TFORPREP",
+            OpCode::TForCall => "TFORCALL",
             OpCode::TForLoop => "TFORLOOP",
             OpCode::Closure => "CLOSURE",
             OpCode::Call => "CALL",
@@ -447,7 +449,7 @@ impl Proto {
                     OpCode::Eq | OpCode::Lt | OpCode::Le => format!("{a} {b} {c}"),
                     OpCode::Test => format!("{a} {c}"),
                     OpCode::TestSet => format!("{a} {b} {c}"),
-                    OpCode::TForLoop => format!("{a} {b} {c}"),
+                    OpCode::TForCall | OpCode::TForLoop => format!("{a} {b} {c}"),
                     OpCode::Call | OpCode::TailCall => format!("{a} {b} {c}"),
                     OpCode::Return => format!("{a} {b}"),
                     OpCode::VarArg => format!("{a} {c}"),
@@ -537,7 +539,8 @@ mod tests {
     fn test_opcode_from_u8() {
         assert_eq!(OpCode::from_u8(0), Some(OpCode::Move));
         assert_eq!(OpCode::from_u8(49), Some(OpCode::ExtraArg));
-        assert_eq!(OpCode::from_u8(50), None);
+        assert_eq!(OpCode::from_u8(50), Some(OpCode::TForCall));
+        assert_eq!(OpCode::from_u8(51), None);
         assert_eq!(OpCode::from_u8(255), None);
     }
 }

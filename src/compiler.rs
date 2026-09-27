@@ -954,28 +954,37 @@ fn compile_numeric_for(
 ) -> Result<(), LuaError> {
     fs.enter_scope(true);
 
-    // Reserve 4 consecutive registers: (index, limit, step, user_var)
-    let base = fs.alloc_regs(4)?;
+    // Lua 5.5 layout: R[base] = iteration count (integer loops) / limit
+    // (float loops), R[base+1] = step, R[base+2] = control variable.
+    let base = fs.alloc_regs(3)?;
 
-    // Compile init, limit, step expressions into R[base], R[base+1], R[base+2]
     compile_expr_to_reg(fs, init, base)?;
     compile_expr_to_reg(fs, limit, base + 1)?;
     if let Some(step_expr) = step {
         compile_expr_to_reg(fs, step_expr, base + 2)?;
     } else {
-        // Default step = 1
         fs.emit_asbx(OpCode::LoadI, base + 2, 1, line);
     }
 
-    // FORPREP: validates and jumps to FORLOOP
+    // FORPREP: validates, sets up the counter, or jumps past FORLOOP.
     let forprep_pc = fs.emit_asbx(OpCode::ForPrep, base, 0, line);
 
-    // Add the loop variable as a local (it's R[base+3])
+    // Internal "(for state)" pseudo-locals plus the const control variable.
+    let body_start_pc = fs.proto.code.len() as u32;
+    for i in 0..2 {
+        fs.locals.push(Local {
+            name: "(for state)".to_string(),
+            reg: base + i as u8,
+            start_pc: body_start_pc,
+            is_const: false,
+            is_close: false,
+        });
+    }
     fs.locals.push(Local {
         name: name.to_string(),
-        reg: base + 3,
-        start_pc: fs.proto.code.len() as u32,
-        is_const: false,
+        reg: base + 2,
+        start_pc: body_start_pc,
+        is_const: true,
         is_close: false,
     });
 
@@ -983,30 +992,22 @@ fn compile_numeric_for(
     let body_start = fs.current_pc();
     compile_block(fs, body)?;
 
-    // Remove the loop variable local
-    let local = fs.locals.pop().unwrap();
-    fs.proto.locals.push(LocalVarInfo {
-        name: local.name,
-        start_pc: local.start_pc,
-        end_pc: fs.proto.code.len() as u32,
-    });
-
-    // The loop variable gets a fresh instance every iteration: if the body
-    // captured it as an upvalue, close it at the end of each iteration.
+    // The control variable gets a fresh instance every iteration: if the
+    // body captured it as an upvalue, close it at the end of each iteration.
     let body_has_upvalues = fs.scopes.last().map(|s| s.has_upvalues).unwrap_or(false);
 
     // Close the scope before the loop-back test; breaks exit past FORLOOP.
     let breaks = fs.leave_scope_unpatched(line)?;
     if body_has_upvalues {
-        fs.emit_abc(OpCode::Close, base + 3, 0, 0, line);
+        fs.emit_abc(OpCode::Close, base + 2, 0, 0, line);
     }
 
-    // FORLOOP: step + compare + branch back
+    // FORLOOP: decrement counter (or add float step) and branch back.
     let forloop_pc = fs.emit_asbx(OpCode::ForLoop, base, 0, line);
 
-    // Patch FORPREP to jump to FORLOOP
-    fs.patch_sbx(forprep_pc, forloop_pc);
-    // Patch FORLOOP to jump back to body start
+    // No iterations? FORPREP jumps past FORLOOP.
+    fs.patch_sbx(forprep_pc, forloop_pc + 1);
+    // FORLOOP branches back to the body start.
     fs.patch_sbx(forloop_pc, body_start);
 
     let exit = fs.current_pc();
@@ -1083,23 +1084,35 @@ fn compile_generic_for(
             name: name.clone(),
             reg: base + 3 + i as u8,
             start_pc: ctrl_start_pc,
-            is_const: false,
+            is_const: true,
             is_close: false,
         });
     }
 
-    // TFORPREP: swap control/closing, mark closing TBC, jump to TFORLOOP.
+    // TFORPREP: swap control/closing, mark closing TBC, jump to TFORCALL.
     let tforprep_pc = fs.emit_asbx(OpCode::TForPrep, base, 0, line);
 
     // Body
     let body_start = fs.current_pc();
     compile_block(fs, body)?;
 
-    // TFORLOOP: call iterator + test + branch
+    // Make sure the call frame slots (iterator, state, control) are within
+    // the GC root window while the iterator runs.
+    let needed = base + 6;
+    if fs.free_reg < needed {
+        fs.free_reg = needed;
+        if fs.free_reg > fs.proto.max_stack_size {
+            fs.proto.max_stack_size = fs.free_reg;
+        }
+    }
+
+    // TFORCALL: call the iterator, leaving its results on the loop variables.
+    let tforcall_pc = fs.emit_abc(OpCode::TForCall, base, 0, num_vars as u8, line);
+    // TFORLOOP: test the first result and branch back to the body.
     let tforloop_pc = fs.emit_abc(OpCode::TForLoop, base, 0, num_vars as u8, line);
 
-    // Patch TFORPREP to jump to TFORLOOP
-    fs.patch_sbx(tforprep_pc, tforloop_pc);
+    // Patch TFORPREP to jump to TFORCALL
+    fs.patch_sbx(tforprep_pc, tforcall_pc);
 
     // Patch TFORLOOP backward branch (PC is incremented before execution).
     let back_offset = tforloop_pc + 1 - body_start;

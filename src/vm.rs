@@ -37,6 +37,7 @@ const MM_NEWINDEX: &[u8] = b"__newindex";
 const MM_CALL: &[u8] = b"__call";
 const MM_TOSTRING: &[u8] = b"__tostring";
 const MM_NAME: &[u8] = b"__name";
+const MM_PAIRS: &[u8] = b"__pairs";
 const MM_METATABLE: &[u8] = b"__metatable";
 const MM_CLOSE: &[u8] = b"__close";
 const MM_GC: &[u8] = b"__gc";
@@ -218,6 +219,18 @@ pub struct Vm {
     /// `table.concat` (VM-special: honors `__index`/`__len`).
     concat_ref: Option<GcRef>,
 
+    /// `table.remove` (VM-special: honors `__index`/`__newindex`/`__len`).
+    remove_ref: Option<GcRef>,
+
+    /// `next` native (returned by `pairs`).
+    next_ref: Option<GcRef>,
+    /// `pairs` (VM-special: honors `__pairs`).
+    pairs_ref: Option<GcRef>,
+    /// `ipairs` (VM-special: returned iterator honors `__index`).
+    ipairs_ref: Option<GcRef>,
+    /// The `ipairs` iteration function.
+    ipairs_iter_ref: Option<GcRef>,
+
     // ── Warning system (`warn`) ────────────────────────────────────
     warn_ref: Option<GcRef>,
     /// Warnings are printed when true (`@on`).
@@ -293,6 +306,11 @@ impl Vm {
             unpack_ref: None,
             insert_ref: None,
             concat_ref: None,
+            remove_ref: None,
+            next_ref: None,
+            pairs_ref: None,
+            ipairs_ref: None,
+            ipairs_iter_ref: None,
             warn_ref: None,
             warn_on: false,
             warn_store: false,
@@ -373,6 +391,7 @@ impl Vm {
             MM_BAND, MM_BOR, MM_BXOR, MM_BNOT, MM_SHL, MM_SHR,
             MM_CONCAT, MM_LEN, MM_EQ, MM_LT, MM_LE,
             MM_INDEX, MM_NEWINDEX, MM_CALL, MM_TOSTRING, MM_METATABLE, MM_NAME,
+            MM_PAIRS,
             MM_CLOSE, MM_GC, MM_MODE,
         ] {
             self.gc.new_string(name);
@@ -443,9 +462,36 @@ impl Vm {
             env.raw_set(Value::Object(key), Value::Object(xpcall_gc));
         }
 
-        self.register_native(&mut env, "ipairs", crate::stdlib::lua_ipairs);
-        self.register_native(&mut env, "pairs", crate::stdlib::lua_pairs);
-        self.register_native(&mut env, "next", crate::stdlib::lua_next);
+        // `next` is a regular native; keep its ref so `pairs` can return it.
+        {
+            use crate::closure::{Closure, NativeFn};
+            let next_closure =
+                Closure::new_native("next", crate::stdlib::lua_next as NativeFn);
+            let next_gc = self.gc.new_closure(next_closure);
+            self.next_ref = Some(next_gc);
+            let key = self.gc.new_string(b"next");
+            env.raw_set(Value::Object(key), Value::Object(next_gc));
+        }
+        // `pairs` / `ipairs` are VM-special (they may call metamethods or
+        // return a metamethod-aware iterator).
+        {
+            use crate::closure::Closure;
+            let pairs_closure = Closure::new_native("pairs", |_, _| Ok(vec![]));
+            let pairs_gc = self.gc.new_closure(pairs_closure);
+            self.pairs_ref = Some(pairs_gc);
+            let key = self.gc.new_string(b"pairs");
+            env.raw_set(Value::Object(key), Value::Object(pairs_gc));
+
+            let ipairs_closure = Closure::new_native("ipairs", |_, _| Ok(vec![]));
+            let ipairs_gc = self.gc.new_closure(ipairs_closure);
+            self.ipairs_ref = Some(ipairs_gc);
+            let key = self.gc.new_string(b"ipairs");
+            env.raw_set(Value::Object(key), Value::Object(ipairs_gc));
+
+            let iter_closure = Closure::new_native("ipairs_iterator", |_, _| Ok(vec![]));
+            let iter_gc = self.gc.new_closure(iter_closure);
+            self.ipairs_iter_ref = Some(iter_gc);
+        }
         self.register_native(&mut env, "rawget", crate::stdlib::lua_rawget);
         self.register_native(&mut env, "rawset", crate::stdlib::lua_rawset);
         self.register_native(&mut env, "rawlen", crate::stdlib::lua_rawlen);
@@ -549,6 +595,14 @@ impl Vm {
             self.concat_ref = Some(concat_gc);
             let key = self.gc.new_string(b"concat");
             table_table.raw_set(Value::Object(key), Value::Object(concat_gc));
+        }
+        // table.remove is VM-special: it honors __index/__newindex/__len.
+        {
+            let remove_closure = Closure::new_native("remove", |_, _| Ok(vec![]));
+            let remove_gc = self.gc.new_closure(remove_closure);
+            self.remove_ref = Some(remove_gc);
+            let key = self.gc.new_string(b"remove");
+            table_table.raw_set(Value::Object(key), Value::Object(remove_gc));
         }
         let table_ref = self.gc.new_table(table_table);
         let table_key = self.gc.new_string(b"table");
@@ -1996,6 +2050,11 @@ impl Vm {
             self.unpack_ref,
             self.insert_ref,
             self.concat_ref,
+            self.remove_ref,
+            self.next_ref,
+            self.pairs_ref,
+            self.ipairs_ref,
+            self.ipairs_iter_ref,
             self.warn_ref,
             self.registry,
             self.tostring_ref,
@@ -2469,29 +2528,108 @@ impl Vm {
                     let init = self.reg(base, a);
                     let limit = self.reg(base, a + 1);
                     let step = self.reg(base, a + 2);
-                    self.for_prep_validate(init, limit, step)?;
-                    // Pre-subtract step so that ForLoop's first increment yields init
-                    let adjusted = Self::try_arith_sub(init, step)
+                    // Strings are coerced to numbers, as in reference Lua.
+                    let init = Self::coerce_to_number(init)
                         .ok_or_else(|| LuaError::new("'for' initial value must be a number"))?;
-                    self.set_reg(base, a, adjusted);
-                    // Jump forward to FORLOOP
-                    self.frames[fi].pc =
-                        (self.frames[fi].pc as i64 + sbx as i64) as usize;
+                    let limit = Self::coerce_to_number(limit)
+                        .ok_or_else(|| LuaError::new("'for' limit must be a number"))?;
+                    let step = Self::coerce_to_number(step)
+                        .ok_or_else(|| LuaError::new("'for' step must be a number"))?;
+                    match step {
+                        Value::Integer(0) => {
+                            return Err(LuaError::new("'for' step is zero"));
+                        }
+                        Value::Float(f) if f == 0.0 => {
+                            return Err(LuaError::new("'for' step is zero"));
+                        }
+                        _ => {}
+                    }
+                    match (init, step) {
+                        (Value::Integer(i0), Value::Integer(st)) => {
+                            // Integer loop: compute the iteration count once.
+                            let limit_int = self.for_limit(i0, limit, st)?;
+                            match limit_int {
+                                None => {
+                                    // Skip the loop entirely.
+                                    self.frames[fi].pc =
+                                        (self.frames[fi].pc as i64 + sbx as i64) as usize;
+                                }
+                                Some(lim) => {
+                                    let count = if st > 0 {
+                                        (lim as u64).wrapping_sub(i0 as u64) / (st as u64)
+                                    } else {
+                                        let denom = ((st.wrapping_add(1))
+                                            .wrapping_neg() as u64)
+                                            .wrapping_add(1);
+                                        (i0 as u64).wrapping_sub(lim as u64) / denom
+                                    };
+                                    self.set_reg(base, a, Value::Integer(count as i64));
+                                    self.set_reg(base, a + 1, Value::Integer(st));
+                                    self.set_reg(base, a + 2, Value::Integer(i0));
+                                }
+                            }
+                        }
+                        _ => {
+                            // Float loop: make everything a float.
+                            let i0 = Self::as_float(init);
+                            let lim = Self::as_float(limit);
+                            let st = Self::as_float(step);
+                            let skip = if st > 0.0 { lim < i0 } else { i0 < lim };
+                            let target = (self.frames[fi].pc as i64 + sbx as i64) as usize;
+                            if skip {
+                                self.frames[fi].pc = target;
+                            } else {
+                                self.set_reg(base, a, Value::Float(lim));
+                                self.set_reg(base, a + 1, Value::Float(st));
+                                self.set_reg(base, a + 2, Value::Float(i0));
+                            }
+                        }
+                    }
                 }
 
                 OpCode::ForLoop => {
-                    let index = self.reg(base, a);
-                    let limit = self.reg(base, a + 1);
-                    let step = self.reg(base, a + 2);
-
-                    let new_index = Self::try_arith_add(index, step)
-                        .ok_or_else(|| LuaError::new("'for' step must be a number"))?;
-                    self.set_reg(base, a, new_index);
-
-                    if self.for_loop_check(new_index, limit, step) {
-                        self.set_reg(base, a + 3, new_index);
-                        self.frames[fi].pc =
-                            (self.frames[fi].pc as i64 + sbx as i64) as usize;
+                    match self.reg(base, a + 1) {
+                        Value::Integer(step) => {
+                            let count = match self.reg(base, a) {
+                                Value::Integer(c) => c as u64,
+                                _ => 0,
+                            };
+                            if count > 0 {
+                                let idx = match self.reg(base, a + 2) {
+                                    Value::Integer(i) => i,
+                                    _ => 0,
+                                };
+                                self.set_reg(
+                                    base,
+                                    a,
+                                    Value::Integer((count - 1) as i64),
+                                );
+                                self.set_reg(
+                                    base,
+                                    a + 2,
+                                    Value::Integer(idx.wrapping_add(step)),
+                                );
+                                self.frames[fi].pc =
+                                    (self.frames[fi].pc as i64 + sbx as i64) as usize;
+                            }
+                        }
+                        Value::Float(step) => {
+                            let limit = Self::as_float(self.reg(base, a));
+                            let idx = Self::as_float(self.reg(base, a + 2)) + step;
+                            let go = if step > 0.0 {
+                                idx <= limit
+                            } else {
+                                limit <= idx
+                            };
+                            if go {
+                                self.set_reg(base, a + 2, Value::Float(idx));
+                                self.frames[fi].pc =
+                                    (self.frames[fi].pc as i64 + sbx as i64) as usize;
+                            }
+                        }
+                        _ => {
+                            return Err(LuaError::new("'for' step must be a number"));
+                        }
                     }
                 }
 
@@ -2515,31 +2653,24 @@ impl Vm {
                         (self.frames[fi].pc as i64 + sbx as i64) as usize;
                 }
 
-                OpCode::TForLoop => {
-                    // A = base, B = backward jump offset, C = #loop variables.
-                    // Loop variables start at A+3 (the first is the control).
+                OpCode::TForCall => {
+                    // A = base, C = #loop variables.  Set up a CALL-style
+                    // frame at A+3: iterator, state, control; results are
+                    // placed back at A+3 when the callee returns.
                     let iter = self.reg(base, a);
                     let state = self.reg(base, a + 1);
                     let control = self.reg(base, a + 3);
+                    self.ensure_stack(base + a + 6);
+                    self.set_reg(base, a + 3, iter);
+                    self.set_reg(base, a + 4, state);
+                    self.set_reg(base, a + 5, control);
+                    self.call_function(base + a + 3, 3, c as i32)?;
+                }
 
-                    let call_base = base + a + 3 + c;
-                    self.ensure_stack(call_base + 3);
-                    self.stack[call_base] = iter;
-                    self.stack[call_base + 1] = state;
-                    self.stack[call_base + 2] = control;
-
-                    // Call with 2 args and C results.
-                    self.call_function(call_base, 3, c as i32)?;
-
-                    // Move results onto the loop variables.
-                    for i in 0..c {
-                        let v = self.stack[call_base + i];
-                        self.set_reg(base, a + 3 + i, v);
-                    }
-
+                OpCode::TForLoop => {
+                    // A = base, B = backward jump offset, C = #loop variables.
                     let first_result = self.reg(base, a + 3);
                     if !first_result.is_nil() {
-                        // Jump back using B (backward offset)
                         let jump_offset = -(b as i64);
                         self.frames[fi].pc =
                             (self.frames[fi].pc as i64 + jump_offset) as usize;
@@ -2603,6 +2734,10 @@ impl Vm {
                         else if self.unpack_ref == Some(r) { 32 }
                         else if self.insert_ref == Some(r) { 33 }
                         else if self.concat_ref == Some(r) { 35 }
+                        else if self.remove_ref == Some(r) { 36 }
+                        else if self.pairs_ref == Some(r) { 37 }
+                        else if self.ipairs_ref == Some(r) { 38 }
+                        else if self.ipairs_iter_ref == Some(r) { 39 }
                         else if self.debug_getregistry_ref == Some(r) { 25 }
                         else if self.tostring_ref == Some(r) { 28 }
                         else if self.print_ref == Some(r) { 29 }
@@ -2795,6 +2930,24 @@ impl Vm {
                                 .map(|i| self.stack[base + a + 1 + i])
                                 .collect();
                             self.handle_table_concat(&args, base + a, num_results)?;
+                        }
+                        36 => { // table.remove
+                            let args: Vec<Value> = (0..num_args)
+                                .map(|i| self.stack[base + a + 1 + i])
+                                .collect();
+                            self.handle_table_remove(&args, base + a, num_results)?;
+                        }
+                        37 | 38 | 39 => { // pairs / ipairs / ipairs iterator
+                            let args: Vec<Value> = (0..num_args)
+                                .map(|i| self.stack[base + a + 1 + i])
+                                .collect();
+                            match special {
+                                37 => self.handle_pairs(&args, base + a, num_results)?,
+                                38 => self.handle_ipairs(&args, base + a, num_results)?,
+                                _ => self.handle_ipairs_iter(
+                                    &args, base + a, num_results,
+                                )?,
+                            }
                         }
                         25 => { // debug.getregistry
                             self.handle_debug_getregistry(base + a, num_results);
@@ -3186,6 +3339,18 @@ impl Vm {
                 }
                 if self.concat_ref == Some(gc_ref) {
                     return self.handle_table_concat(&actual_args, result_base, num_results);
+                }
+                if self.remove_ref == Some(gc_ref) {
+                    return self.handle_table_remove(&actual_args, result_base, num_results);
+                }
+                if self.pairs_ref == Some(gc_ref) {
+                    return self.handle_pairs(&actual_args, result_base, num_results);
+                }
+                if self.ipairs_ref == Some(gc_ref) {
+                    return self.handle_ipairs(&actual_args, result_base, num_results);
+                }
+                if self.ipairs_iter_ref == Some(gc_ref) {
+                    return self.handle_ipairs_iter(&actual_args, result_base, num_results);
                 }
                 if self.debug_getregistry_ref == Some(gc_ref) {
                     self.handle_debug_getregistry(result_base, num_results);
@@ -4568,6 +4733,133 @@ impl Vm {
             fname,
             v.type_name()
         )))
+    }
+
+    /// Handle `pairs(t)` (VM-special: may call `__pairs`).
+    fn handle_pairs(
+        &mut self,
+        args: &[Value],
+        result_base: usize,
+        num_results: i32,
+    ) -> Result<(), LuaError> {
+        if args.is_empty() {
+            return Err(LuaError::new(
+                "bad argument #1 to 'pairs' (value expected)",
+            ));
+        }
+        let v = args[0];
+        if let Some(mm) = self.get_metamethod(v, MM_PAIRS) {
+            // Call the metamethod like a regular call so that it may yield;
+            // its four results are placed at `result_base` on return.
+            let cb = self.find_call_base();
+            self.ensure_stack(cb + 2);
+            self.stack[cb] = mm;
+            self.stack[cb + 1] = v;
+            self.do_call(mm, cb, &[v], result_base, 4)?;
+            return Ok(());
+        }
+        let next_fn = Value::Object(self.next_ref.unwrap());
+        self.place_results(
+            result_base,
+            num_results,
+            &[next_fn, v, Value::Nil, Value::Nil],
+        );
+        Ok(())
+    }
+
+    /// Handle `ipairs(t)` (VM-special: the iterator honors `__index`).
+    fn handle_ipairs(
+        &mut self,
+        args: &[Value],
+        result_base: usize,
+        num_results: i32,
+    ) -> Result<(), LuaError> {
+        if args.is_empty() {
+            return Err(LuaError::new(
+                "bad argument #1 to 'ipairs' (value expected)",
+            ));
+        }
+        let iter = Value::Object(self.ipairs_iter_ref.unwrap());
+        self.place_results(
+            result_base,
+            num_results,
+            &[iter, args[0], Value::Integer(0)],
+        );
+        Ok(())
+    }
+
+    /// The `ipairs` iteration function.
+    fn handle_ipairs_iter(
+        &mut self,
+        args: &[Value],
+        result_base: usize,
+        num_results: i32,
+    ) -> Result<(), LuaError> {
+        let t = args.first().copied().unwrap_or(Value::Nil);
+        let i = match args.get(1).copied().unwrap_or(Value::Integer(0)) {
+            Value::Integer(n) => n,
+            Value::Float(f) => f as i64,
+            v => {
+                return Err(LuaError::new(format!(
+                    "bad argument #2 to 'for iterator' (number expected, got {})",
+                    v.type_name()
+                )));
+            }
+        };
+        let i = i.wrapping_add(1);
+        let v = self.table_get(t, Value::Integer(i))?;
+        if v.is_nil() {
+            self.place_results(result_base, num_results, &[Value::Nil]);
+        } else {
+            self.place_results(
+                result_base,
+                num_results,
+                &[Value::Integer(i), v],
+            );
+        }
+        Ok(())
+    }
+
+    /// Handle `table.remove(list [, pos])`, mirroring `tremove` from
+    /// `ltablib.c`.
+    fn handle_table_remove(
+        &mut self,
+        args: &[Value],
+        result_base: usize,
+        num_results: i32,
+    ) -> Result<(), LuaError> {
+        let t = args.first().copied().unwrap_or(Value::Nil);
+        self.check_move_table_rw(t, 1)?;
+        let size = self.lua_len_integer(t)?;
+        let pos = if args.len() > 1 {
+            match args[1] {
+                Value::Integer(i) => i,
+                Value::Float(f) if f.floor() == f => f as i64,
+                v => {
+                    return Err(LuaError::new(format!(
+                        "bad argument #2 to 'remove' (number expected, got {})",
+                        v.type_name()
+                    )));
+                }
+            }
+        } else {
+            size
+        };
+        if pos != size && (pos as u64).wrapping_sub(1) > size as u64 {
+            return Err(LuaError::new(
+                "bad argument #2 to 'remove' (position out of bounds)",
+            ));
+        }
+        let result = self.table_get(t, Value::Integer(pos))?;
+        let mut p = pos;
+        while p < size {
+            let v = self.table_get(t, Value::Integer(p + 1))?;
+            self.table_set(t, Value::Integer(p), v)?;
+            p += 1;
+        }
+        self.table_set(t, Value::Integer(p), Value::Nil)?;
+        self.place_results(result_base, num_results, &[result]);
+        Ok(())
     }
 
     /// Handle `table.concat(list [, sep [, i [, j]]])`, mirroring
@@ -6458,25 +6750,19 @@ impl Vm {
                     comp.type_name()
                 )));
             }
-            self.auxsort(table_ref, 1, n as u32, 0, comp)?;
+            self.auxsort(tv, 1, n as u32, 0, comp)?;
         }
 
         self.place_results(result_base, num_results, &[]);
         Ok(())
     }
 
-    fn sort_get(&self, table: GcRef, i: u32) -> Value {
-        table
-            .as_object()
-            .as_table()
-            .map(|t| t.raw_get(&Value::Integer(i as i64)))
-            .unwrap_or(Value::Nil)
+    fn sort_get(&mut self, table: Value, i: u32) -> Result<Value, LuaError> {
+        self.table_get(table, Value::Integer(i as i64))
     }
 
-    fn sort_set(&mut self, table: GcRef, i: u32, v: Value) {
-        if let Some(t) = table.as_object_mut().as_table_mut() {
-            t.raw_set(Value::Integer(i as i64), v);
-        }
+    fn sort_set(&mut self, table: Value, i: u32, v: Value) -> Result<(), LuaError> {
+        self.table_set(table, Value::Integer(i as i64), v)
     }
 
     fn sort_comp(&mut self, a: Value, b: Value, comp: Value) -> Result<bool, LuaError> {
@@ -6490,18 +6776,18 @@ impl Vm {
 
     fn auxsort(
         &mut self,
-        table: GcRef,
+        table: Value,
         mut lo: u32,
         mut up: u32,
         mut rnd: u32,
         comp: Value,
     ) -> Result<(), LuaError> {
         while lo < up {
-            let a_lo = self.sort_get(table, lo);
-            let a_up = self.sort_get(table, up);
+            let a_lo = self.sort_get(table, lo)?;
+            let a_up = self.sort_get(table, up)?;
             if self.sort_comp(a_up, a_lo, comp)? {
-                self.sort_set(table, lo, a_up);
-                self.sort_set(table, up, a_lo);
+                self.sort_set(table, lo, a_up)?;
+                self.sort_set(table, up, a_lo)?;
             }
             if up - lo == 1 {
                 return Ok(());
@@ -6513,26 +6799,26 @@ impl Vm {
                 choose_pivot(lo, up, rnd)
             };
 
-            let a_p = self.sort_get(table, p);
-            let a_lo = self.sort_get(table, lo);
+            let a_p = self.sort_get(table, p)?;
+            let a_lo = self.sort_get(table, lo)?;
             if self.sort_comp(a_p, a_lo, comp)? {
-                self.sort_set(table, p, a_lo);
-                self.sort_set(table, lo, a_p);
+                self.sort_set(table, p, a_lo)?;
+                self.sort_set(table, lo, a_p)?;
             } else {
-                let a_up = self.sort_get(table, up);
+                let a_up = self.sort_get(table, up)?;
                 if self.sort_comp(a_up, a_p, comp)? {
-                    self.sort_set(table, p, a_up);
-                    self.sort_set(table, up, a_p);
+                    self.sort_set(table, p, a_up)?;
+                    self.sort_set(table, up, a_p)?;
                 }
             }
             if up - lo == 2 {
                 return Ok(());
             }
 
-            let pivot = self.sort_get(table, p);
-            let a_up1 = self.sort_get(table, up - 1);
-            self.sort_set(table, p, a_up1);
-            self.sort_set(table, up - 1, pivot);
+            let pivot = self.sort_get(table, p)?;
+            let a_up1 = self.sort_get(table, up - 1)?;
+            self.sort_set(table, p, a_up1)?;
+            self.sort_set(table, up - 1, pivot)?;
 
             p = self.partition(table, lo, up, comp, pivot)?;
 
@@ -6555,7 +6841,7 @@ impl Vm {
 
     fn partition(
         &mut self,
-        table: GcRef,
+        table: Value,
         lo: u32,
         up: u32,
         comp: Value,
@@ -6566,7 +6852,7 @@ impl Vm {
         loop {
             let ai = loop {
                 i += 1;
-                let v = self.sort_get(table, i);
+                let v = self.sort_get(table, i)?;
                 if !self.sort_comp(v, pivot, comp)? {
                     break v;
                 }
@@ -6576,7 +6862,7 @@ impl Vm {
             };
             let aj = loop {
                 j -= 1;
-                let v = self.sort_get(table, j);
+                let v = self.sort_get(table, j)?;
                 if !self.sort_comp(pivot, v, comp)? {
                     break v;
                 }
@@ -6585,12 +6871,12 @@ impl Vm {
                 }
             };
             if j < i {
-                self.sort_set(table, up - 1, ai);
-                self.sort_set(table, i, pivot);
+                self.sort_set(table, up - 1, ai)?;
+                self.sort_set(table, i, pivot)?;
                 return Ok(i);
             }
-            self.sort_set(table, i, aj);
-            self.sort_set(table, j, ai);
+            self.sort_set(table, i, aj)?;
+            self.sort_set(table, j, ai)?;
         }
     }
 
@@ -6733,6 +7019,79 @@ impl Vm {
     }
 
     // ── For-loop helpers ───────────────────────────────────────────
+
+    /// Convert a numeric value to `f64` (assumes it is already a number).
+    fn as_float(v: Value) -> f64 {
+        match v {
+            Value::Integer(i) => i as f64,
+            Value::Float(f) => f,
+            _ => 0.0,
+        }
+    }
+
+    /// Convert a limit value to an integer for the integer loop, mirroring
+    /// reference Lua's `forlimit`. Returns None when the loop must be skipped.
+    fn for_limit(
+        &self,
+        init: i64,
+        lim: Value,
+        step: i64,
+    ) -> Result<Option<i64>, LuaError> {
+        let ceil = step < 0;
+        let converted = match lim {
+            Value::Integer(i) => Some(i),
+            Value::Float(f) => {
+                if f.is_nan() || f.is_infinite() {
+                    None
+                } else {
+                    let r = if ceil { f.ceil() } else { f.floor() };
+                    if r >= -(2f64.powi(63)) && r < 2f64.powi(63) {
+                        Some(r as i64)
+                    } else {
+                        None
+                    }
+                }
+            }
+            Value::Object(r) if r.as_object().as_string().is_some() => {
+                let s = r.as_object().as_string().unwrap();
+                match crate::stdlib::io::parse_lua_number(s.as_bytes()) {
+                    Some(Value::Integer(i)) => Some(i),
+                    Some(Value::Float(f)) => {
+                        let r = if ceil { f.ceil() } else { f.floor() };
+                        if r >= -(2f64.powi(63)) && r < 2f64.powi(63) {
+                            Some(r as i64)
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+        let p = match converted {
+            Some(p) => p,
+            None => {
+                // Not coercible to an integer: try as a float out of bounds.
+                let f = Self::coerce_to_number(lim)
+                    .ok_or_else(|| LuaError::new("'for' limit must be a number"))?;
+                let f = Self::as_float(f);
+                if f > 0.0 {
+                    if step < 0 {
+                        return Ok(None);
+                    }
+                    i64::MAX
+                } else {
+                    if step > 0 {
+                        return Ok(None);
+                    }
+                    i64::MIN
+                }
+            }
+        };
+        let skip = if step > 0 { init > p } else { init < p };
+        Ok(if skip { None } else { Some(p) })
+    }
 
     fn for_prep_validate(
         &self,

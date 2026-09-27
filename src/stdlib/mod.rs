@@ -192,7 +192,11 @@ pub fn lua_next(args: &[Value], _gc: &mut Gc) -> Result<Vec<Value>, LuaError> {
     let key = args.get(1).copied().unwrap_or(Value::Nil);
     match table {
         Value::Object(r) if r.as_object().as_table().is_some() => {
-            match r.as_object().as_table().unwrap().next(&key) {
+            let t = r.as_object().as_table().unwrap();
+            if !key.is_nil() && !t.has_key(&key) {
+                return Err(LuaError::new("invalid key to 'next'"));
+            }
+            match t.next(&key) {
                 Some((k, v)) => Ok(vec![k, v]),
                 None => Ok(vec![Value::Nil]),
             }
