@@ -1897,12 +1897,13 @@ fn compile_funcall(
 
     let nargs = args.len();
 
-    // Ensure we have registers allocated for args starting at arg_start
-    if fs.free_reg < arg_start {
-        fs.free_reg = arg_start;
-        if fs.free_reg > fs.proto.max_stack_size {
-            fs.proto.max_stack_size = fs.free_reg;
-        }
+    // Arguments always live immediately above the call base (CALL reads
+    // exactly R[base+1]..). Any temporaries used while evaluating the
+    // callee are dead now, so reset the temporary stack even if it was
+    // raised (e.g. by a pre-allocated concat operand block).
+    fs.free_reg = arg_start;
+    if fs.free_reg > fs.proto.max_stack_size {
+        fs.proto.max_stack_size = fs.free_reg;
     }
 
     for (i, arg) in args.iter().enumerate() {

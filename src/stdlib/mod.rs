@@ -5,6 +5,7 @@ pub mod debug;
 pub mod io;
 pub mod math;
 pub mod os;
+pub mod pack;
 pub mod package;
 pub mod string;
 pub mod table;

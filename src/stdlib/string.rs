@@ -1087,10 +1087,34 @@ fn get_captures(ms: &MatchState, source: &[u8], start: usize, end: usize, gc: &m
 
 // ── Public API ─────────────────────────────────────────────────────
 
+pub fn string_dump(args: &[Value], gc: &mut Gc) -> Result<Vec<Value>, LuaError> {
+    let v = args.first().copied().unwrap_or(Value::Nil);
+    let strip = args.get(1).map(|v| v.is_truthy()).unwrap_or(false);
+
+    let proto = match v {
+        Value::Object(r) => match r.as_object().as_closure() {
+            Some(crate::closure::Closure::Lua(lc)) => Some(std::rc::Rc::clone(&lc.proto)),
+            _ => None,
+        },
+        _ => None,
+    };
+
+    match proto {
+        Some(proto) => {
+            let bytes = crate::chunk::dump(&proto, strip);
+            Ok(vec![Value::Object(gc.new_string(&bytes))])
+        }
+        None => Err(LuaError::new(
+            "bad argument #1 to 'dump' (Lua function expected)",
+        )),
+    }
+}
+
 pub fn string_functions() -> Vec<(&'static str, NativeFn)> {
     vec![
         ("byte", string_byte as NativeFn),
         ("char", string_char),
+        ("dump", string_dump),
         ("find", string_find),
         ("format", string_format),
         ("gmatch", string_gmatch),
@@ -1098,9 +1122,12 @@ pub fn string_functions() -> Vec<(&'static str, NativeFn)> {
         ("len", string_len),
         ("lower", string_lower),
         ("match", string_match),
+        ("pack", crate::stdlib::pack::string_pack as NativeFn),
+        ("packsize", crate::stdlib::pack::string_packsize),
         ("rep", string_rep),
         ("reverse", string_reverse),
         ("sub", string_sub),
+        ("unpack", crate::stdlib::pack::string_unpack),
         ("upper", string_upper),
     ]
 }

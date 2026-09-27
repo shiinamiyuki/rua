@@ -3977,6 +3977,50 @@ impl Vm {
         Ok(self.gc.new_closure(closure))
     }
 
+    /// Load chunk bytes as either source text or a precompiled binary
+    /// chunk, according to `mode` ("b", "t" or "bt"). Binary chunks
+    /// receive fresh upvalues: the first is bound to `env`, the rest
+    /// start as nil.
+    fn load_chunk(
+        &mut self,
+        bytes: &[u8],
+        chunk_name: &str,
+        mode: &str,
+        env: GcRef,
+    ) -> Result<GcRef, LuaError> {
+        let is_binary = bytes.first() == Some(&0x1b);
+        if is_binary && !mode.contains('b') {
+            return Err(LuaError::new(format!(
+                "attempt to load a binary chunk (mode is '{mode}')"
+            )));
+        }
+        if !is_binary && !mode.contains('t') {
+            return Err(LuaError::new(format!(
+                "attempt to load a text chunk (mode is '{mode}')"
+            )));
+        }
+
+        if !is_binary {
+            return self.compile_chunk(bytes, chunk_name, env);
+        }
+
+        // Binary chunk (PUC-Rio chunks are detected as binary too but
+        // rejected by `undump` below).
+        let proto = crate::chunk::undump(bytes, chunk_name)
+            .map_err(|why| LuaError::new(format!("bad binary format ({why})")))?;
+
+        let num_upvalues = proto.upvalues.len();
+        let mut upvalues: Vec<UpvalueRef> = (0..num_upvalues)
+            .map(|_| Rc::new(RefCell::new(Upvalue::Closed(Value::Nil))))
+            .collect();
+        if num_upvalues > 0 {
+            upvalues[0] = Rc::new(RefCell::new(Upvalue::Closed(Value::Object(env))));
+        }
+
+        let closure = Closure::new_lua(Rc::new(proto), upvalues);
+        Ok(self.gc.new_closure(closure))
+    }
+
     /// Read a table field by string key using raw_get.
     fn table_raw_get_str(&mut self, table: GcRef, key: &[u8]) -> Value {
         let key_ref = self.gc.new_string(key);
@@ -4073,7 +4117,7 @@ impl Vm {
 
         let env = self.globals_ref.expect("globals ref not set");
         let chunk_name = format!("@{filename}");
-        let closure_ref = self.compile_chunk(&source, &chunk_name, env)?;
+        let closure_ref = self.load_chunk(&source, &chunk_name, "bt", env)?;
         let fname_val = Value::Object(self.gc.new_string(filename.as_bytes()));
         Ok(vec![Value::Object(closure_ref), fname_val])
     }
@@ -4213,7 +4257,11 @@ impl Vm {
             .map(|b| String::from_utf8_lossy(b).to_string())
             .unwrap_or_else(|| "=(load)".to_string());
 
-        // args[2] (mode) is accepted but not enforced for now.
+        let mode = args
+            .get(2)
+            .and_then(|v| v.as_str_bytes())
+            .map(|b| String::from_utf8_lossy(b).to_string())
+            .unwrap_or_else(|| "bt".to_string());
 
         let env = match args.get(3).copied() {
             Some(Value::Object(r)) if r.as_object().as_table().is_some() => r,
@@ -4231,7 +4279,7 @@ impl Vm {
             }
         };
 
-        match self.compile_chunk(&chunk_bytes, &chunkname, env) {
+        match self.load_chunk(&chunk_bytes, &chunkname, &mode, env) {
             Ok(closure_ref) => {
                 self.place_results(result_base, num_results, &[Value::Object(closure_ref)]);
             }
@@ -4291,6 +4339,12 @@ impl Vm {
             }
         };
 
+        let mode = args
+            .get(1)
+            .and_then(|v| v.as_str_bytes())
+            .map(|b| String::from_utf8_lossy(b).to_string())
+            .unwrap_or_else(|| "bt".to_string());
+
         let env = match args.get(2).copied() {
             Some(Value::Object(r)) if r.as_object().as_table().is_some() => r,
             Some(Value::Nil) | None => self.globals_ref.expect("globals ref not set"),
@@ -4302,7 +4356,7 @@ impl Vm {
         };
 
         let chunk_name = format!("@{filename}");
-        match self.compile_chunk(&source, &chunk_name, env) {
+        match self.load_chunk(&source, &chunk_name, &mode, env) {
             Ok(closure_ref) => {
                 self.place_results(result_base, num_results, &[Value::Object(closure_ref)]);
             }
@@ -4346,7 +4400,7 @@ impl Vm {
 
         let env = self.globals_ref.expect("globals ref not set");
         let chunk_name = format!("@{filename}");
-        let closure_ref = self.compile_chunk(&source, &chunk_name, env)?;
+        let closure_ref = self.load_chunk(&source, &chunk_name, "bt", env)?;
 
         let results = self.call_value(Value::Object(closure_ref), &[])?;
         self.place_results(result_base, num_results, &results);

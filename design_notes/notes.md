@@ -562,4 +562,82 @@ All four new Lua suites pass: `weak_tables_test.lua`,
 plus the existing `io_os_test.lua` which had been crashing earlier
 due to the stack-scan bug.
 
+## Session — M2.6 completion: string.dump + string.pack (2026-09-27)
+
+Finished the two remaining Phase 2 items. Upstream `tpack.lua` now passes
+end-to-end, and `cargo test` reports 172 unit tests + 2 integration tests,
+with all `tests/*.lua` suites green.
+
+### `string.pack` / `string.unpack` / `string.packsize`
+
+- New module `src/stdlib/pack.rs` (~640 lines), a direct port of PUC-Rio
+  5.5's `lstrlib.c` pack engine (fetched `v5.5.0` sources as reference):
+  - All options: `b B h H l L j J T i[n] I[n] f d n c[n] z s[n] x X<op>`
+    plus `< > = ![n]` and spaces.
+  - Native sizes taken from Rust `size_of`/`align_of` (`c_long` for `l`),
+    native max alignment computed as `offsetof(struct cD, u)`.
+  - `MAX_SIZE = LUA_MAXINTEGER` (i64::MAX on 64-bit), matching the
+    overflow/too-large/too-long boundaries the upstream suite checks;
+    digit parsing stops at `(MAX_SIZE - 9)/10` so oversized numerals
+    leave trailing digits to be reported as invalid options.
+  - PUC-identical error strings (`integral size (N) out of limits
+    [1,16]`, `format asks for alignment not power of 2`, `invalid next
+    option for option 'X'`, `%d-byte integer does not fit into Lua
+    Integer`, etc.) so `checkerror` patterns in `tpack.lua` match.
+  - Alignment (`min(size, maxalign)`, power-of-2 validation, `c`/`z`
+    unaligned, `Xop` pulls alignment from the following option),
+    endianness, sign extension, oversized-integer verification, and
+    `unpack` initial-position semantics (`posrelatI`) all mirror the C
+    implementation.
+- Registered in `string_functions()` as `pack` / `packsize` / `unpack`.
+
+### `string.dump` + binary chunks
+
+- New module `src/chunk.rs`: custom, versioned binary chunk format
+  (`\x1bRua` + version + endian/size/numeric check header + recursive
+  Proto encoding). Not PUC-compatible by design; `undump` validates the
+  full header and reports `bad binary format (<why>)`.
+  - `strip` omits line info, locals, source, and upvalue names.
+  - 3 unit tests: round-trip, strip, bad header/truncation.
+- `string_dump` in `src/stdlib/string.rs` accepts Lua closures only and
+  dumps `Rc<Proto>` directly (no VM access needed).
+- `Vm::load_chunk(bytes, chunk_name, mode, env)` is the new central
+  loader: mode enforcement (`b`/`t`/`bt`, PUC messages `attempt to load
+  a binary/text chunk (mode is 'x')`), binary undump, and fresh upvalue
+  setup (first upvalue = env, rest = nil). Used by `load`, `loadfile`,
+  `dofile`, and the `require` file searcher, so all of them now accept
+  precompiled chunks.
+- Fuzzed corrupted/truncated chunks via Lua (all truncations + 200 bit
+  flips): always an error, never a panic.
+
+### Bug fixed: function calls inside concat chains
+
+While running `tpack.lua` the expression `"ab" .. string.rep("\0", n) ..
+"X\1"` exposed a pre-existing compiler bug: `compile_funcall` assumed
+argument registers start at `base + 1`, but `compile_concat` pre-reserves
+a contiguous block for all operands and raises `free_reg` above the call
+base, so calls that were *not* the last concat operand compiled their
+arguments into wrong registers (CALL then read nils/stale values).
+- Fix: `compile_funcall` now unconditionally resets `free_reg` to
+  `arg_start` after evaluating the callee (`src/compiler.rs`); temps
+  used for the callee are dead at that point, and concat operands after
+  the call are written later, so their reserved slots are safe.
+- Regression coverage added in `tests/test_pack.lua` ("concat call 1..4").
+
+### Tests added
+
+- `tests/test_pack.lua` — 264 assertions: all integer sizes/endianness,
+  overflow errors, floats, strings, alignment, invalid formats, initial
+  positions, plus concat-call regressions.
+- `tests/test_dump.lua` — 39 assertions: round-trips, strip, mode
+  enforcement, bad binary, upvalue freshness/env binding, varargs,
+  nested functions, stripped-chunk errors, binary `loadfile`/`dofile`.
+- Upstream `tests/lua-upstream-tests/tpack.lua` passes (`OK`).
+
+### ROADMAP
+
+- M2.6: `string.dump` and `string.pack`/`unpack`/`packsize` checked off.
+- M4.7: the two precompiled-chunk items are checked off early (custom
+  format; no `luac` CLI yet).
+
 ## APPEND HERE

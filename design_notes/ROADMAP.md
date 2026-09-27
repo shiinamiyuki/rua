@@ -151,8 +151,8 @@ Goal: Pass the majority of the Lua test suite (non-coroutine, non-IO parts).
 - [x] `string.format` (all specifiers: `d`, `i`, `u`, `f`, `e`, `g`, `x`, `o`, `s`, `c`, `q`, `p`)
 - [x] Pattern matching engine: `string.find`, `string.match`, `string.gmatch`, `string.gsub`
   - Character classes (`%a`, `%d`, `%w`, etc.), quantifiers (`*`, `+`, `-`, `?`), captures, `%bxy`, `%f[set]`
-- [ ] `string.dump` (serialize `Proto` to binary)
-- [ ] `string.pack`, `string.unpack`, `string.packsize`
+- [x] `string.dump` (serialize `Proto` to binary)
+- [x] `string.pack`, `string.unpack`, `string.packsize`
 - [x] String metatable with `__index = string`
 
 ### M2.7 — Table Library
@@ -296,8 +296,8 @@ Goal: Performance comparable to PUC-Rio Lua. Production-ready interpreter.
 - [ ] Regression test for performance (CI check)
 
 ### M4.7 — Polish
-- [ ] Precompiled chunk load/dump (binary format compatible or custom)
-- [ ] `string.dump` / `load` binary chunk support
+- [x] Precompiled chunk load/dump (binary format compatible or custom)
+- [x] `string.dump` / `load` binary chunk support
 - [ ] Complete CLI: `rua -i` interactive REPL, `rua -l lib`, `rua -W` warnings
 - [ ] `warn()` function and control messages (`@on`, `@off`)
 - [ ] Comprehensive error messages with source locations

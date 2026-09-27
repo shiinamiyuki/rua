@@ -2,6 +2,7 @@
 
 pub mod ast;
 pub mod bytecode;
+pub mod chunk;
 pub mod closure;
 pub mod compiler;
 pub mod coroutine;
