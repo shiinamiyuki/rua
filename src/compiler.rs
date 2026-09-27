@@ -62,6 +62,9 @@ struct PendingGoto {
     name: String,
     /// Index into the code array of the JMP instruction.
     patch_pc: usize,
+    /// Index into the code array of the CLOSE instruction emitted just
+    /// before the JMP (patched when the goto leaves a local's scope).
+    close_pc: usize,
     /// Number of locals active at the goto site.
     num_locals: usize,
     /// Block depth where the goto appears (0 = function body).
@@ -1149,19 +1152,33 @@ fn compile_generic_for(
 }
 
 fn compile_goto(fs: &mut FuncState, label: &str, line: u32) -> Result<(), LuaError> {
-    // Try to resolve label immediately
-    let resolved_pc = fs.labels.iter().find(|lbl| lbl.name == label).map(|lbl| lbl.pc);
-    if let Some(target_pc) = resolved_pc {
+    // Try to resolve label immediately (backward goto).
+    let resolved = fs
+        .labels
+        .iter()
+        .find(|lbl| lbl.name == label)
+        .map(|lbl| (lbl.pc, lbl.num_locals));
+    if let Some((target_pc, label_locals)) = resolved {
+        // Close upvalues of locals that are leaving scope.
+        let first_reg = if fs.locals.len() > label_locals {
+            fs.locals[label_locals].reg
+        } else {
+            fs.free_reg
+        };
+        fs.emit_abc(OpCode::Close, first_reg, 0, 0, line);
         let jmp_pc = fs.emit_jmp(line);
         fs.patch_jmp(jmp_pc, target_pc);
         return Ok(());
     }
 
-    // Forward goto — add to pending list
+    // Forward goto — add to pending list.  The CLOSE placeholder before the
+    // JMP is patched when the label is resolved (reference Lua's closegoto).
+    let close_pc = fs.emit_abc(OpCode::Close, fs.free_reg, 0, 0, line);
     let jmp_pc = fs.emit_jmp(line);
     fs.pending_gotos.push(PendingGoto {
         name: label.to_string(),
         patch_pc: jmp_pc,
+        close_pc,
         num_locals: fs.locals.len(),
         depth: fs.scopes.len(),
         line,
@@ -1212,6 +1229,15 @@ fn compile_label(fs: &mut FuncState, label: &str, is_last: bool) -> Result<(), L
                     fs.locals[goto.num_locals].name,
                 )));
             }
+            // Patch the CLOSE placeholder: close the locals that go out of
+            // scope at the target label.
+            let first_reg = if goto.num_locals > num_locals {
+                fs.locals[num_locals].reg
+            } else {
+                fs.free_reg
+            };
+            fs.proto.code[goto.close_pc] =
+                encode_abc(OpCode::Close, first_reg, 0, 0);
             fs.patch_jmp(goto.patch_pc, pc);
         } else {
             i += 1;

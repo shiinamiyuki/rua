@@ -6165,7 +6165,14 @@ impl Vm {
                 self.place_results(result_base, num_results, &[Value::Integer(ptr as i64)]);
             }
             _ => {
-                self.place_results(result_base, num_results, &[Value::Nil]);
+                // Native closures have implementation-defined upvalues; report
+                // a stable identifier for the first one.
+                if up_idx == 1 {
+                    let ptr = closure_ref.ptr_value() as i64;
+                    self.place_results(result_base, num_results, &[Value::Integer(ptr)]);
+                } else {
+                    self.place_results(result_base, num_results, &[Value::Nil]);
+                }
             }
         }
     }
