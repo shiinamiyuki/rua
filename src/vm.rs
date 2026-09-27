@@ -1435,8 +1435,8 @@ impl Vm {
         match (a, b) {
             (Value::Integer(x), Value::Integer(y)) => Some(x < y),
             (Value::Float(x), Value::Float(y)) => Some(x < y),
-            (Value::Integer(x), Value::Float(y)) => Some((x as f64) < y),
-            (Value::Float(x), Value::Integer(y)) => Some(x < (y as f64)),
+            (Value::Integer(x), Value::Float(y)) => Some(lt_int_float(x, y)),
+            (Value::Float(x), Value::Integer(y)) => Some(lt_float_int(x, y)),
             (Value::Object(ra), Value::Object(rb)) => {
                 match (&ra.as_object().kind, &rb.as_object().kind) {
                     (GcObjectKind::String(sa), GcObjectKind::String(sb)) => {
@@ -1468,8 +1468,8 @@ impl Vm {
         match (a, b) {
             (Value::Integer(x), Value::Integer(y)) => Some(x <= y),
             (Value::Float(x), Value::Float(y)) => Some(x <= y),
-            (Value::Integer(x), Value::Float(y)) => Some((x as f64) <= y),
-            (Value::Float(x), Value::Integer(y)) => Some(x <= (y as f64)),
+            (Value::Integer(x), Value::Float(y)) => Some(le_int_float(x, y)),
+            (Value::Float(x), Value::Integer(y)) => Some(le_float_int(x, y)),
             (Value::Object(ra), Value::Object(rb)) => {
                 match (&ra.as_object().kind, &rb.as_object().kind) {
                     (GcObjectKind::String(sa), GcObjectKind::String(sb)) => {
@@ -1787,6 +1787,12 @@ impl Vm {
             roots.push(r);
         }
         if let Some(r) = self.gc.io_output {
+            roots.push(r);
+        }
+        if let Some(r) = self.gc.ipairs_iter {
+            roots.push(r);
+        }
+        if let Some(r) = self.gc.pairs_next {
             roots.push(r);
         }
         if let Some(r) = self.hook_func {
@@ -2686,6 +2692,12 @@ impl Vm {
                             self.call_hook("return", None)?;
                         }
                         self.frames.pop();
+                        if self.frames.is_empty() {
+                            // Native tail call ended the top-level function:
+                            // expose its results to resume/wrap.
+                            self.last_return_values =
+                                self.stack[result_base..self.top.max(result_base)].to_vec();
+                        }
                     }
                 }
 
@@ -3239,13 +3251,9 @@ impl Vm {
         let co_ref = match co_val {
             Value::Object(r) if r.as_object().as_coroutine().is_some() => r,
             _ => {
-                let err_str = self.gc.new_string(b"value is not a thread");
-                self.place_results(
-                    result_base,
-                    num_results,
-                    &[Value::Boolean(false), Value::Object(err_str)],
-                );
-                return Ok(());
+                return Err(LuaError::new(
+                    "bad argument #1 to 'resume' (coroutine expected)",
+                ));
             }
         };
 
@@ -5922,6 +5930,77 @@ impl Vm {
 }
 
 // ── Lua integer arithmetic helpers ─────────────────────────────────
+
+/// True when the integer `i` fits in a float exactly (reference Lua's
+/// `l_intfitsf` for a 53-bit mantissa).
+#[inline]
+fn int_fits_float(i: i64) -> bool {
+    (i as i128).abs() <= (1i128 << 53)
+}
+
+/// Exact `i < f` (reference Lua 5.5 semantics).
+fn lt_int_float(i: i64, f: f64) -> bool {
+    if int_fits_float(i) {
+        (i as f64) < f
+    } else if f.is_finite() {
+        let c = f.ceil();
+        if c >= -(2f64.powi(63)) && c < 2f64.powi(63) {
+            i < c as i64
+        } else {
+            f > 0.0
+        }
+    } else {
+        false
+    }
+}
+
+/// Exact `i <= f`.
+fn le_int_float(i: i64, f: f64) -> bool {
+    if int_fits_float(i) {
+        (i as f64) <= f
+    } else if f.is_finite() {
+        let fl = f.floor();
+        if fl >= -(2f64.powi(63)) && fl < 2f64.powi(63) {
+            i <= fl as i64
+        } else {
+            f > 0.0
+        }
+    } else {
+        false
+    }
+}
+
+/// Exact `f < i`.
+fn lt_float_int(f: f64, i: i64) -> bool {
+    if int_fits_float(i) {
+        f < (i as f64)
+    } else if f.is_finite() {
+        let fl = f.floor();
+        if fl >= -(2f64.powi(63)) && fl < 2f64.powi(63) {
+            (fl as i64) < i
+        } else {
+            f < 0.0
+        }
+    } else {
+        false
+    }
+}
+
+/// Exact `f <= i`.
+fn le_float_int(f: f64, i: i64) -> bool {
+    if int_fits_float(i) {
+        f <= (i as f64)
+    } else if f.is_finite() {
+        let c = f.ceil();
+        if c >= -(2f64.powi(63)) && c < 2f64.powi(63) {
+            (c as i64) <= i
+        } else {
+            f < 0.0
+        }
+    } else {
+        false
+    }
+}
 
 /// Lua floor division for integers (wrapping, like reference Lua).
 fn lua_idiv(a: i64, b: i64) -> i64 {

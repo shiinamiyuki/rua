@@ -140,6 +140,17 @@ impl Value {
     }
 }
 
+/// Exact integer/float equality: true when `f` is finite, integral, and
+/// exactly equal to `i` (floats out of the `i64` range never are).
+#[inline]
+pub fn int_equals_float(i: i64, f: f64) -> bool {
+    f.is_finite()
+        && f == f.trunc()
+        && f >= -(2f64.powi(63))
+        && f < 2f64.powi(63)
+        && (f as i64) == i
+}
+
 impl PartialEq for Value {
     /// Structural equality for Value.
     ///
@@ -151,9 +162,10 @@ impl PartialEq for Value {
             (Value::Boolean(a), Value::Boolean(b)) => a == b,
             (Value::Integer(a), Value::Integer(b)) => a == b,
             (Value::Float(a), Value::Float(b)) => a == b,
-            // Lua: 1 == 1.0 is true
+            // Number equality is exact (Lua 5.5): a float equals an
+            // integer only when it has that exact integer value.
             (Value::Integer(i), Value::Float(f)) | (Value::Float(f), Value::Integer(i)) => {
-                (*i as f64) == *f
+                int_equals_float(*i, *f)
             }
             (Value::Object(a), Value::Object(b)) => {
                 // Pointer equality (fast path for interned strings)

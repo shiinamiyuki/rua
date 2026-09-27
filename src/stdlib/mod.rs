@@ -52,6 +52,11 @@ pub fn lua_tostring(args: &[Value], gc: &mut Gc) -> Result<Vec<Value>, LuaError>
 
 /// tonumber(v [, base]) — Convert v to a number.
 pub fn lua_tonumber(args: &[Value], _gc: &mut Gc) -> Result<Vec<Value>, LuaError> {
+    if args.is_empty() {
+        return Err(LuaError::new(
+            "bad argument #1 to 'tonumber' (value expected)",
+        ));
+    }
     let v = args.first().copied().unwrap_or(Value::Nil);
     let base = args
         .get(1)
@@ -136,9 +141,16 @@ pub fn lua_ipairs(args: &[Value], gc: &mut Gc) -> Result<Vec<Value>, LuaError> {
                     _ => Ok(vec![Value::Nil]),
                 }
             };
-            let iter_closure =
-                crate::closure::Closure::new_native("ipairs_iterator", iter_fn);
-            let iter_ref = gc.new_closure(iter_closure);
+            let iter_ref = match gc.ipairs_iter {
+                Some(r) => r,
+                None => {
+                    let iter_closure =
+                        crate::closure::Closure::new_native("ipairs_iterator", iter_fn);
+                    let r = gc.new_closure(iter_closure);
+                    gc.ipairs_iter = Some(r);
+                    r
+                }
+            };
             Ok(vec![Value::Object(iter_ref), table, Value::Integer(0)])
         }
         _ => Err(LuaError::new("bad argument #1 to 'ipairs' (table expected)")),
@@ -179,9 +191,16 @@ pub fn lua_pairs(args: &[Value], gc: &mut Gc) -> Result<Vec<Value>, LuaError> {
                     _ => Ok(vec![Value::Nil]),
                 }
             };
-            let next_closure =
-                crate::closure::Closure::new_native("pairs_next", next_fn);
-            let next_ref = gc.new_closure(next_closure);
+            let next_ref = match gc.pairs_next {
+                Some(r) => r,
+                None => {
+                    let next_closure =
+                        crate::closure::Closure::new_native("pairs_next", next_fn);
+                    let r = gc.new_closure(next_closure);
+                    gc.pairs_next = Some(r);
+                    r
+                }
+            };
             Ok(vec![Value::Object(next_ref), table, Value::Nil])
         }
         _ => Err(LuaError::new("bad argument #1 to 'pairs' (table expected)")),

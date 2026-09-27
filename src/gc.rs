@@ -201,6 +201,9 @@ pub struct Gc {
     /// Current default input/output file handles for the io library.
     pub io_input: Option<GcRef>,
     pub io_output: Option<GcRef>,
+    /// Shared iterator closures for `ipairs`/`pairs`.
+    pub ipairs_iter: Option<GcRef>,
+    pub pairs_next: Option<GcRef>,
     /// Tables and userdata that have a `__gc` finalizer registered. Each
     /// object appears at most once. Removed when its finalizer runs (so it
     /// runs at most once) or when the object is swept.
@@ -228,6 +231,8 @@ impl Gc {
             mt_thread: None,
             io_input: None,
             io_output: None,
+            ipairs_iter: None,
+            pairs_next: None,
             finalizable: Vec::new(),
             pending_finalizers: Vec::new(),
         }
