@@ -838,10 +838,14 @@ fn compile_repeat(
     fs.enter_scope(true);
     compile_block_with(fs, body, false)?;
 
-    // Evaluate condition
+    // Evaluate condition (still inside the body's scope).
     let base = fs.free_reg;
     let cond_reg = fs.alloc_reg()?;
     compile_expr_to_reg(fs, cond, cond_reg)?;
+
+    // Close the body scope before the loop-back jump so locals captured by
+    // closures are fresh each iteration. `breaks` must land after the jump.
+    let breaks = fs.leave_scope_unpatched(line)?;
 
     let cond_line = fs.last_line();
     // TEST cond_reg, 0 — skip if falsy (i.e., repeat body)
@@ -852,7 +856,10 @@ fn compile_repeat(
     fs.proto.code[back_jmp] = encode_asbx(OpCode::Jmp, 0, offset as i16);
 
     fs.free_reg_to(base);
-    fs.leave_scope(line)?;
+    let exit = fs.current_pc();
+    for pc in breaks {
+        fs.patch_jmp(pc, exit);
+    }
 
     Ok(())
 }
@@ -968,8 +975,15 @@ fn compile_numeric_for(
         end_pc: fs.proto.code.len() as u32,
     });
 
+    // The loop variable gets a fresh instance every iteration: if the body
+    // captured it as an upvalue, close it at the end of each iteration.
+    let body_has_upvalues = fs.scopes.last().map(|s| s.has_upvalues).unwrap_or(false);
+
     // Close the scope before the loop-back test; breaks exit past FORLOOP.
     let breaks = fs.leave_scope_unpatched(line)?;
+    if body_has_upvalues {
+        fs.emit_abc(OpCode::Close, base + 3, 0, 0, line);
+    }
 
     // FORLOOP: step + compare + branch back
     let forloop_pc = fs.emit_asbx(OpCode::ForLoop, base, 0, line);
@@ -1164,6 +1178,18 @@ fn compile_break(fs: &mut FuncState, line: u32) -> Result<(), LuaError> {
     let scope_idx = fs
         .find_loop_scope()
         .ok_or_else(|| LuaError::new("break outside loop"))?;
+
+    // Close upvalues captured by scopes we are leaving (so break behaves
+    // like reaching the loop's end for closure freshness).
+    let has_upvalues = fs.scopes[scope_idx..].iter().any(|s| s.has_upvalues);
+    if has_upvalues {
+        let first_reg = fs
+            .locals
+            .get(fs.scopes[scope_idx].first_local)
+            .map(|l| l.reg)
+            .unwrap_or(fs.free_reg);
+        fs.emit_abc(OpCode::Close, first_reg, 0, 0, line);
+    }
 
     let jmp_pc = fs.emit_jmp(line);
     fs.scopes[scope_idx].break_jumps.push(jmp_pc);
@@ -2341,6 +2367,21 @@ fn compile_concat(
     collect_concat_parts(rhs, &mut parts);
 
     let base = fs.free_reg;
+    if dest as usize + 1 == base as usize {
+        // The destination register is immediately below the temporaries:
+        // evaluate the first operand there (like reference Lua), so no
+        // stale value is left in `dest` before the CONCAT's possible GC.
+        compile_expr_to_reg(fs, parts[0], dest)?;
+        for (i, part) in parts.iter().enumerate().skip(1) {
+            let reg = dest + i as u8;
+            fs.alloc_reg()?;
+            compile_expr_to_reg(fs, part, reg)?;
+        }
+        let end = dest + parts.len() as u8 - 1;
+        fs.emit_abc(OpCode::Concat, dest, dest, end, line);
+        fs.free_reg_to(base);
+        return Ok(());
+    }
     let start = fs.alloc_regs(parts.len() as u8)?;
     for (i, part) in parts.iter().enumerate() {
         compile_expr_to_reg(fs, part, start + i as u8)?;
