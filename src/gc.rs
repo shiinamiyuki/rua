@@ -191,6 +191,13 @@ pub struct Gc {
     pub gc_threshold: usize,
     /// Shared metatable for file handles (userdata).
     pub file_metatable: Option<GcRef>,
+    /// Per-type metatables for basic values (set via debug.setmetatable).
+    pub mt_nil: Option<GcRef>,
+    pub mt_bool: Option<GcRef>,
+    pub mt_number: Option<GcRef>,
+    pub mt_string: Option<GcRef>,
+    pub mt_function: Option<GcRef>,
+    pub mt_thread: Option<GcRef>,
     /// Current default input/output file handles for the io library.
     pub io_input: Option<GcRef>,
     pub io_output: Option<GcRef>,
@@ -213,6 +220,12 @@ impl Gc {
             bytes_allocated: 0,
             gc_threshold: GC_INITIAL_THRESHOLD,
             file_metatable: None,
+            mt_nil: None,
+            mt_bool: None,
+            mt_number: None,
+            mt_string: None,
+            mt_function: None,
+            mt_thread: None,
             io_input: None,
             io_output: None,
             finalizable: Vec::new(),

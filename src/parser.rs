@@ -515,8 +515,15 @@ impl Parser {
     /// `attrib ::= '<' Name '>'`
     fn parse_attrib(&mut self) -> Result<String, ParseError> {
         self.expect(TokenKind::Lt)?;
+        let loc = self.current_location();
         let name = self.expect_name()?;
         self.expect(TokenKind::Gt)?;
+        if name != "const" && name != "close" {
+            return Err(ParseError::new(
+                format!("unknown attribute '{name}'"),
+                loc,
+            ));
+        }
         Ok(name)
     }
 

@@ -62,8 +62,8 @@ pub fn debug_setmetatable(args: &[Value], _gc: &mut Gc) -> Result<Vec<Value>, Lu
             ));
         }
     };
-    match val {
-        Value::Object(r) => {
+    if let Value::Object(r) = val {
+        if r.as_object().as_table().is_some() || r.as_object().as_userdata().is_some() {
             {
                 let obj = r.as_object_mut();
                 match &mut obj.kind {
@@ -73,11 +73,7 @@ pub fn debug_setmetatable(args: &[Value], _gc: &mut Gc) -> Result<Vec<Value>, Lu
                     GcObjectKind::Userdata(ud) => {
                         ud.metatable = mt;
                     }
-                    _ => {
-                        return Err(LuaError::new(
-                            "bad argument #1 to 'setmetatable' (table or userdata expected)",
-                        ));
-                    }
+                    _ => unreachable!(),
                 }
             }
 
@@ -106,13 +102,28 @@ pub fn debug_setmetatable(args: &[Value], _gc: &mut Gc) -> Result<Vec<Value>, Lu
             } else if r.as_object().as_table().is_some() {
                 r.as_object_mut().as_table_mut().unwrap().set_weak_mode(None);
             }
-        }
-        _ => {
-            return Err(LuaError::new(
-                "bad argument #1 to 'setmetatable' (table or userdata expected)",
-            ));
+
+            return Ok(vec![val]);
         }
     }
+
+    // Basic (non-table) values share one metatable per type.
+    match val {
+        Value::Object(r) => match &r.as_object().kind {
+            GcObjectKind::Closure(_) => _gc.mt_function = mt,
+            GcObjectKind::String(_) => _gc.mt_string = mt,
+            GcObjectKind::Thread(_) => _gc.mt_thread = mt,
+            _ => {
+                return Err(LuaError::new(
+                    "bad argument #1 to 'setmetatable' (table or userdata expected)",
+                ))
+            }
+        },
+        Value::Nil => _gc.mt_nil = mt,
+        Value::Boolean(_) => _gc.mt_bool = mt,
+        Value::Integer(_) | Value::Float(_) => _gc.mt_number = mt,
+    }
+
     Ok(vec![val])
 }
 

@@ -340,12 +340,16 @@ pub fn lua_setmetatable(args: &[Value], _gc: &mut Gc) -> Result<Vec<Value>, LuaE
 pub fn lua_getmetatable(args: &[Value], _gc: &mut Gc) -> Result<Vec<Value>, LuaError> {
     let v = args.first().copied().unwrap_or(Value::Nil);
     let mt = match v {
+        Value::Nil => _gc.mt_nil,
+        Value::Boolean(_) => _gc.mt_bool,
+        Value::Integer(_) | Value::Float(_) => _gc.mt_number,
         Value::Object(r) => match &r.as_object().kind {
             GcObjectKind::Table(t) => t.metatable,
             GcObjectKind::Userdata(ud) => ud.metatable,
-            _ => None,
+            GcObjectKind::String(_) => _gc.mt_string,
+            GcObjectKind::Closure(_) => _gc.mt_function,
+            GcObjectKind::Thread(_) => _gc.mt_thread,
         },
-        _ => None,
     };
     match mt {
         Some(mt) => {

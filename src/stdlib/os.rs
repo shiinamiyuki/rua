@@ -4,7 +4,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use crate::closure::NativeFn;
 use crate::error::LuaError;
-use crate::gc::Gc;
+use crate::gc::{Gc, GcRef};
 use crate::value::Value;
 
 // ── os functions ───────────────────────────────────────────────────
@@ -19,21 +19,166 @@ pub fn os_clock(_args: &[Value], _gc: &mut Gc) -> Result<Vec<Value>, LuaError> {
     Ok(vec![Value::Float(elapsed.as_secs_f64())])
 }
 
-pub fn os_time(args: &[Value], _gc: &mut Gc) -> Result<Vec<Value>, LuaError> {
-    if args.is_empty() || args[0] == Value::Nil {
+const INT_MAX_I: i64 = i32::MAX as i64;
+const INT_MIN_I: i64 = i32::MIN as i64;
+
+/// Read an integer field from a date table, with reference-Lua's bounds
+/// checks (`field 'x' is not an integer` / `is out-of-bound` / `missing`).
+fn get_date_field(
+    table: GcRef,
+    key: &[u8],
+    default: Option<i64>,
+    delta: i64,
+    gc: &mut Gc,
+) -> Result<i64, LuaError> {
+    let k = gc.new_string(key);
+    let v = table
+        .as_object()
+        .as_table()
+        .map(|t| t.raw_get(&Value::Object(k)))
+        .unwrap_or(Value::Nil);
+    let name = String::from_utf8_lossy(key);
+    let res = match v {
+        Value::Nil => match default {
+            Some(d) => d,
+            None => {
+                return Err(LuaError::new(format!(
+                    "field '{name}' missing in date table"
+                )))
+            }
+        },
+        Value::Integer(i) => i,
+        Value::Float(f) if f.fract() == 0.0 && f >= -(2f64.powi(63)) && f < 2f64.powi(63) => {
+            f as i64
+        }
+        _ => {
+            return Err(LuaError::new(format!(
+                "field '{name}' is not an integer"
+            )))
+        }
+    };
+    let in_bounds = if res >= 0 {
+        res - delta <= INT_MAX_I
+    } else {
+        INT_MIN_I + delta <= res
+    };
+    if !in_bounds {
+        return Err(LuaError::new(format!(
+            "field '{name}' is out-of-bound"
+        )));
+    }
+    Ok(res - delta)
+}
+
+/// Days from 1970-01-01 to y-m-d (proleptic Gregorian).
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = (m + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146097 + doe - 719468
+}
+
+/// Inverse of `days_from_civil`.
+fn civil_from_days(z: i64) -> (i64, i64, i64) {
+    let z = z + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+/// Normalize raw date fields (allowing out-of-range values) into an epoch.
+fn fields_to_epoch(
+    year: i64,
+    month: i64,
+    day: i64,
+    hour: i64,
+    min: i64,
+    sec: i64,
+) -> Option<i64> {
+    // Normalize month into 1..12.
+    let mut y = year as i128;
+    let mut m = month as i128 - 1;
+    y += m.div_euclid(12);
+    m = m.rem_euclid(12);
+    let m = m + 1;
+    let days = days_from_civil(y as i64, m as i64, day) as i128;
+    let total = days * 86400 + hour as i128 * 3600 + min as i128 * 60 + sec as i128;
+    if total < i64::MIN as i128 || total > i64::MAX as i128 {
+        None
+    } else {
+        Some(total as i64)
+    }
+}
+
+fn set_date_fields(t: GcRef, epoch: i64, gc: &mut Gc) {
+    let secs_per_day = 86400i64;
+    let days = epoch.div_euclid(secs_per_day);
+    let rem = epoch.rem_euclid(secs_per_day);
+    let (year, month, day) = civil_from_days(days);
+    let hour = rem / 3600;
+    let min = (rem % 3600) / 60;
+    let sec = rem % 60;
+    let yday = days - days_from_civil(year, 1, 1) + 1;
+    let wday = (days + 4).rem_euclid(7) + 1; // 1 = Sunday
+    let mut set = |name: &[u8], v: Value, gc: &mut Gc| {
+        let k = gc.new_string(name);
+        t.as_object_mut()
+            .as_table_mut()
+            .unwrap()
+            .raw_set(Value::Object(k), v);
+    };
+    set(b"year", Value::Integer(year), gc);
+    set(b"month", Value::Integer(month), gc);
+    set(b"day", Value::Integer(day), gc);
+    set(b"hour", Value::Integer(hour), gc);
+    set(b"min", Value::Integer(min), gc);
+    set(b"sec", Value::Integer(sec), gc);
+    set(b"yday", Value::Integer(yday), gc);
+    set(b"wday", Value::Integer(wday), gc);
+    set(b"isdst", Value::Boolean(false), gc);
+}
+
+pub fn os_time(args: &[Value], gc: &mut Gc) -> Result<Vec<Value>, LuaError> {
+    if args.is_empty() || args[0].is_nil() {
         let secs = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
         return Ok(vec![Value::Integer(secs as i64)]);
     }
-    // os.time(table) — construct time from table fields
-    // For now, return current time regardless of table
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    Ok(vec![Value::Integer(secs as i64)])
+    let table = match args[0] {
+        Value::Object(r) if r.as_object().as_table().is_some() => r,
+        _ => {
+            return Err(LuaError::new(
+                "bad argument #1 to 'time' (table expected)",
+            ))
+        }
+    };
+    let year = get_date_field(table, b"year", None, 1900, gc)? + 1900;
+    let month = get_date_field(table, b"month", None, 1, gc)? + 1;
+    let day = get_date_field(table, b"day", None, 0, gc)?;
+    let hour = get_date_field(table, b"hour", Some(12), 0, gc)?;
+    let min = get_date_field(table, b"min", Some(0), 0, gc)?;
+    let sec = get_date_field(table, b"sec", Some(0), 0, gc)?;
+
+    match fields_to_epoch(year, month, day, hour, min, sec) {
+        Some(epoch) => {
+            set_date_fields(table, epoch, gc);
+            Ok(vec![Value::Integer(epoch)])
+        }
+        None => Err(LuaError::new(
+            "time result cannot be represented in this installation",
+        )),
+    }
 }
 
 pub fn os_difftime(args: &[Value], _gc: &mut Gc) -> Result<Vec<Value>, LuaError> {
@@ -50,51 +195,84 @@ pub fn os_difftime(args: &[Value], _gc: &mut Gc) -> Result<Vec<Value>, LuaError>
     Ok(vec![Value::Float(t2 - t1)])
 }
 
-pub fn os_date(args: &[Value], gc: &mut Gc) -> Result<Vec<Value>, LuaError> {
-    let format = args.first()
-        .and_then(|v| v.as_str_bytes())
-        .map(|b| std::str::from_utf8(b).unwrap_or("%c"))
-        .unwrap_or("%c");
-
-    // Handle "*t" format — return table
-    if format == "*t" || format == "!*t" {
-        return os_date_table(args, gc);
+/// Valid one-character strftime options (C99 set) plus the two-character
+/// 'E'/'O' variants accepted by reference Lua.
+fn valid_specifier(bytes: &[u8], pos: usize) -> Option<usize> {
+    const ONE: &[u8] = b"aAbBcCdDeFgGhHIjmMnprRStTuUVwWxXyYzZ%";
+    const TWO: [&[u8]; 26] = [
+        b"Ec", b"EC", b"Ex", b"EX", b"Ey", b"EY", b"Od", b"Oe", b"OH", b"OI",
+        b"Om", b"OM", b"OS", b"Ou", b"OU", b"OV", b"Ow", b"OW", b"Oy", b"#c",
+        b"#x", b"#d", b"#H", b"#I", b"#j", b"#m",
+    ];
+    let first = *bytes.get(pos)?;
+    if ONE.contains(&first) {
+        return Some(1);
     }
-
-    // For simple date formatting, use a basic implementation
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-
-    let result = format_date(format, now as i64);
-    Ok(vec![Value::Object(gc.new_string(result.as_bytes()))])
+    if pos + 1 <= bytes.len() {
+        let pair = &bytes[pos..bytes.len().min(pos + 2)];
+        if pair.len() == 2 && TWO.iter().any(|t| *t == pair) {
+            return Some(2);
+        }
+    }
+    None
 }
 
-fn os_date_table(_args: &[Value], gc: &mut Gc) -> Result<Vec<Value>, LuaError> {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs() as i64;
+pub fn os_date(args: &[Value], gc: &mut Gc) -> Result<Vec<Value>, LuaError> {
+    let format = args
+        .first()
+        .map(|v| {
+            v.as_str_bytes()
+                .map(|b| b.to_vec())
+                .unwrap_or_else(|| b"%c".to_vec())
+        })
+        .unwrap_or_else(|| b"%c".to_vec());
 
-    // Simple epoch → broken-down time (UTC)
-    let (year, month, day, hour, min, sec, wday, yday) = epoch_to_fields(now);
+    let epoch = match args.get(1).copied() {
+        None | Some(Value::Nil) => SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64,
+        Some(Value::Integer(i)) => i,
+        Some(Value::Float(f)) if f.fract() == 0.0 => f as i64,
+        Some(_) => {
+            return Err(LuaError::new(
+                "bad argument #2 to 'date' (number expected)",
+            ))
+        }
+    };
 
-    let table_ref = gc.new_table(crate::table::Table::new());
-    {
-        let table = table_ref.as_object_mut().as_table_mut().unwrap();
-        table.raw_set(Value::Object(gc.new_string(b"year")), Value::Integer(year));
-        table.raw_set(Value::Object(gc.new_string(b"month")), Value::Integer(month));
-        table.raw_set(Value::Object(gc.new_string(b"day")), Value::Integer(day));
-        table.raw_set(Value::Object(gc.new_string(b"hour")), Value::Integer(hour));
-        table.raw_set(Value::Object(gc.new_string(b"min")), Value::Integer(min));
-        table.raw_set(Value::Object(gc.new_string(b"sec")), Value::Integer(sec));
-        table.raw_set(Value::Object(gc.new_string(b"wday")), Value::Integer(wday));
-        table.raw_set(Value::Object(gc.new_string(b"yday")), Value::Integer(yday));
-        table.raw_set(Value::Object(gc.new_string(b"isdst")), Value::Boolean(false));
+    let mut fmt: &[u8] = &format;
+    if fmt.first() == Some(&b'!') {
+        fmt = &fmt[1..];
     }
 
-    Ok(vec![Value::Object(table_ref)])
+    if fmt == b"*t" {
+        let t = gc.new_table(crate::table::Table::new());
+        set_date_fields(t, epoch, gc);
+        return Ok(vec![Value::Object(t)]);
+    }
+
+    // Validate every conversion specifier.
+    let mut i = 0;
+    while i < fmt.len() {
+        if fmt[i] != b'%' {
+            i += 1;
+            continue;
+        }
+        i += 1;
+        match valid_specifier(fmt, i) {
+            Some(n) => i += n,
+            None => {
+                let spec = String::from_utf8_lossy(&fmt[i.min(fmt.len())..]).to_string();
+                return Err(LuaError::new(format!(
+                    "bad argument #1 to 'date' (invalid conversion specifier '%{spec}')"
+                )));
+            }
+        }
+    }
+
+    let result = format_date_bytes(fmt, epoch);
+    Ok(vec![Value::Object(gc.new_string(&result))])
 }
 
 /// Convert UTC epoch seconds to (year, month, day, hour, min, sec, wday, yday).
@@ -149,7 +327,138 @@ fn is_leap(year: i64) -> bool {
     (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
 }
 
-/// Basic strftime-like formatting.
+/// Format a date using strftime-like specifiers (already validated).
+fn format_date_bytes(fmt: &[u8], epoch: i64) -> Vec<u8> {
+    let (year, month, day, hour, min, sec, wday, yday) = epoch_to_fields(epoch);
+    let mut result: Vec<u8> = Vec::new();
+    let mut i = 0usize;
+    while i < fmt.len() {
+        let c = fmt[i];
+        if c != b'%' {
+            result.push(c);
+            i += 1;
+            continue;
+        }
+        i += 1;
+        let n = valid_specifier(fmt, i).unwrap_or(1);
+        let spec: Vec<u8> = fmt[i..fmt.len().min(i + n)].to_vec();
+        i += n;
+        let mut push = |s: String| result.extend_from_slice(s.as_bytes());
+        // Map 'E'/'O' variants to their base specifier.
+        let base = match spec.as_slice() {
+            b"Ec" | b"#c" => b'c',
+            b"EC" => b'C',
+            b"Ex" | b"#x" => b'x',
+            b"EX" => b'X',
+            b"Ey" | b"#y" => b'y',
+            b"EY" => b'Y',
+            b"Od" | b"#d" => b'd',
+            b"Oe" => b'e',
+            b"OH" | b"#H" => b'H',
+            b"OI" | b"#I" => b'I',
+            b"Om" | b"#m" => b'm',
+            b"OM" => b'M',
+            b"OS" => b'S',
+            b"Ou" => b'u',
+            b"OU" => b'U',
+            b"OV" => b'V',
+            b"Ow" => b'w',
+            b"OW" => b'W',
+            b"Oy" => b'y',
+            b"#j" => b'j',
+            other => other.first().copied().unwrap_or(b'%'),
+        };
+        match base {
+            b'%' => result.push(b'%'),
+            b'Y' => push(format!("{:04}", year)),
+            _ => {
+                let text = format_base_specifier(base, year, month, day, hour, min, sec, wday, yday);
+                result.extend_from_slice(text.as_bytes());
+            }
+        }
+    }
+    result
+}
+
+fn format_base_specifier(
+    c: u8,
+    year: i64,
+    month: i64,
+    day: i64,
+    hour: i64,
+    min: i64,
+    sec: i64,
+    wday: i64,
+    yday: i64,
+) -> String {
+    match c {
+        b'y' => format!("{:02}", year.rem_euclid(100)),
+        b'm' => format!("{:02}", month),
+        b'd' => format!("{:02}", day),
+        b'e' => format!("{:2}", day),
+        b'H' => format!("{:02}", hour),
+        b'M' => format!("{:02}", min),
+        b'S' => format!("{:02}", sec),
+        b'j' => format!("{:03}", yday),
+        b'w' => format!("{}", (wday - 1).rem_euclid(7)),
+        b'u' => format!("{}", if wday == 1 { 7 } else { wday - 1 }),
+        b'A' => {
+            let names = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+            names[((wday - 1).rem_euclid(7)) as usize].to_string()
+        }
+        b'a' => {
+            let names = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
+            names[((wday - 1).rem_euclid(7)) as usize].to_string()
+        }
+        b'B' => {
+            let names = ["January", "February", "March", "April", "May", "June",
+                         "July", "August", "September", "October", "November", "December"];
+            names[(month - 1).rem_euclid(12) as usize].to_string()
+        }
+        b'b' | b'h' => {
+            let names = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                         "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+            names[(month - 1).rem_euclid(12) as usize].to_string()
+        }
+        b'p' => if hour < 12 { "AM".to_string() } else { "PM".to_string() },
+        b'C' => format!("{:02}", year.div_euclid(100)),
+        b'D' => format!("{:02}/{:02}/{:02}", month, day, year.rem_euclid(100)),
+        b'F' => format!("{:04}-{:02}-{:02}", year, month, day),
+        b'R' => format!("{:02}:{:02}", hour, min),
+        b'T' => format!("{:02}:{:02}:{:02}", hour, min, sec),
+        b'r' => format!(
+            "{:02}:{:02}:{:02} {}",
+            if hour % 12 == 0 { 12 } else { hour % 12 },
+            min,
+            sec,
+            if hour < 12 { "AM" } else { "PM" }
+        ),
+        b'c' => format!(
+            "{} {} {:2} {:02}:{:02}:{:02} {}",
+            ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"][((wday - 1).rem_euclid(7)) as usize],
+            ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+                [(month - 1).rem_euclid(12) as usize],
+            day, hour, min, sec, year
+        ),
+        b'x' => format!("{:02}/{:02}/{:02}", month, day, year.rem_euclid(100)),
+        b'X' => format!("{:02}:{:02}:{:02}", hour, min, sec),
+        b'n' => "\n".to_string(),
+        b't' => "\t".to_string(),
+        b'z' => "+0000".to_string(),
+        b'Z' => "UTC".to_string(),
+        b'G' => format!("{:04}", year),
+        b'g' => format!("{:02}", year.rem_euclid(100)),
+        b'V' => {
+            let week = ((yday - 1) / 7 + 1).min(53);
+            format!("{:02}", week)
+        }
+        b'U' => format!("{:02}", (yday + 6 - wday % 7) / 7),
+        b'W' => format!("{:02}", (yday + 6 - (wday + 6) % 7) / 7),
+        _ => String::new(),
+    }
+}
+
+/// Basic strftime-like formatting (unvalidated).
 fn format_date(fmt: &str, epoch: i64) -> String {
     let (year, month, day, hour, min, sec, wday, yday) = epoch_to_fields(epoch);
     let mut result = String::new();
@@ -329,8 +638,15 @@ pub fn os_rename(args: &[Value], gc: &mut Gc) -> Result<Vec<Value>, LuaError> {
 }
 
 pub fn os_tmpname(_args: &[Value], gc: &mut Gc) -> Result<Vec<Value>, LuaError> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let t = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
     let dir = std::env::temp_dir();
-    let path = dir.join(format!("lua_tmp_{}", std::process::id()));
+    let path = dir.join(format!("lua_{}_{}_{}", std::process::id(), n, t));
     let s = path.to_string_lossy().to_string();
     Ok(vec![Value::Object(gc.new_string(s.as_bytes()))])
 }

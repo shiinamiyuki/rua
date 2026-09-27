@@ -310,6 +310,8 @@ pub struct UpvalueDesc {
     pub in_stack: bool,
     /// If in_stack: register index in parent. If not: upvalue index in parent.
     pub index: u8,
+    /// True when the captured variable is a `<const>`/`<close>` local.
+    pub is_const: bool,
 }
 
 /// Debug info for a local variable.

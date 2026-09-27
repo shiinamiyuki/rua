@@ -129,9 +129,6 @@ pub struct Vm {
     error_ref: Option<GcRef>,
     /// Stack indices of to-be-closed variables (sorted ascending).
     tbc_slots: Vec<usize>,
-    /// Shared metatable for all string values.
-    string_metatable: Option<GcRef>,
-
     // ── Coroutine support ──────────────────────────────────────────
     /// GcRef to the main thread coroutine object.
     main_thread: Option<GcRef>,
@@ -164,6 +161,9 @@ pub struct Vm {
     debug_getregistry_ref: Option<GcRef>,
     debug_sethook_ref: Option<GcRef>,
     debug_gethook_ref: Option<GcRef>,
+    /// `tostring` / `print` are VM-special so they can call `__tostring`.
+    tostring_ref: Option<GcRef>,
+    print_ref: Option<GcRef>,
     /// The registry table returned by `debug.getregistry`.
     registry: Option<GcRef>,
     /// Active debug hook state (per-thread; swapped on coroutine switch).
@@ -225,7 +225,6 @@ impl Vm {
             xpcall_ref: None,
             error_ref: None,
             tbc_slots: Vec::new(),
-            string_metatable: None,
             main_thread: None,
             current_thread: None,
             yielded: None,
@@ -248,6 +247,8 @@ impl Vm {
             debug_getregistry_ref: None,
             debug_sethook_ref: None,
             debug_gethook_ref: None,
+            tostring_ref: None,
+            print_ref: None,
             registry: None,
             hook_func: None,
             hook_mask: 0,
@@ -354,9 +355,21 @@ impl Vm {
         }
 
         // Register built-in functions
-        self.register_native(&mut env, "print", crate::stdlib::lua_print);
+        {
+            let c = Closure::new_native("print", |_, _| Ok(vec![]));
+            let r = self.gc.new_closure(c);
+            self.print_ref = Some(r);
+            let k = self.gc.new_string(b"print");
+            env.raw_set(Value::Object(k), Value::Object(r));
+        }
         self.register_native(&mut env, "type", crate::stdlib::lua_type);
-        self.register_native(&mut env, "tostring", crate::stdlib::lua_tostring);
+        {
+            let c = Closure::new_native("tostring", |_, _| Ok(vec![]));
+            let r = self.gc.new_closure(c);
+            self.tostring_ref = Some(r);
+            let k = self.gc.new_string(b"tostring");
+            env.raw_set(Value::Object(k), Value::Object(r));
+        }
         self.register_native(&mut env, "tonumber", crate::stdlib::lua_tonumber);
         self.register_native(&mut env, "assert", crate::stdlib::lua_assert);
 
@@ -449,7 +462,7 @@ impl Vm {
         let index_key = self.gc.new_string(MM_INDEX);
         string_mt.raw_set(Value::Object(index_key), Value::Object(string_ref));
         let string_mt_ref = self.gc.new_table(string_mt);
-        self.string_metatable = Some(string_mt_ref);
+        self.gc.mt_string = Some(string_mt_ref);
 
         // table library
         let mut table_table = Table::new();
@@ -542,6 +555,15 @@ impl Vm {
         let close_closure = Closure::new_native("file.__close", crate::stdlib::io::file_gc_close);
         let close_ref = self.gc.new_closure(close_closure);
         file_mt.raw_set(Value::Object(close_key), Value::Object(close_ref));
+        let gc_key = self.gc.new_string(MM_GC);
+        let gc_closure = Closure::new_native("file.__gc", crate::stdlib::io::file_gc_close);
+        let gc_ref = self.gc.new_closure(gc_closure);
+        file_mt.raw_set(Value::Object(gc_key), Value::Object(gc_ref));
+        let tostring_key = self.gc.new_string(MM_TOSTRING);
+        let tostring_closure =
+            Closure::new_native("file.__tostring", crate::stdlib::io::file_tostring);
+        let tostring_ref2 = self.gc.new_closure(tostring_closure);
+        file_mt.raw_set(Value::Object(tostring_key), Value::Object(tostring_ref2));
         let name_key = self.gc.new_string(b"__name");
         let file_name = self.gc.new_string(b"FILE*");
         file_mt.raw_set(Value::Object(name_key), Value::Object(file_name));
@@ -998,14 +1020,16 @@ impl Vm {
     /// Get the metatable of a value (if any).
     fn get_metatable(&self, val: Value) -> Option<GcRef> {
         match val {
+            Value::Nil => self.gc.mt_nil,
+            Value::Boolean(_) => self.gc.mt_bool,
+            Value::Integer(_) | Value::Float(_) => self.gc.mt_number,
             Value::Object(r) => match &r.as_object().kind {
                 GcObjectKind::Table(t) => t.metatable,
-                GcObjectKind::Closure(_) => None,
-                GcObjectKind::String(_) => self.string_metatable,
-                GcObjectKind::Thread(_) => None,
+                GcObjectKind::Closure(_) => self.gc.mt_function,
+                GcObjectKind::String(_) => self.gc.mt_string,
+                GcObjectKind::Thread(_) => self.gc.mt_thread,
                 GcObjectKind::Userdata(ud) => ud.metatable,
             },
-            _ => None,
         }
     }
 
@@ -1058,8 +1082,10 @@ impl Vm {
             self.execute_to_depth(saved_depth)?;
         }
 
-        // Collect results from result_base..self.top
-        let results: Vec<Value> = self.stack[result_base..self.top].to_vec();
+        // Collect results from result_base..self.top. After a yield, `top`
+        // may not reflect this call's results yet; clamp defensively.
+        let top = self.top.max(result_base);
+        let results: Vec<Value> = self.stack[result_base..top.min(self.stack.len())].to_vec();
         Ok(results)
     }
 
@@ -1742,8 +1768,17 @@ impl Vm {
         }
 
         // Root: metatables stored on VM and GC
-        if let Some(r) = self.string_metatable {
-            roots.push(r);
+        for r in [
+            self.gc.mt_nil,
+            self.gc.mt_bool,
+            self.gc.mt_number,
+            self.gc.mt_string,
+            self.gc.mt_function,
+            self.gc.mt_thread,
+        ] {
+            if let Some(r) = r {
+                roots.push(r);
+            }
         }
         if let Some(r) = self.gc.file_metatable {
             roots.push(r);
@@ -1772,6 +1807,8 @@ impl Vm {
             self.sort_ref,
             self.warn_ref,
             self.registry,
+            self.tostring_ref,
+            self.print_ref,
         ] {
             if let Some(r) = r {
                 roots.push(r);
@@ -2249,30 +2286,49 @@ impl Vm {
                 }
 
                 OpCode::TForPrep => {
+                    // Swap the control value (A+3) with the closing value
+                    // (A+2), then mark the closing value as to-be-closed.
+                    let close_idx = base + a + 2;
+                    let ctrl_idx = base + a + 3;
+                    self.ensure_stack(ctrl_idx + 1);
+                    self.stack.swap(close_idx, ctrl_idx);
+                    let val = self.stack[close_idx];
+                    if val != Value::Nil && val != Value::Boolean(false) {
+                        if self.get_metamethod(val, MM_CLOSE).is_none() {
+                            return Err(LuaError::new(
+                                "variable '?' got a non-closable value",
+                            ));
+                        }
+                    }
+                    self.tbc_slots.push(close_idx);
                     self.frames[fi].pc =
                         (self.frames[fi].pc as i64 + sbx as i64) as usize;
                 }
 
                 OpCode::TForLoop => {
-                    // A = base register, B = backward jump offset, C = number of loop variables
+                    // A = base, B = backward jump offset, C = #loop variables.
+                    // Loop variables start at A+3 (the first is the control).
                     let iter = self.reg(base, a);
                     let state = self.reg(base, a + 1);
-                    let control = self.reg(base, a + 2);
+                    let control = self.reg(base, a + 3);
 
-                    // Set up call: place function and args in temp registers
-                    let call_base = base + a + 4;
+                    let call_base = base + a + 3 + c;
                     self.ensure_stack(call_base + 3);
                     self.stack[call_base] = iter;
                     self.stack[call_base + 1] = state;
                     self.stack[call_base + 2] = control;
 
-                    // Call with 2 args, C results (C = num_vars)
+                    // Call with 2 args and C results.
                     self.call_function(call_base, 3, c as i32)?;
 
-                    // Check first result
-                    let first_result = self.reg(base, a + 4);
+                    // Move results onto the loop variables.
+                    for i in 0..c {
+                        let v = self.stack[call_base + i];
+                        self.set_reg(base, a + 3 + i, v);
+                    }
+
+                    let first_result = self.reg(base, a + 3);
                     if !first_result.is_nil() {
-                        self.set_reg(base, a + 2, first_result);
                         // Jump back using B (backward offset)
                         let jump_offset = -(b as i64);
                         self.frames[fi].pc =
@@ -2334,6 +2390,8 @@ impl Vm {
                         else if self.warn_ref == Some(r) { 23 }
                         else if self.sort_ref == Some(r) { 24 }
                         else if self.debug_getregistry_ref == Some(r) { 25 }
+                        else if self.tostring_ref == Some(r) { 28 }
+                        else if self.print_ref == Some(r) { 29 }
                         else if self.debug_sethook_ref == Some(r) { 26 }
                         else if self.debug_gethook_ref == Some(r) { 27 }
                         else { 0 }
@@ -2499,6 +2557,19 @@ impl Vm {
                         }
                         25 => { // debug.getregistry
                             self.handle_debug_getregistry(base + a, num_results);
+                        }
+                        28 => { // tostring
+                            let args: Vec<Value> = (0..num_args)
+                                .map(|i| self.stack[base + a + 1 + i])
+                                .collect();
+                            self.handle_tostring(&args, base + a, num_results)?;
+                        }
+                        29 => { // print
+                            let args: Vec<Value> = (0..num_args)
+                                .map(|i| self.stack[base + a + 1 + i])
+                                .collect();
+                            self.handle_print(&args)?;
+                            self.place_results(base + a, num_results, &[]);
                         }
                         26 => { // debug.sethook
                             let args: Vec<Value> = (0..num_args)
@@ -2845,6 +2916,14 @@ impl Vm {
                 }
                 if self.debug_getregistry_ref == Some(gc_ref) {
                     self.handle_debug_getregistry(result_base, num_results);
+                    return Ok(());
+                }
+                if self.tostring_ref == Some(gc_ref) {
+                    return self.handle_tostring(&actual_args, result_base, num_results);
+                }
+                if self.print_ref == Some(gc_ref) {
+                    self.handle_print(&actual_args)?;
+                    self.place_results(result_base, num_results, &[]);
                     return Ok(());
                 }
                 if self.debug_sethook_ref == Some(gc_ref) {
@@ -3832,6 +3911,54 @@ impl Vm {
     }
 
     // ── Debug library handlers ─────────────────────────────────────
+
+    /// Convert a value to a string, honoring a `__tostring` metamethod.
+    fn value_to_string(&mut self, v: Value) -> Result<Vec<u8>, LuaError> {
+        if let Some(mm) = self.get_metamethod(v, MM_TOSTRING) {
+            let results = self.call_value(mm, &[v])?;
+            let first = results.first().copied().unwrap_or(Value::Nil);
+            match first {
+                Value::Object(r) if r.as_object().as_string().is_some() => {
+                    return Ok(r.as_object().as_string().unwrap().as_bytes().to_vec());
+                }
+                Value::Integer(n) => return Ok(format!("{n}").into_bytes()),
+                Value::Float(f) => return Ok(format!("{f}").into_bytes()),
+                _ => return Err(LuaError::new("'__tostring' must return a string")),
+            }
+        }
+        Ok(format!("{v}").into_bytes())
+    }
+
+    /// Handle `tostring(v)`.
+    fn handle_tostring(
+        &mut self,
+        args: &[Value],
+        result_base: usize,
+        num_results: i32,
+    ) -> Result<(), LuaError> {
+        if args.is_empty() {
+            return Err(LuaError::new(
+                "bad argument #1 to 'tostring' (value expected)",
+            ));
+        }
+        let bytes = self.value_to_string(args[0])?;
+        let s = self.gc.new_string(&bytes);
+        self.place_results(result_base, num_results, &[Value::Object(s)]);
+        Ok(())
+    }
+
+    /// Handle `print(...)` using `__tostring` semantics.
+    fn handle_print(&mut self, args: &[Value]) -> Result<(), LuaError> {
+        for (i, arg) in args.iter().enumerate() {
+            if i > 0 {
+                print!("\t");
+            }
+            let bytes = self.value_to_string(*arg)?;
+            print!("{}", String::from_utf8_lossy(&bytes));
+        }
+        println!();
+        Ok(())
+    }
 
     /// Handle debug.getregistry().
     fn handle_debug_getregistry(&mut self, result_base: usize, num_results: i32) {
@@ -4912,6 +5039,29 @@ impl Vm {
         Ok(self.gc.new_closure(closure))
     }
 
+    /// Skip a UTF-8 BOM and an initial `#` comment line (as `luaL_loadfile`
+    /// does). For text chunks the comment line is replaced by a newline so
+    /// line numbers still count it; for binary chunks it is dropped.
+    fn skip_bom_and_comment(bytes: &[u8]) -> Vec<u8> {
+        let mut s = bytes;
+        if s.starts_with(b"\xEF\xBB\xBF") {
+            s = &s[3..];
+        }
+        if s.first() == Some(&b'#') {
+            let rest = match s.iter().position(|&b| b == b'\n') {
+                Some(i) => &s[i + 1..],
+                None => &s[s.len()..],
+            };
+            if rest.first() == Some(&0x1b) {
+                return rest.to_vec();
+            }
+            let mut v = vec![b'\n'];
+            v.extend_from_slice(rest);
+            return v;
+        }
+        s.to_vec()
+    }
+
     /// Load chunk bytes as either source text or a precompiled binary
     /// chunk, according to `mode` ("b", "t" or "bt"). Binary chunks
     /// receive fresh upvalues: the first is bound to `env`, the rest
@@ -5052,7 +5202,8 @@ impl Vm {
 
         let env = Value::Object(self.globals_ref.expect("globals ref not set"));
         let chunk_name = format!("@{filename}");
-        let closure_ref = self.load_chunk(&source, &chunk_name, "bt", env)?;
+        let text = Self::skip_bom_and_comment(&source);
+        let closure_ref = self.load_chunk(&text, &chunk_name, "bt", env)?;
         let fname_val = Value::Object(self.gc.new_string(filename.as_bytes()));
         Ok(vec![Value::Object(closure_ref), fname_val])
     }
@@ -5253,6 +5404,11 @@ impl Vm {
             .and_then(|v| v.as_str_bytes())
             .map(|b| String::from_utf8_lossy(b).to_string())
             .unwrap_or_else(|| "bt".to_string());
+        if !mode.bytes().all(|c| c == b'b' || c == b't') {
+            return Err(LuaError::new(
+                "bad argument #3 to 'load' (invalid mode)",
+            ));
+        }
 
         // Any value is valid as the environment (`_ENV` can be anything).
         // An explicitly given nil is used as-is; only an absent argument
@@ -5321,6 +5477,7 @@ impl Vm {
                 return Ok(());
             }
         };
+        let text = Self::skip_bom_and_comment(&source);
 
         let mode = args
             .get(1)
@@ -5334,7 +5491,7 @@ impl Vm {
         };
 
         let chunk_name = format!("@{filename}");
-        match self.load_chunk(&source, &chunk_name, &mode, env) {
+        match self.load_chunk(&text, &chunk_name, &mode, env) {
             Ok(closure_ref) => {
                 self.place_results(result_base, num_results, &[Value::Object(closure_ref)]);
             }
@@ -5378,7 +5535,8 @@ impl Vm {
 
         let env = Value::Object(self.globals_ref.expect("globals ref not set"));
         let chunk_name = format!("@{filename}");
-        let closure_ref = self.load_chunk(&source, &chunk_name, "bt", env)?;
+        let text = Self::skip_bom_and_comment(&source);
+        let closure_ref = self.load_chunk(&text, &chunk_name, "bt", env)?;
 
         let results = self.call_value(Value::Object(closure_ref), &[])?;
         self.place_results(result_base, num_results, &results);

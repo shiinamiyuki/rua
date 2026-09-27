@@ -22,6 +22,7 @@ pub fn compile(block: &Block, source: Option<String>) -> Result<Proto, LuaError>
         name: Some("_ENV".to_string()),
         in_stack: true,
         index: 0,
+        is_const: false,
     });
     // Emit VARARGPREP for the top-level chunk (0 fixed params). Line 0
     // means "no line information" (it must not produce a line event).
@@ -128,7 +129,9 @@ impl FuncState {
     }
 
     fn finish(mut self) -> Proto {
-        // Patch end_pc for all remaining locals
+        // Patch end_pc for all remaining locals. Sorting by start_pc keeps
+        // `proto.locals` in declaration order even when locals from nested
+        // scopes were recorded earlier (on scope exit).
         let end_pc = self.proto.code.len() as u32;
         for local in &self.locals {
             self.proto.locals.push(LocalVarInfo {
@@ -137,6 +140,7 @@ impl FuncState {
                 end_pc,
             });
         }
+        self.proto.locals.sort_by_key(|l| l.start_pc);
         self.proto.max_stack_size = self.proto.max_stack_size.max(self.free_reg).max(2);
         self.proto
     }
@@ -201,8 +205,8 @@ impl FuncState {
     // ── Register allocation ────────────────────────────────────────
 
     fn alloc_reg(&mut self) -> Result<u8, LuaError> {
-        if self.free_reg >= 250 {
-            return Err(LuaError::new("too many local variables (limit is 250)"));
+        if self.free_reg >= 255 {
+            return Err(LuaError::new("too many registers"));
         }
         let reg = self.free_reg;
         self.free_reg += 1;
@@ -339,6 +343,9 @@ impl FuncState {
     }
 
     fn add_local(&mut self, name: String) -> Result<u8, LuaError> {
+        if self.locals.len() >= 200 {
+            return Err(LuaError::new("too many local variables"));
+        }
         let reg = self.alloc_reg()?;
         self.locals.push(Local {
             name,
@@ -384,22 +391,37 @@ impl FuncState {
                         }
                     }
                 }
+                let mut captured_const = false;
+                for local in enclosing.locals.iter().rev() {
+                    if local.name == name {
+                        captured_const = local.is_const;
+                        break;
+                    }
+                }
                 let idx = self.proto.upvalues.len() as u8;
                 self.proto.upvalues.push(UpvalueDesc {
                     name: Some(name.to_string()),
                     in_stack: true,
                     index: reg,
+                    is_const: captured_const,
                 });
                 return Some(idx);
             }
 
             // Check enclosing upvalues (recursive)
             if let Some(uv_idx) = enclosing.find_upvalue(name) {
+                let captured_const = enclosing
+                    .proto
+                    .upvalues
+                    .get(uv_idx as usize)
+                    .map(|u| u.is_const)
+                    .unwrap_or(false);
                 let idx = self.proto.upvalues.len() as u8;
                 self.proto.upvalues.push(UpvalueDesc {
                     name: Some(name.to_string()),
                     in_stack: false,
                     index: uv_idx,
+                    is_const: captured_const,
                 });
                 return Some(idx);
             }
@@ -579,7 +601,9 @@ fn compile_assign(
                         if local.name == *name {
                             if local.is_const {
                                 return Err(LuaError::new(format!(
-                                    "attempt to assign to const variable '{name}'"
+                                    "{}:{}: attempt to assign to const variable '{name}'",
+                                    fs.proto.source.as_deref().unwrap_or("?"),
+                                    line
                                 )));
                             }
                             break;
@@ -592,6 +616,19 @@ fn compile_assign(
                         key: None,
                     });
                 } else if let Some(uv) = fs.find_upvalue(name) {
+                    if fs
+                        .proto
+                        .upvalues
+                        .get(uv as usize)
+                        .map(|u| u.is_const)
+                        .unwrap_or(false)
+                    {
+                        return Err(LuaError::new(format!(
+                            "{}:{}: attempt to assign to const variable '{name}'",
+                            fs.proto.source.as_deref().unwrap_or("?"),
+                            line
+                        )));
+                    }
                     prepared.push(Prepared::Name {
                         local_reg: None,
                         upval: Some(uv),
@@ -917,63 +954,69 @@ fn compile_generic_for(
 ) -> Result<(), LuaError> {
     fs.enter_scope(true);
 
-    // Layout: R[base], R[base+1], R[base+2] = iter_fn, state, control
-    //         R[base+3] = TBC placeholder
-    //         R[base+4..] = loop variables
+    // Layout (matches reference Lua 5.5):
+    //   R[base]     iterator function
+    //   R[base+1]   state
+    //   R[base+2]   closing value (after the TFORPREP swap), to-be-closed
+    //   R[base+3..] loop variables (first one is the control value)
     let num_vars = names.len();
     let base = fs.free_reg;
+    fs.alloc_regs(4)?; // reserve base..base+3
 
-    // Compile iterator expressions into R[base], R[base+1], R[base+2]
-    let n_iter = iterators.len();
+    // Compile iterator expressions into the four control slots.
+    let n_iter = iterators.len().min(4);
     let mut filled = 0usize;
-    for (i, iter_expr) in iterators.iter().enumerate() {
-        if i >= 3 {
-            break;
-        }
+    for i in 0..n_iter {
         let is_last = i == n_iter - 1;
-        if is_last && i < 2 && is_multi_value_expr(iter_expr) {
-            // Last expression is multi-value: expand to fill remaining slots
-            let wanted = (3 - i) as u8;
-            let reg = fs.alloc_reg()?;
-            compile_expr_multi(fs, iter_expr, reg, wanted)?;
-            // Ensure free_reg accounts for all 3 slots
-            let target = base + 3;
-            if fs.free_reg < target {
-                fs.free_reg = target;
-                if fs.free_reg > fs.proto.max_stack_size {
-                    fs.proto.max_stack_size = fs.free_reg;
-                }
-            }
-            filled = 3;
+        if is_last && i < 3 && is_multi_value_expr(&iterators[i]) {
+            // Last expression expands to fill the remaining slots.
+            let wanted = (4 - i) as u8;
+            compile_expr_multi(fs, &iterators[i], base + i as u8, wanted)?;
+            filled = 4;
             break;
         }
-        let reg = fs.alloc_reg()?;
-        compile_expr_to_reg(fs, iter_expr, reg)?;
+        compile_expr_to_reg(fs, &iterators[i], base + i as u8)?;
         filled = i + 1;
     }
-    // Fill remaining with nil if fewer than 3 iterator values
-    while filled < 3 {
-        let reg = fs.alloc_reg()?;
-        fs.emit_abc(OpCode::LoadNil, reg, 0, 0, line);
+    while filled < 4 {
+        fs.emit_abc(OpCode::LoadNil, base + filled as u8, 0, 0, line);
         filled += 1;
     }
 
-    // TBC variable placeholder register
-    let _tbc_reg = fs.alloc_reg()?; // base + 3
+    // Ensure room for the loop variables (they overlap the control slot).
+    if num_vars > 1 {
+        fs.alloc_regs((num_vars - 1) as u8)?;
+    }
+    let needed = base + 3 + num_vars as u8;
+    if fs.free_reg < needed {
+        fs.free_reg = needed;
+        if fs.free_reg > fs.proto.max_stack_size {
+            fs.proto.max_stack_size = fs.free_reg;
+        }
+    }
 
-    // Loop variables
-    let var_base = fs.alloc_regs(num_vars as u8)?;
+    // Internal "(for state)" locals; the 3rd (closing) is to-be-closed.
+    let ctrl_start_pc = fs.proto.code.len() as u32;
+    for i in 0..3 {
+        fs.locals.push(Local {
+            name: "(for state)".to_string(),
+            reg: base + i as u8,
+            start_pc: ctrl_start_pc,
+            is_const: false,
+            is_close: i == 2,
+        });
+    }
     for (i, name) in names.iter().enumerate() {
         fs.locals.push(Local {
             name: name.clone(),
-            reg: var_base + i as u8,
-            start_pc: fs.proto.code.len() as u32,
+            reg: base + 3 + i as u8,
+            start_pc: ctrl_start_pc,
             is_const: false,
             is_close: false,
         });
     }
 
-    // TFORPREP: jump to TFORLOOP
+    // TFORPREP: swap control/closing, mark closing TBC, jump to TFORLOOP.
     let tforprep_pc = fs.emit_asbx(OpCode::TForPrep, base, 0, line);
 
     // Body
@@ -981,38 +1024,23 @@ fn compile_generic_for(
     compile_block(fs, body)?;
 
     // TFORLOOP: call iterator + test + branch
-    let tforloop_pc = fs.emit_abc(
-        OpCode::TForLoop,
-        base,
-        0, // unused
-        num_vars as u8,
-        line,
-    );
+    let tforloop_pc = fs.emit_abc(OpCode::TForLoop, base, 0, num_vars as u8, line);
 
     // Patch TFORPREP to jump to TFORLOOP
     fs.patch_sbx(tforprep_pc, tforloop_pc);
 
-    // Patch TFORLOOP: the backward branch offset (encoded in the instruction itself)
-    // PC is already incremented before execution, so offset must account for that.
+    // Patch TFORLOOP backward branch (PC is incremented before execution).
     let back_offset = tforloop_pc + 1 - body_start;
-    fs.proto.code[tforloop_pc] = encode_abc(
-        OpCode::TForLoop,
-        base,
-        back_offset as u8,
-        num_vars as u8,
-    );
+    fs.proto.code[tforloop_pc] =
+        encode_abc(OpCode::TForLoop, base, back_offset as u8, num_vars as u8);
 
-    // Remove loop variable locals
-    for _ in 0..num_vars {
-        let local = fs.locals.pop().unwrap();
-        fs.proto.locals.push(LocalVarInfo {
-            name: local.name,
-            start_pc: local.start_pc,
-            end_pc: fs.proto.code.len() as u32,
-        });
+    // Emit the CLOSE for the to-be-closed control value and patch breaks to
+    // land on it (so the closing value is closed when the loop is exited).
+    let close_pc = fs.current_pc();
+    let breaks = fs.leave_scope_unpatched(line)?;
+    for pc in breaks {
+        fs.patch_jmp(pc, close_pc);
     }
-
-    fs.leave_scope(line)?;
 
     Ok(())
 }
@@ -1113,6 +1141,7 @@ fn compile_func_body(
             name: Some("_ENV".to_string()),
             in_stack: false,
             index: uv_idx,
+            is_const: false,
         });
     } else {
         // Top-level: _ENV is upvalue[0] of the parent
@@ -1120,6 +1149,7 @@ fn compile_func_body(
             name: Some("_ENV".to_string()),
             in_stack: false,
             index: 0,
+            is_const: false,
         });
     }
 
@@ -1590,10 +1620,18 @@ fn resolve_parent_upvalue(parent_fs: &mut FuncState, name: &str) -> UpvalueDesc 
                 break;
             }
         }
+        let is_const = parent_fs
+            .locals
+            .iter()
+            .rev()
+            .find(|l| l.name == name)
+            .map(|l| l.is_const)
+            .unwrap_or(false);
         return UpvalueDesc {
             name: Some(name.to_string()),
             in_stack: true,
             index: reg,
+            is_const,
         };
     }
 
@@ -1604,6 +1642,7 @@ fn resolve_parent_upvalue(parent_fs: &mut FuncState, name: &str) -> UpvalueDesc 
                 name: Some(name.to_string()),
                 in_stack: false,
                 index: i as u8,
+                is_const: uv.is_const,
             };
         }
     }
@@ -1613,6 +1652,7 @@ fn resolve_parent_upvalue(parent_fs: &mut FuncState, name: &str) -> UpvalueDesc 
         name: Some(name.to_string()),
         in_stack: false,
         index: 0,
+        is_const: false,
     }
 }
 
@@ -1671,7 +1711,7 @@ fn compile_local_decl(
             name: att_name.name.clone(),
             reg,
             start_pc: fs.proto.code.len() as u32,
-            is_const: att_name.attrib.as_deref() == Some("const"),
+            is_const: matches!(att_name.attrib.as_deref(), Some("const") | Some("close")),
             is_close: att_name.attrib.as_deref() == Some("close"),
         });
 

@@ -82,7 +82,24 @@ impl Writer {
         }
     }
 
-    fn proto(&mut self, p: &Proto, strip: bool) {
+    /// Write the proto's source, inheriting the parent's when identical
+    /// (keeps dumps compact, matching reference Lua's string reuse).
+    fn source(&mut self, source: Option<&str>, parent: Option<&str>, strip: bool) {
+        if strip {
+            self.u8(0);
+            return;
+        }
+        match source {
+            Some(s) if Some(s) == parent => self.u8(1),
+            Some(s) => {
+                self.u8(2);
+                self.bytes(s.as_bytes());
+            }
+            None => self.u8(0),
+        }
+    }
+
+    fn proto(&mut self, p: &Proto, strip: bool, parent_source: Option<&str>) {
         self.u32(p.code.len() as u32);
         for &inst in &p.code {
             self.u32(inst);
@@ -112,9 +129,11 @@ impl Writer {
             }
         }
 
+        self.source(p.source.as_deref(), parent_source, strip);
+
         self.u32(p.protos.len() as u32);
         for sub in &p.protos {
-            self.proto(sub, strip);
+            self.proto(sub, strip, p.source.as_deref());
         }
 
         self.u32(p.upvalues.len() as u32);
@@ -127,12 +146,12 @@ impl Writer {
             }
             self.u8(uv.in_stack as u8);
             self.u8(uv.index);
+            self.u8(uv.is_const as u8);
         }
 
         if strip {
             self.u32(0); // line_info
             self.u32(0); // locals
-            self.opt_string(None);
         } else {
             self.u32(p.line_info.len() as u32);
             for &line in &p.line_info {
@@ -145,8 +164,6 @@ impl Writer {
                 self.u32(l.start_pc);
                 self.u32(l.end_pc);
             }
-
-            self.opt_string(p.source.as_deref());
         }
 
         self.u8(p.num_params);
@@ -183,7 +200,7 @@ pub fn dump(proto: &Proto, strip: bool) -> Vec<u8> {
     w.buf.extend_from_slice(&INTEGER_CHECK.to_le_bytes());
     w.u8(std::mem::size_of::<f64>() as u8);
     w.buf.extend_from_slice(&NUM_CHECK.to_le_bytes());
-    w.proto(proto, strip);
+    w.proto(proto, strip, None);
     w.buf
 }
 
@@ -241,6 +258,17 @@ impl<'a> Reader<'a> {
         }
     }
 
+    fn source(&mut self, inherited: Option<&str>) -> ChunkResult<Option<String>> {
+        match self.u8()? {
+            0 => Ok(None),
+            1 => Ok(inherited.map(|s| s.to_string())),
+            _ => {
+                let b = self.bytes()?;
+                Ok(Some(String::from_utf8_lossy(&b).to_string()))
+            }
+        }
+    }
+
     /// Read a length that must not be absurdly large, to avoid
     /// pre-allocating giant vectors on corrupted input.
     fn count(&mut self, elem: usize) -> ChunkResult<usize> {
@@ -251,7 +279,7 @@ impl<'a> Reader<'a> {
         Ok(n)
     }
 
-    fn proto(&mut self) -> ChunkResult<Proto> {
+    fn proto(&mut self, inherited_source: Option<&str>) -> ChunkResult<Proto> {
         let mut proto = Proto::new(None);
 
         let ncode = self.count(4)?;
@@ -277,10 +305,12 @@ impl<'a> Reader<'a> {
             }
         }
 
+        proto.source = self.source(inherited_source)?;
+
         let nprotos = self.count(1)?;
         proto.protos.reserve(nprotos);
         for _ in 0..nprotos {
-            proto.protos.push(self.proto()?);
+            proto.protos.push(self.proto(proto.source.as_deref())?);
         }
 
         let nupvals = self.count(1)?;
@@ -292,10 +322,12 @@ impl<'a> Reader<'a> {
             };
             let in_stack = self.u8()? != 0;
             let index = self.u8()?;
+            let is_const = self.u8()? != 0;
             proto.upvalues.push(UpvalueDesc {
                 name,
                 in_stack,
                 index,
+                is_const,
             });
         }
 
@@ -317,8 +349,6 @@ impl<'a> Reader<'a> {
                 end_pc,
             });
         }
-
-        proto.source = self.opt_string()?;
 
         proto.num_params = self.u8()?;
         proto.is_vararg = self.u8()? != 0;
@@ -381,7 +411,7 @@ pub fn undump(data: &[u8], _chunkname: &str) -> ChunkResult<Proto> {
         return Err("Lua number format mismatch".to_string());
     }
 
-    let proto = r.proto()?;
+    let proto = r.proto(None)?;
     Ok(proto)
 }
 
@@ -403,6 +433,7 @@ mod tests {
             name: Some("_ENV".to_string()),
             in_stack: true,
             index: 0,
+            is_const: false,
         });
         p.locals.push(LocalVarInfo {
             name: "x".to_string(),
