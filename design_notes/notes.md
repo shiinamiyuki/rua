@@ -840,4 +840,36 @@ Suggested next order: varinfo error hints (math/errors), goto/label
 scope rules (goto/closure), utf8 validation, pattern fixes (pm/strings),
 named vararg semantics (vararg), syntax-error formatting (errors).
 
+## Session — M3 finish, part 4 (2026-09-27, cont.)
+
+More triage fixes (still 8/21 green, but failures moved much deeper):
+
+- **goto/label scope rules**: gotos now carry a block depth (labels only
+  visible at their own depth); unresolved gotos are exported with updated
+  local levels and reported at function end; labels that are the last
+  non-op statement of a block treat the block's locals as out of scope
+  (except in `repeat` bodies, where `until` keeps them alive); repeated
+  labels rejected across visible blocks; `global *` creates a const `"*"`
+  pseudo-local so gotos cannot jump over it; "jumps into the scope of"
+  message aligned with reference Lua.
+- **Per-iteration loop-variable freshness**: numeric `for` closes the
+  loop variable's upvalues before FORLOOP when the body captures them;
+  `break` emits CLOSE for scopes it leaves; `repeat` closes the body
+  scope before the loop-back jump; `local a = a..b..c` now evaluates
+  the first concat operand into the destination register (removes a
+  stale-value root that kept weak tables alive across GC).
+- **Numerals/coercion**: numeric strings use the full Lua numeral
+  grammar (signs, hex ints/floats, surrounding spaces); float→integer
+  coercion rejects out-of-range values; `//0` message is "attempt to
+  divide by zero"; bitwise errors include varinfo hints
+  (`number (field 'huge') has no integer representation`).
+- **Misc**: `string.find` init beyond `len+1` returns nil; `string.rep`
+  guards overflow ("resulting string too large").
+
+Progress points (first failure line):
+- `goto.lua` 212/477 (upvalue sharing across backward gotos),
+  `closure.lua` 222/279 (goto/if upvalue sharing), `math.lua` 374/1145
+  (needs `gsub` function replacement), `strings.lua` 152, others as
+  before.
+
 ## APPEND HERE
