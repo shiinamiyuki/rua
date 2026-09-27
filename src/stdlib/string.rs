@@ -147,7 +147,12 @@ pub fn string_rep(args: &[Value], gc: &mut Gc) -> Result<Vec<Value>, LuaError> {
         return Ok(vec![Value::Object(r)]);
     }
     let n = n as usize;
-    let mut result = Vec::with_capacity(s.len() * n + sep.len() * n.saturating_sub(1));
+    let total = (s.len() as u128) * (n as u128)
+        + (sep.len() as u128) * (n as u128 - 1);
+    if total > (isize::MAX as u128) {
+        return Err(LuaError::new("resulting string too large"));
+    }
+    let mut result = Vec::with_capacity(total as usize);
     for i in 0..n {
         if i > 0 && !sep.is_empty() {
             result.extend_from_slice(&sep);
@@ -809,6 +814,11 @@ pub fn string_find(args: &[Value], gc: &mut Gc) -> Result<Vec<Value>, LuaError> 
         .map(|v| v.is_truthy())
         .unwrap_or(false);
 
+    // `init` is 1-based; negative counts from the end. An init beyond
+    // `len + 1` finds nothing.
+    if init > s.len() as i64 + 1 {
+        return Ok(vec![Value::Nil]);
+    }
     let start = if init >= 1 {
         (init - 1) as usize
     } else {
