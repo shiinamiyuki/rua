@@ -511,7 +511,7 @@ fn do_read_format(file: &mut LuaFile, fmt: ReadFormat, gc: &mut Gc) -> Result<Va
 /// Parse a Lua numeral (decimal/hex integer, decimal/hex float) the way
 /// the lexer does, returning `None` when the token is not a valid numeral.
 pub fn parse_lua_number(token: &[u8]) -> Option<Value> {
-    let txt = std::str::from_utf8(token).ok()?;
+    let txt = std::str::from_utf8(token).ok()?.trim();
     let (neg, body) = if let Some(rest) = txt.strip_prefix('-') {
         (true, rest)
     } else if let Some(rest) = txt.strip_prefix('+') {

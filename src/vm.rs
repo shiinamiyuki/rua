@@ -1110,23 +1110,8 @@ impl Vm {
             Value::Integer(_) | Value::Float(_) => Some(v),
             Value::Object(r) => {
                 let s = r.as_object().as_string()?;
-                let text = std::str::from_utf8(s.as_bytes()).ok()?;
-                let text = text.trim();
-                // Try integer first
-                if let Ok(n) = text.parse::<i64>() {
-                    return Some(Value::Integer(n));
-                }
-                // Try hex integer
-                if let Some(hex) = text.strip_prefix("0x").or_else(|| text.strip_prefix("0X")) {
-                    if let Ok(n) = i64::from_str_radix(hex, 16) {
-                        return Some(Value::Integer(n));
-                    }
-                }
-                // Try float
-                if let Ok(n) = text.parse::<f64>() {
-                    return Some(Value::Float(n));
-                }
-                None
+                // Full Lua numeral grammar (signs, hex integers/floats).
+                crate::stdlib::io::parse_lua_number(s.as_bytes())
             }
             _ => None,
         }
@@ -1138,29 +1123,24 @@ impl Vm {
         match v {
             Value::Integer(n) => Some(n),
             Value::Float(f) => {
-                let i = f as i64;
-                if i as f64 == f { Some(i) } else { None }
+                if !(f >= -(2f64.powi(63)) && f < 2f64.powi(63)) || f.fract() != 0.0 {
+                    return None;
+                }
+                Some(f as i64)
             }
             Value::Object(r) => {
                 let s = r.as_object().as_string()?;
-                let text = std::str::from_utf8(s.as_bytes()).ok()?;
-                let text = text.trim();
-                if let Ok(n) = text.parse::<i64>() {
-                    return Some(n);
-                }
-                if let Some(hex) = text.strip_prefix("0x").or_else(|| text.strip_prefix("0X")) {
-                    if let Ok(n) = i64::from_str_radix(hex, 16) {
-                        return Some(n);
+                match crate::stdlib::io::parse_lua_number(s.as_bytes())? {
+                    Value::Integer(i) => Some(i),
+                    Value::Float(f)
+                        if f >= -(2f64.powi(63))
+                            && f < 2f64.powi(63)
+                            && f.fract() == 0.0 =>
+                    {
+                        Some(f as i64)
                     }
+                    _ => None,
                 }
-                // Try float string → integer
-                if let Ok(f) = text.parse::<f64>() {
-                    let i = f as i64;
-                    if i as f64 == f {
-                        return Some(i);
-                    }
-                }
-                None
             }
             _ => None,
         }
@@ -1238,7 +1218,7 @@ impl Vm {
         match (a, b) {
             (Value::Integer(x), Value::Integer(y)) => {
                 if y == 0 {
-                    return Err(LuaError::new("attempt to perform 'n//0'"));
+                    return Err(LuaError::new("attempt to divide by zero"));
                 }
                 Ok(Some(Value::Integer(lua_idiv(x, y))))
             }
@@ -1378,6 +1358,7 @@ impl Vm {
         b: Value,
         raw_fn: fn(i64, i64) -> i64,
         mm_name: &[u8],
+        regs: Option<(usize, usize)>,
     ) -> Result<Value, LuaError> {
         if let (Some(x), Some(y)) = (Self::coerce_to_integer(a), Self::coerce_to_integer(b)) {
             return Ok(Value::Integer(raw_fn(x, y)));
@@ -1385,10 +1366,133 @@ impl Vm {
         if let Some(mm) = self.get_binop_metamethod(a, b, mm_name) {
             return self.call_metamethod(mm, &[a, b]);
         }
-        Err(LuaError::new(format!(
-            "attempt to perform bitwise operation on a {} value",
-            if Self::coerce_to_integer(a).is_none() { a.type_name() } else { b.type_name() }
-        )))
+        let (bad, reg) = if Self::coerce_to_integer(a).is_none() {
+            (a, regs.map(|r| r.0))
+        } else {
+            (b, regs.map(|r| r.1))
+        };
+        Err(self.bitwise_type_error(bad, reg))
+    }
+
+    /// Build the reference-Lua bitwise error for a bad operand, including
+    /// a variable hint when the operand's register can be identified.
+    fn bitwise_type_error(&self, bad: Value, reg: Option<usize>) -> LuaError {
+        let hint = reg.map(|r| self.reg_varinfo(r)).unwrap_or_default();
+        if bad.is_number() {
+            LuaError::new(format!(
+                "number{hint} has no integer representation"
+            ))
+        } else {
+            LuaError::new(format!(
+                "attempt to perform bitwise operation on a {} value{hint}",
+                bad.type_name()
+            ))
+        }
+    }
+
+    /// Variable-description hint for register `reg` of the current frame,
+    /// e.g. `" (field 'huge')"`.
+    fn reg_varinfo(&self, reg: usize) -> String {
+        let fi = match self.frames.len().checked_sub(1) {
+            Some(fi) => fi,
+            None => return String::new(),
+        };
+        let frame = &self.frames[fi];
+        if reg < frame.base {
+            return String::new();
+        }
+        let rel = (reg - frame.base) as u8;
+        let pc = frame.pc.saturating_sub(1);
+        let (name, what) = Self::reg_source_name(&frame.proto, pc, rel);
+        match name {
+            Some(n) => format!(" ({what} '{n}')"),
+            None => String::new(),
+        }
+    }
+
+    /// Inspect the instruction(s) before `pc` to name the value in `reg`.
+    fn reg_source_name(proto: &Proto, pc: usize, reg: u8) -> (Option<String>, &'static str) {
+        let mut source_inst: Option<(OpCode, u32)> = None;
+        let limit = pc.saturating_sub(32);
+        let mut idx = pc;
+        while idx > limit {
+            idx -= 1;
+            let inst = proto.code[idx];
+            let op = match OpCode::from_u8(decode_op(inst)) {
+                Some(op) => op,
+                None => break,
+            };
+            if decode_a(inst) == reg && inst_writes_reg(op) {
+                match op {
+                    OpCode::GetTabUp
+                    | OpCode::GetTable
+                    | OpCode::GetUpval
+                    | OpCode::LoadK
+                    | OpCode::Move => {
+                        source_inst = Some((op, inst));
+                    }
+                    _ => {}
+                }
+                break;
+            }
+        }
+        let (op, inst) = match source_inst {
+            Some(pair) => pair,
+            None => return (None, ""),
+        };
+        match op {
+            OpCode::GetTabUp => {
+                let up = decode_b(inst);
+                let k = decode_c(inst);
+                if let Some(key) = constant_string(&proto.constants, k as usize) {
+                    let what = if proto
+                        .upvalues
+                        .get(up as usize)
+                        .and_then(|u| u.name.as_deref())
+                        == Some("_ENV")
+                    {
+                        "global"
+                    } else {
+                        "field"
+                    };
+                    return (Some(key), what);
+                }
+            }
+            OpCode::GetTable => {
+                let key_reg = decode_c(inst);
+                let start = pc.saturating_sub(12);
+                for idx in (start..pc.saturating_sub(1)).rev() {
+                    let inst = proto.code[idx];
+                    if decode_op(inst) == OpCode::LoadK as u8 && decode_a(inst) == key_reg {
+                        if let Some(key) =
+                            constant_string(&proto.constants, decode_bx(inst) as usize)
+                        {
+                            return (Some(key), "field");
+                        }
+                        break;
+                    }
+                }
+            }
+            OpCode::GetUpval => {
+                let uv = decode_b(inst);
+                if let Some(u) = proto.upvalues.get(uv as usize) {
+                    if let Some(name) = &u.name {
+                        return (Some(name.clone()), "upvalue");
+                    }
+                }
+            }
+            OpCode::Move => {
+                let rb = decode_b(inst);
+                if let Some(local) = local_at_reg(proto, rb, pc as u32) {
+                    return (Some(local), "local");
+                }
+            }
+            OpCode::LoadK => {
+                // A constant has no variable name.
+            }
+            _ => {}
+        }
+        (None, "")
     }
 
     /// Perform unary bitwise NOT with coercion + metamethod fallback.
@@ -2150,35 +2254,38 @@ impl Vm {
                 OpCode::BAnd => {
                     let rb = self.reg(base, b);
                     let rc = self.reg(base, c);
-                    let result = self.bitwise_binop(rb, rc, |x, y| x & y, MM_BAND)?;
+                    let result =
+                        self.bitwise_binop(rb, rc, |x, y| x & y, MM_BAND, Some((base + b, base + c)))?;
                     self.set_reg(base, a, result);
                 }
 
                 OpCode::BOr => {
                     let rb = self.reg(base, b);
                     let rc = self.reg(base, c);
-                    let result = self.bitwise_binop(rb, rc, |x, y| x | y, MM_BOR)?;
+                    let result =
+                        self.bitwise_binop(rb, rc, |x, y| x | y, MM_BOR, Some((base + b, base + c)))?;
                     self.set_reg(base, a, result);
                 }
 
                 OpCode::BXor => {
                     let rb = self.reg(base, b);
                     let rc = self.reg(base, c);
-                    let result = self.bitwise_binop(rb, rc, |x, y| x ^ y, MM_BXOR)?;
+                    let result =
+                        self.bitwise_binop(rb, rc, |x, y| x ^ y, MM_BXOR, Some((base + b, base + c)))?;
                     self.set_reg(base, a, result);
                 }
 
                 OpCode::Shl => {
                     let rb = self.reg(base, b);
                     let rc = self.reg(base, c);
-                    let result = self.bitwise_binop(rb, rc, lua_shl, MM_SHL)?;
+                    let result = self.bitwise_binop(rb, rc, lua_shl, MM_SHL, Some((base + b, base + c)))?;
                     self.set_reg(base, a, result);
                 }
 
                 OpCode::Shr => {
                     let rb = self.reg(base, b);
                     let rc = self.reg(base, c);
-                    let result = self.bitwise_binop(rb, rc, lua_shr, MM_SHR)?;
+                    let result = self.bitwise_binop(rb, rc, lua_shr, MM_SHR, Some((base + b, base + c)))?;
                     self.set_reg(base, a, result);
                 }
 
