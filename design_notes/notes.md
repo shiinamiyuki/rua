@@ -872,4 +872,50 @@ Progress points (first failure line):
   (needs `gsub` function replacement), `strings.lua` 152, others as
   before.
 
+## Session summary (M3 triage: 9 -> 18/21 curated upstream tests)
+
+Passing: bwcoercion, calls, closure, code, constructs, coroutine, events, files,
+goto, math, nextvar, pm, sort, strings, tpack, utf8, vararg, verybig.
+Remaining: errors.lua + literals.lua (need PUC-style syntax error messages:
+`<chunkid>:<line>: <message> near '<token>'`, incl. "to close '{' at line N"),
+locals.lua (yielding inside __close metamethods).
+
+Major changes this session:
+- string.format: full C-printf port (str_format semantics, %q literal forms,
+  %a hex floats, width/precision limits, "too long"/"invalid conversion"
+  errors) as VM-special so %s can call __tostring; added __name fallback.
+- GETTABUP/SETTABUP constant escape via EXTRAARG for indices >= 255
+  (fixed silently wrong globals in large chunks!).
+- Pattern matcher ported from lstrlib.c: backrefs, %b, %f, %z/Z, malformed
+  pattern errors, unfinished captures, 5.3.3 empty-match rules in gsub and
+  a lazy gmatch iterator with lastmatch; add_s replacement rules.
+- table.create limits (INT_MAX, table overflow), VM-special table.move /
+  unpack / insert / concat / remove (metamethod aware), sort via table_get/set.
+- Table length borders + dead-key ("tombstone") iteration so `next` works
+  across deletions; hash_live counter to avoid tombstone-driven rehashing.
+- Lua 5.5 numeric for: count-based scheme (forlimit, float fallback),
+  FORPREP skip, string coercion; loop vars are const.
+- Generic for: split TFORCALL/TFORLOOP (call is a real frame, so iterators
+  can yield), CLOSE per iteration, 5.5 named-vararg tables (reads through t.n,
+  "no proper 'n'" error), select() exact semantics, global <const> decls
+  (contextual `global`, shadowing, collective *, ERRnil duplicate checks).
+- utf8 library ported from lutf8lib.c (lax mode, 5/6-byte sequences,
+  stateless codes, two-value offset, charpattern).
+- Coroutine.close semantics: main/normal/running/reentrant/self-close,
+  pending errors; unyieldable C boundaries (gsub/sort/msgh/reader);
+  tail-call yield; dofile yields via deferred frame; native bodies run
+  through the frame mechanism; pcall guard result propagation.
+- TBC close semantics: error object only on error unwinding, closeprotected
+  chaining, close_frame_info for tracebacks, close methods getinfo level 2
+  reports pcall, stack overflow limits with error-handler reserve, stack
+  top reset after unwinding, extra_roots for GC during closing.
+- Locals/debug: LocalVarInfo carries its register (local_at_reg by reg),
+  call-site name resolution checks locals first, C-called frames unnamed,
+  return hooks for C calls (sethook), metamethod frames named "close".
+- Lexer line counting: \r, \n, and paired \r\n / \n\r count as one line.
+
+Next steps: implement PUC syntax error formatting (chunkid + near token) to
+pass errors.lua/literals.lua; support yields in __close (locals.lua) via a
+close continuation or frame-based closer calls.
+
 ## APPEND HERE
