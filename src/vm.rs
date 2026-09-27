@@ -4652,97 +4652,129 @@ impl Vm {
         Ok(())
     }
 
-    /// Handle `string.gsub(s, pat, repl [, n])`. Supports string, table and
-    /// function replacements; function replacements may call back into Lua.
+    /// Handle `string.gsub(s, pat, repl [, n])`, mirroring `str_gsub`
+    /// from `lstrlib.c` (including the 5.3.3 empty-match rules).
     fn handle_gsub(
         &mut self,
         args: &[Value],
         result_base: usize,
         num_results: i32,
     ) -> Result<(), LuaError> {
-        use crate::stdlib::string::{apply_string_replacement, get_captures, MatchState};
+        use crate::stdlib::string::{apply_string_replacement, MatchState};
         let s = crate::stdlib::string::check_string(args, 0, "gsub")?;
         let pat = crate::stdlib::string::check_string(args, 1, "gsub")?;
         let repl = args.get(2).copied().unwrap_or(Value::Nil);
-        let max_s = args
-            .get(3)
-            .and_then(|v| v.as_integer())
-            .map(|n| n as usize)
-            .unwrap_or(usize::MAX);
+        if !matches!(
+            repl,
+            Value::Integer(_)
+                | Value::Float(_)
+                | Value::Object(_)
+        ) {
+            return Err(LuaError::new(
+                "bad argument #3 to 'gsub' (string/function/table expected)",
+            ));
+        }
+        let max_s: i64 = match args.get(3).and_then(|v| v.as_integer()) {
+            Some(n) => n,
+            None => s.len() as i64 + 1,
+        };
 
         let anchored = !pat.is_empty() && pat[0] == b'^';
         let pat_slice = if anchored { &pat[1..] } else { &pat[..] };
 
         let mut result: Vec<u8> = Vec::new();
-        let mut si = 0usize;
-        let mut count = 0usize;
+        let mut src = 0usize;
+        let mut lastmatch: Option<usize> = None;
+        let mut n: i64 = 0;
+        let mut changed = false;
 
-        while si <= s.len() && count < max_s {
+        while n < max_s {
             let mut ms = MatchState::new(&s, pat_slice);
-            if let Some(end) = ms.match_pattern(si, 0) {
-                count += 1;
-
+            let matched = ms.match_pattern(src, 0)?;
+            let e_opt = match matched {
+                Some(e) if Some(e) != lastmatch => Some(e),
+                _ => None,
+            };
+            if let Some(e) = e_opt {
+                n += 1;
                 // Build the replacement piece.
-                let piece: Vec<u8> = match repl {
+                match repl {
                     Value::Object(r) if r.as_object().as_string().is_some() => {
                         let repl_str = r.as_object().as_string().unwrap().as_bytes().to_vec();
-                        let mut out = Vec::new();
-                        apply_string_replacement(&mut out, &repl_str, &ms, &s, si, end);
-                        out
+                        apply_string_replacement(&mut result, &repl_str, &ms, &s, src, e)?;
+                        changed = true;
                     }
                     Value::Object(r) if r.as_object().as_table().is_some() => {
-                        let captures = get_captures(&ms, &s, si, end, &mut self.gc);
-                        let key = captures.into_iter().next().unwrap_or(Value::Nil);
-                        let val = r.as_object().as_table().unwrap().raw_get(&key);
-                        if val.is_truthy() {
-                            Self::replacement_bytes(val)?
+                        let key = if ms.captures.is_empty() {
+                            let cap = self.gc.new_string(&s[src..e]);
+                            Value::Object(cap)
                         } else {
-                            s[si..end].to_vec()
+                            match ms.captures[0].len {
+                                crate::stdlib::string::CaptureLen::Position => {
+                                    Value::Integer(ms.captures[0].start as i64 + 1)
+                                }
+                                crate::stdlib::string::CaptureLen::Len(len) => {
+                                    let cap = self
+                                        .gc
+                                        .new_string(&s[ms.captures[0].start..ms.captures[0].start + len]);
+                                    Value::Object(cap)
+                                }
+                                crate::stdlib::string::CaptureLen::Unfinished => Value::Nil,
+                            }
+                        };
+                        let val = self.table_get(Value::Object(r), key)?;
+                        if val.is_truthy() {
+                            let piece = Self::replacement_bytes(val)?;
+                            result.extend_from_slice(&piece);
+                            changed = true;
+                        } else {
+                            result.extend_from_slice(&s[src..e]);
                         }
                     }
-                    Value::Object(r)
-                        if r.as_object().as_closure().is_some() =>
-                    {
-                        let captures = get_captures(&ms, &s, si, end, &mut self.gc);
+                    Value::Object(r) if r.as_object().as_closure().is_some() => {
+                        let captures =
+                            crate::stdlib::string::get_captures(&ms, &s, src, e, &mut self.gc)?;
                         let results = self.call_value(repl, &captures)?;
                         let first = results.first().copied().unwrap_or(Value::Nil);
                         if first.is_nil() || first == Value::Boolean(false) {
-                            s[si..end].to_vec()
+                            result.extend_from_slice(&s[src..e]);
                         } else {
-                            Self::replacement_bytes(first)?
+                            let piece = Self::replacement_bytes(first)?;
+                            result.extend_from_slice(&piece);
+                            changed = true;
                         }
                     }
-                    _ => s[si..end].to_vec(),
-                };
-                result.extend_from_slice(&piece);
-
-                if end == si {
-                    if si < s.len() {
-                        result.push(s[si]);
+                    _ => {
+                        // Number: formatted like tostring.
+                        let piece = Self::replacement_bytes(repl)?;
+                        result.extend_from_slice(&piece);
+                        changed = true;
                     }
-                    si += 1;
-                } else {
-                    si = end;
                 }
-                if anchored {
-                    break;
-                }
+                src = e;
+                lastmatch = Some(e);
+            } else if src < s.len() {
+                result.push(s[src]);
+                src += 1;
             } else {
-                if si < s.len() {
-                    result.push(s[si]);
-                }
-                si += 1;
+                break;
+            }
+            if anchored {
+                break;
             }
         }
-        if si <= s.len() {
-            result.extend_from_slice(&s[si..]);
-        }
 
-        let r = self.gc.new_string(&result);
+        let out_val = if !changed {
+            args[0]
+        } else {
+            result.extend_from_slice(&s[src..]);
+            let r = self.gc.new_string(&result);
+            Value::Object(r)
+        };
         self.place_results(
             result_base,
             num_results,
-            &[Value::Object(r), Value::Integer(count as i64)],
+            &[out_val, Value::Integer(n)],
         );
         Ok(())
     }
@@ -4754,7 +4786,9 @@ impl Vm {
                 Ok(r.as_object().as_string().unwrap().as_bytes().to_vec())
             }
             Value::Integer(n) => Ok(format!("{n}").into_bytes()),
-            Value::Float(n) => Ok(format!("{n}").into_bytes()),
+            Value::Float(n) => {
+                Ok(crate::value::lua_float_to_string(n).into_bytes())
+            }
             other => Err(LuaError::new(format!(
                 "invalid replacement value (a {})",
                 other.type_name()

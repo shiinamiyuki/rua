@@ -805,18 +805,19 @@ fn val_to_float(v: Value, fname: &str) -> Result<f64, LuaError> {
 pub(crate) struct MatchState<'a> {
     source: &'a [u8],
     pattern: &'a [u8],
-    captures: Vec<Capture>,
+    pub(crate) captures: Vec<Capture>,
     level: usize,
+    error: Option<String>,
 }
 
 #[derive(Clone, Copy)]
-struct Capture {
-    start: usize,
-    len: CaptureLen,
+pub(crate) struct Capture {
+    pub(crate) start: usize,
+    pub(crate) len: CaptureLen,
 }
 
 #[derive(Clone, Copy)]
-enum CaptureLen {
+pub(crate) enum CaptureLen {
     Len(usize),
     Position, // for %n position capture
     Unfinished,
@@ -829,295 +830,358 @@ impl<'a> MatchState<'a> {
             pattern,
             captures: Vec::new(),
             level: 0,
+            error: None,
         }
     }
 
     /// Match pattern starting at pat_idx against source starting at si.
-    /// Returns the end position in source if match succeeds.
-    pub(crate) fn match_pattern(&mut self, si: usize, pi: usize) -> Option<usize> {
-        self.match_impl(si, pi, 0)
-    }
-
-    fn match_impl(&mut self, mut si: usize, mut pi: usize, depth: usize) -> Option<usize> {
-        if depth > 200 {
-            return None; // recursion limit
-        }
-        loop {
-            if pi >= self.pattern.len() {
-                return Some(si);
-            }
-            match self.pattern[pi] {
-                b'(' => {
-                    if pi + 1 < self.pattern.len() && self.pattern[pi + 1] == b')' {
-                        // Position capture
-                        let cap_idx = self.level;
-                        self.captures.push(Capture {
-                            start: si,
-                            len: CaptureLen::Position,
-                        });
-                        self.level += 1;
-                        let result = self.match_impl(si, pi + 2, depth + 1);
-                        if result.is_some() {
-                            return result;
-                        }
-                        self.captures.pop();
-                        self.level -= 1;
-                        return None;
-                    } else {
-                        let cap_idx = self.level;
-                        self.captures.push(Capture {
-                            start: si,
-                            len: CaptureLen::Unfinished,
-                        });
-                        self.level += 1;
-                        let result = self.match_impl(si, pi + 1, depth + 1);
-                        if result.is_some() {
-                            return result;
-                        }
-                        self.captures.pop();
-                        self.level -= 1;
-                        return None;
-                    }
-                }
-                b')' => {
-                    // Close the most recent unfinished capture
-                    for i in (0..self.captures.len()).rev() {
-                        if matches!(self.captures[i].len, CaptureLen::Unfinished) {
-                            self.captures[i].len = CaptureLen::Len(si - self.captures[i].start);
-                            let result = self.match_impl(si, pi + 1, depth + 1);
-                            if result.is_some() {
-                                return result;
-                            }
-                            self.captures[i].len = CaptureLen::Unfinished;
-                            return None;
-                        }
-                    }
-                    return None; // no matching open
-                }
-                b'$' if pi + 1 == self.pattern.len() => {
-                    // Anchor to end
-                    if si == self.source.len() {
-                        return Some(si);
-                    }
-                    return None;
-                }
-                _ => {
-                    // Check for quantifier after class
-                    let (class_end, class_pi) = self.skip_class(pi);
-                    if class_end < self.pattern.len() {
-                        match self.pattern[class_end] {
-                            b'*' => {
-                                return self.match_greedy(si, pi, class_end + 1, depth);
-                            }
-                            b'+' => {
-                                if si < self.source.len()
-                                    && self.match_class(self.source[si], pi)
-                                {
-                                    return self.match_greedy(si + 1, pi, class_end + 1, depth);
-                                }
-                                return None;
-                            }
-                            b'-' => {
-                                return self.match_lazy(si, pi, class_end + 1, depth);
-                            }
-                            b'?' => {
-                                // Optional
-                                if si < self.source.len()
-                                    && self.match_class(self.source[si], pi)
-                                {
-                                    if let Some(r) =
-                                        self.match_impl(si + 1, class_end + 1, depth + 1)
-                                    {
-                                        return Some(r);
-                                    }
-                                }
-                                pi = class_end + 1;
-                                continue;
-                            }
-                            _ => {}
-                        }
-                    }
-                    // No quantifier, single match
-                    if si < self.source.len() && self.match_class(self.source[si], pi) {
-                        si += 1;
-                        pi = class_end;
-                        continue;
-                    }
-                    return None;
-                }
-            }
-        }
-    }
-
-    /// Greedy match: match as many chars as possible, then try rest.
-    fn match_greedy(
+    /// Returns the end position in source if match succeeds.  Malformed
+    /// patterns produce an `Err`.
+    pub(crate) fn match_pattern(
         &mut self,
         si: usize,
-        class_pi: usize,
-        rest_pi: usize,
-        depth: usize,
-    ) -> Option<usize> {
-        let mut count = 0;
-        while si + count < self.source.len()
-            && self.match_class(self.source[si + count], class_pi)
-        {
-            count += 1;
+        pi: usize,
+    ) -> Result<Option<usize>, LuaError> {
+        let res = self.match_impl(si, pi, 0);
+        match self.error.take() {
+            Some(msg) => Err(LuaError::new(msg)),
+            None => Ok(res),
         }
-        // Try from longest to shortest
-        for c in (0..=count).rev() {
-            if let Some(r) = self.match_impl(si + c, rest_pi, depth + 1) {
-                return Some(r);
+    }
+
+    /// Return the index just past the pattern item starting at `pi`,
+    /// mirroring `classend`.
+    fn class_end(&mut self, pi: usize) -> Option<usize> {
+        match self.pattern.get(pi).copied() {
+            Some(b'%') => {
+                if pi + 1 >= self.pattern.len() {
+                    self.error = Some("malformed pattern (ends with '%')".into());
+                    return None;
+                }
+                Some(pi + 2)
+            }
+            Some(b'[') => {
+                let mut p = pi + 1;
+                if self.pattern.get(p).copied() == Some(b'^') {
+                    p += 1;
+                }
+                loop {
+                    let c = match self.pattern.get(p).copied() {
+                        Some(c) => c,
+                        None => {
+                            self.error =
+                                Some("malformed pattern (missing ']')".into());
+                            return None;
+                        }
+                    };
+                    p += 1;
+                    if c == b'%' && p < self.pattern.len() {
+                        p += 1;
+                    }
+                    if self.pattern.get(p).copied() == Some(b']') {
+                        return Some(p + 1);
+                    }
+                }
+            }
+            Some(_) => Some(pi + 1),
+            None => Some(pi),
+        }
+    }
+
+    /// Match a byte against a bracket class `[...]` (from `p` to `ec`).
+    fn match_bracket_class(&self, c: u8, p: usize, ec: usize) -> bool {
+        let mut sig = true;
+        let mut p = p;
+        if self.pattern.get(p + 1).copied() == Some(b'^') {
+            sig = false;
+            p += 1;
+        }
+        loop {
+            p += 1;
+            if p >= ec {
+                break;
+            }
+            if self.pattern[p] == b'%' {
+                p += 1;
+                if p < self.pattern.len() && match_char_class(c, self.pattern[p]) {
+                    return sig;
+                }
+            } else if p + 2 < ec && self.pattern[p + 1] == b'-' {
+                if self.pattern[p] <= c && c <= self.pattern[p + 2] {
+                    return sig;
+                }
+                p += 2;
+            } else if self.pattern[p] == c {
+                return sig;
+            }
+        }
+        !sig
+    }
+
+    /// Match a single pattern item against source at `si`.
+    fn single_match(&self, si: usize, pi: usize, ep: usize) -> bool {
+        if si >= self.source.len() {
+            return false;
+        }
+        let c = self.source[si];
+        match self.pattern.get(pi).copied().unwrap_or(0) {
+            b'.' => true,
+            b'%' => match_char_class(c, self.pattern[pi + 1]),
+            b'[' => self.match_bracket_class(c, pi, ep - 1),
+            other => other == c,
+        }
+    }
+
+    fn match_balance(&mut self, si: usize, pi: usize) -> Option<usize> {
+        if pi + 1 >= self.pattern.len() {
+            self.error =
+                Some("malformed pattern (missing arguments to '%b')".into());
+            return None;
+        }
+        if si >= self.source.len() || self.source[si] != self.pattern[pi] {
+            return None;
+        }
+        let b = self.pattern[pi];
+        let e = self.pattern[pi + 1];
+        let mut cont = 1i32;
+        let mut s = si;
+        loop {
+            s += 1;
+            if s >= self.source.len() {
+                break;
+            }
+            if self.source[s] == e {
+                cont -= 1;
+                if cont == 0 {
+                    return Some(s + 1);
+                }
+            } else if self.source[s] == b {
+                cont += 1;
             }
         }
         None
     }
 
-    /// Lazy match: match as few chars as possible.
-    fn match_lazy(
+    fn max_expand(
         &mut self,
         si: usize,
-        class_pi: usize,
-        rest_pi: usize,
+        pi: usize,
+        ep: usize,
         depth: usize,
     ) -> Option<usize> {
-        let mut count = 0;
+        let mut i = 0usize;
+        while self.single_match(si + i, pi, ep) {
+            i += 1;
+        }
         loop {
-            if let Some(r) = self.match_impl(si + count, rest_pi, depth + 1) {
-                return Some(r);
+            if let Some(res) = self.match_impl(si + i, ep + 1, depth + 1) {
+                return Some(res);
             }
-            if si + count < self.source.len()
-                && self.match_class(self.source[si + count], class_pi)
-            {
-                count += 1;
+            if i == 0 {
+                return None;
+            }
+            i -= 1;
+        }
+    }
+
+    fn min_expand(
+        &mut self,
+        mut si: usize,
+        pi: usize,
+        ep: usize,
+        depth: usize,
+    ) -> Option<usize> {
+        loop {
+            if let Some(res) = self.match_impl(si, ep + 1, depth + 1) {
+                return Some(res);
+            }
+            if self.single_match(si, pi, ep) {
+                si += 1;
             } else {
                 return None;
             }
         }
     }
 
-    /// Skip past a single pattern class at pi, return the index after the class.
-    fn skip_class(&self, pi: usize) -> (usize, usize) {
-        if pi >= self.pattern.len() {
-            return (pi, pi);
+    fn start_capture(
+        &mut self,
+        si: usize,
+        pi: usize,
+        position: bool,
+        depth: usize,
+    ) -> Option<usize> {
+        if self.level >= 32 {
+            self.error = Some("too many captures".into());
+            return None;
         }
-        match self.pattern[pi] {
-            b'%' => {
-                if pi + 1 < self.pattern.len() {
-                    if self.pattern[pi + 1] == b'b' {
-                        // %bxy
-                        (pi + 4, pi)
-                    } else if self.pattern[pi + 1] == b'f' {
-                        // %f[set] — frontier pattern
-                        if pi + 2 < self.pattern.len() && self.pattern[pi + 2] == b'[' {
-                            let end = self.find_set_end(pi + 2);
-                            (end, pi)
-                        } else {
-                            (pi + 2, pi)
-                        }
-                    } else {
-                        (pi + 2, pi)
-                    }
-                } else {
-                    (pi + 1, pi)
-                }
-            }
-            b'[' => {
-                let end = self.find_set_end(pi);
-                (end, pi)
-            }
-            _ => (pi + 1, pi),
-        }
-    }
-
-    /// Find the end of a character set [...].
-    fn find_set_end(&self, pi: usize) -> usize {
-        let mut i = pi + 1;
-        if i < self.pattern.len() && self.pattern[i] == b'^' {
-            i += 1;
-        }
-        if i < self.pattern.len() && self.pattern[i] == b']' {
-            i += 1; // ] at start is literal
-        }
-        while i < self.pattern.len() {
-            if self.pattern[i] == b']' {
-                return i + 1;
-            }
-            if self.pattern[i] == b'%' && i + 1 < self.pattern.len() {
-                i += 2;
+        self.captures.push(Capture {
+            start: si,
+            len: if position {
+                CaptureLen::Position
             } else {
-                i += 1;
-            }
+                CaptureLen::Unfinished
+            },
+        });
+        self.level += 1;
+        let res = self.match_impl(si, pi, depth + 1);
+        if res.is_none() {
+            self.level -= 1;
+            self.captures.pop();
         }
-        i
+        res
     }
 
-    /// Match a single source byte against a pattern class starting at pi.
-    fn match_class(&self, ch: u8, pi: usize) -> bool {
-        if pi >= self.pattern.len() {
-            return false;
-        }
-        match self.pattern[pi] {
-            b'%' => {
-                if pi + 1 >= self.pattern.len() {
-                    return false;
-                }
-                let cls = self.pattern[pi + 1];
-                if cls == b'b' {
-                    // %bxy is not a single-character class
-                    return false;
-                }
-                match_char_class(ch, cls)
+    fn capture_to_close(&mut self) -> Option<usize> {
+        for i in (0..self.captures.len()).rev() {
+            if matches!(self.captures[i].len, CaptureLen::Unfinished) {
+                return Some(i);
             }
-            b'[' => self.match_set(ch, pi),
-            b'.' => true,
-            c => ch == c,
         }
+        self.error = Some("invalid pattern capture".into());
+        None
     }
 
-    /// Match a byte against a character set [...]
-    fn match_set(&self, ch: u8, pi: usize) -> bool {
-        let mut i = pi + 1;
-        let negate = if i < self.pattern.len() && self.pattern[i] == b'^' {
-            i += 1;
-            true
-        } else {
-            false
+    fn end_capture(&mut self, si: usize, pi: usize, depth: usize) -> Option<usize> {
+        let l = self.capture_to_close()?;
+        let old = self.captures[l].len;
+        self.captures[l].len = CaptureLen::Len(si - self.captures[l].start);
+        let res = self.match_impl(si, pi, depth + 1);
+        if res.is_none() {
+            self.captures[l].len = old;
+        }
+        res
+    }
+
+    fn match_capture(&mut self, si: usize, lch: u8) -> Option<usize> {
+        let l = lch as i32 - b'1' as i32;
+        if l < 0
+            || l >= self.level as i32
+            || matches!(self.captures[l as usize].len, CaptureLen::Unfinished)
+        {
+            self.error = Some(format!("invalid capture index %{}", l + 1));
+            return None;
+        }
+        let cap = self.captures[l as usize];
+        let len = match cap.len {
+            CaptureLen::Len(n) => n,
+            // Position captures cannot be used as back-references.
+            _ => return None,
         };
-        let mut matched = false;
-        // First ] is literal
-        if i < self.pattern.len() && self.pattern[i] == b']' {
-            if ch == b']' {
-                matched = true;
-            }
-            i += 1;
-        }
-        while i < self.pattern.len() && self.pattern[i] != b']' {
-            if self.pattern[i] == b'%' && i + 1 < self.pattern.len() {
-                if match_char_class(ch, self.pattern[i + 1]) {
-                    matched = true;
-                }
-                i += 2;
-            } else if i + 2 < self.pattern.len() && self.pattern[i + 1] == b'-' {
-                if ch >= self.pattern[i] && ch <= self.pattern[i + 2] {
-                    matched = true;
-                }
-                i += 3;
-            } else {
-                if ch == self.pattern[i] {
-                    matched = true;
-                }
-                i += 1;
-            }
-        }
-        if negate {
-            !matched
+        if self.source.len() - si >= len
+            && self.source[cap.start..cap.start + len] == self.source[si..si + len]
+        {
+            Some(si + len)
         } else {
-            matched
+            None
+        }
+    }
+
+    fn match_impl(&mut self, mut si: usize, mut pi: usize, depth: usize) -> Option<usize> {
+        if depth > 200 {
+            self.error = Some("pattern too complex".into());
+            return None;
+        }
+        'init: loop {
+            if pi >= self.pattern.len() {
+                return Some(si);
+            }
+            match self.pattern[pi] {
+                b'(' => {
+                    if self.pattern.get(pi + 1).copied() == Some(b')') {
+                        return self.start_capture(si, pi + 2, true, depth);
+                    }
+                    return self.start_capture(si, pi + 1, false, depth);
+                }
+                b')' => {
+                    return self.end_capture(si, pi + 1, depth);
+                }
+                b'$' if pi + 1 == self.pattern.len() => {
+                    return if si == self.source.len() { Some(si) } else { None };
+                }
+                b'%' => {
+                    match self.pattern.get(pi + 1).copied() {
+                        Some(b'b') => {
+                            match self.match_balance(si, pi + 2) {
+                                Some(s) => {
+                                    si = s;
+                                    pi += 4;
+                                    continue 'init;
+                                }
+                                None => return None,
+                            }
+                        }
+                        Some(b'f') => {
+                            pi += 2;
+                            if self.pattern.get(pi).copied() != Some(b'[') {
+                                self.error =
+                                    Some("missing '[' after '%f' in pattern".into());
+                                return None;
+                            }
+                            let ep = self.class_end(pi)?;
+                            let previous = if si == 0 { 0 } else { self.source[si - 1] };
+                            let cur = self.source.get(si).copied().unwrap_or(0);
+                            if !self.match_bracket_class(previous, pi, ep - 1)
+                                && self.match_bracket_class(cur, pi, ep - 1)
+                            {
+                                pi = ep;
+                                continue 'init;
+                            }
+                            return None;
+                        }
+                        Some(c @ b'0'..=b'9') => {
+                            match self.match_capture(si, c) {
+                                Some(s) => {
+                                    si = s;
+                                    pi += 2;
+                                    continue 'init;
+                                }
+                                None => return None,
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                _ => {}
+            }
+            // Default: pattern class plus optional suffix.
+            let ep = self.class_end(pi)?;
+            if !self.single_match(si, pi, ep) {
+                match self.pattern.get(ep).copied() {
+                    Some(b'*') | Some(b'?') | Some(b'-') => {
+                        pi = ep + 1;
+                        continue 'init;
+                    }
+                    _ => return None,
+                }
+            } else {
+                match self.pattern.get(ep).copied() {
+                    Some(b'?') => {
+                        if let Some(res) = self.match_impl(si + 1, ep + 1, depth + 1) {
+                            return Some(res);
+                        }
+                        pi = ep + 1;
+                        continue 'init;
+                    }
+                    Some(b'+') => {
+                        return self.max_expand(si + 1, pi, ep, depth);
+                    }
+                    Some(b'*') => {
+                        return self.max_expand(si, pi, ep, depth);
+                    }
+                    Some(b'-') => {
+                        return self.min_expand(si, pi, ep, depth);
+                    }
+                    _ => {
+                        si += 1;
+                        pi = ep;
+                        continue 'init;
+                    }
+                }
+            }
         }
     }
 }
 
-/// Match a byte against a Lua character class like %a, %d, etc.
 fn match_char_class(ch: u8, cls: u8) -> bool {
     let result = match cls.to_ascii_lowercase() {
         b'a' => ch.is_ascii_alphabetic(),
@@ -1130,6 +1194,7 @@ fn match_char_class(ch: u8, cls: u8) -> bool {
         b'u' => ch.is_ascii_uppercase(),
         b'w' => ch.is_ascii_alphanumeric(),
         b'x' => ch.is_ascii_hexdigit(),
+        b'z' => ch == 0,
         _ => return ch == cls, // literal match (e.g., %., %[, etc.)
     };
     if cls.is_ascii_uppercase() {
@@ -1184,13 +1249,13 @@ pub fn string_find(args: &[Value], gc: &mut Gc) -> Result<Vec<Value>, LuaError> 
         let search_start = start;
         if anchored {
             let mut ms = MatchState::new(&s, pat_slice);
-            if let Some(end) = ms.match_pattern(search_start, 0) {
+            if let Some(end) = ms.match_pattern(search_start, 0)? {
                 let mut results = vec![
                     Value::Integer(search_start as i64 + 1),
                     Value::Integer(end as i64),
                 ];
                 for cap in &ms.captures {
-                    results.push(capture_to_value(cap, &s, gc));
+                    results.push(capture_to_value(cap, &s, gc)?);
                 }
                 return Ok(results);
             }
@@ -1199,13 +1264,13 @@ pub fn string_find(args: &[Value], gc: &mut Gc) -> Result<Vec<Value>, LuaError> 
 
         for si in search_start..=s.len() {
             let mut ms = MatchState::new(&s, pat_slice);
-            if let Some(end) = ms.match_pattern(si, 0) {
+            if let Some(end) = ms.match_pattern(si, 0)? {
                 let mut results = vec![
                     Value::Integer(si as i64 + 1),
                     Value::Integer(end as i64),
                 ];
                 for cap in &ms.captures {
-                    results.push(capture_to_value(cap, &s, gc));
+                    results.push(capture_to_value(cap, &s, gc)?);
                 }
                 return Ok(results);
             }
@@ -1234,59 +1299,83 @@ pub fn string_match(args: &[Value], gc: &mut Gc) -> Result<Vec<Value>, LuaError>
 
     if anchored {
         let mut ms = MatchState::new(&s, pat_slice);
-        if let Some(end) = ms.match_pattern(start, 0) {
-            return Ok(get_captures(&ms, &s, start, end, gc));
+        if let Some(end) = ms.match_pattern(start, 0)? {
+            return get_captures(&ms, &s, start, end, gc);
         }
         return Ok(vec![Value::Nil]);
     }
 
     for si in start..=s.len() {
         let mut ms = MatchState::new(&s, pat_slice);
-        if let Some(end) = ms.match_pattern(si, 0) {
-            return Ok(get_captures(&ms, &s, si, end, gc));
+        if let Some(end) = ms.match_pattern(si, 0)? {
+            return get_captures(&ms, &s, si, end, gc);
         }
     }
     Ok(vec![Value::Nil])
 }
 
 pub fn string_gmatch(args: &[Value], gc: &mut Gc) -> Result<Vec<Value>, LuaError> {
-    let s = check_string(args, 0, "gmatch")?;
+    let s_ref = match args.first() {
+        Some(Value::Object(r)) if r.as_object().as_string().is_some() => *r,
+        _ => {
+            return Err(LuaError::new(
+                "bad argument #1 to 'gmatch' (string expected)",
+            ))
+        }
+    };
     let pat = check_string(args, 1, "gmatch")?;
-
-    // Collect all matches
-    let anchored = !pat.is_empty() && pat[0] == b'^';
-    let pat_slice: Vec<u8> = if anchored { pat[1..].to_vec() } else { pat.clone() };
-
-    let mut matches: Vec<Vec<Value>> = Vec::new();
-    let mut si = 0;
-    while si <= s.len() {
-        let mut ms = MatchState::new(&s, &pat_slice);
-        if let Some(end) = ms.match_pattern(si, 0) {
-            let caps = get_captures(&ms, &s, si, end, gc);
-            matches.push(caps);
-            if end == si {
-                si += 1; // prevent infinite loop on empty match
-            } else {
-                si = end;
-            }
-            if anchored {
-                break;
-            }
-        } else {
-            si += 1;
-        }
+    if args.len() > 2 && !matches!(args[2], Value::Integer(_) | Value::Float(_)) {
+        return Err(LuaError::new(
+            "bad argument #3 to 'gmatch' (number expected)",
+        ));
     }
+    let init_arg = args
+        .get(2)
+        .and_then(|v| match v {
+            Value::Integer(n) => Some(*n),
+            Value::Float(f) => Some(*f as i64),
+            _ => None,
+        })
+        .unwrap_or(1);
+    let len = s_ref
+        .as_object()
+        .as_string()
+        .unwrap()
+        .as_bytes()
+        .len() as i64;
+    let mut init = if init_arg > 0 {
+        init_arg - 1
+    } else if init_arg < -len {
+        0
+    } else {
+        len + init_arg
+    };
+    if init > len {
+        init = len + 1;
+    }
+    let src = std::cell::Cell::new(init as usize);
+    let lastmatch: std::cell::Cell<Option<usize>> = std::cell::Cell::new(None);
 
-    // Return an iterator function
-    let match_idx = std::cell::Cell::new(0usize);
-    let iter_fn = move |_args: &[Value], _gc: &mut Gc| -> Result<Vec<Value>, LuaError> {
-        let idx = match_idx.get();
-        if idx < matches.len() {
-            match_idx.set(idx + 1);
-            Ok(matches[idx].clone())
-        } else {
-            Ok(vec![Value::Nil])
+    let iter_fn = move |_args: &[Value], gc: &mut Gc| -> Result<Vec<Value>, LuaError> {
+        let s = s_ref
+            .as_object()
+            .as_string()
+            .ok_or_else(|| LuaError::new("string expected"))?
+            .as_bytes()
+            .to_vec();
+        let mut cur = src.get();
+        while cur <= s.len() {
+            let mut ms = MatchState::new(&s, &pat);
+            if let Some(e) = ms.match_pattern(cur, 0)? {
+                if Some(e) != lastmatch.get() {
+                    lastmatch.set(Some(e));
+                    src.set(e);
+                    return get_captures(&ms, &s, cur, e, gc);
+                }
+            }
+            cur += 1;
         }
+        Ok(vec![Value::Nil])
     };
 
     let closure = crate::closure::Closure::new_native_dyn("gmatch_iter".to_string(), iter_fn);
@@ -1301,42 +1390,58 @@ pub(crate) fn apply_string_replacement(
     source: &[u8],
     match_start: usize,
     match_end: usize,
-) {
+) -> Result<(), LuaError> {
+    let whole = &source[match_start..match_end];
     let mut i = 0;
     while i < repl.len() {
-        if repl[i] == b'%' && i + 1 < repl.len() {
-            let c = repl[i + 1];
-            if c.is_ascii_digit() {
-                let idx = (c - b'0') as usize;
-                if idx == 0 {
-                    // %0 = whole match
-                    result.extend_from_slice(&source[match_start..match_end]);
-                } else if idx <= ms.captures.len() {
-                    let cap = &ms.captures[idx - 1];
-                    match cap.len {
-                        CaptureLen::Len(len) => {
-                            result.extend_from_slice(&source[cap.start..cap.start + len]);
-                        }
-                        CaptureLen::Position => {
-                            let s = format!("{}", cap.start + 1);
-                            result.extend_from_slice(s.as_bytes());
-                        }
-                        CaptureLen::Unfinished => {}
-                    }
-                }
-                i += 2;
-            } else if c == b'%' {
-                result.push(b'%');
-                i += 2;
-            } else {
-                result.push(c);
-                i += 2;
-            }
-        } else {
+        if repl[i] != b'%' {
             result.push(repl[i]);
             i += 1;
+            continue;
         }
+        if i + 1 >= repl.len() {
+            return Err(LuaError::new(
+                "invalid use of '%' in replacement string",
+            ));
+        }
+        let c = repl[i + 1];
+        if c == b'%' {
+            result.push(b'%');
+        } else if c == b'0' {
+            result.extend_from_slice(whole);
+        } else if c.is_ascii_digit() {
+            let idx = (c - b'0') as usize;
+            if idx - 1 < ms.captures.len() {
+                let cap = &ms.captures[idx - 1];
+                match cap.len {
+                    CaptureLen::Len(len) => {
+                        result.extend_from_slice(&source[cap.start..cap.start + len]);
+                    }
+                    CaptureLen::Position => {
+                        let s = format!("{}", cap.start + 1);
+                        result.extend_from_slice(s.as_bytes());
+                    }
+                    CaptureLen::Unfinished => {
+                        return Err(LuaError::new("unfinished capture"));
+                    }
+                }
+            } else if idx == 1 {
+                // No captures in the pattern: `%1` is the whole match.
+                result.extend_from_slice(whole);
+            } else {
+                return Err(LuaError::new(format!(
+                    "invalid capture index %{} in replacement string",
+                    idx
+                )));
+            }
+        } else {
+            return Err(LuaError::new(
+                "invalid use of '%' in replacement string",
+            ));
+        }
+        i += 2;
     }
+    Ok(())
 }
 
 // ── Helpers ────────────────────────────────────────────────────────
@@ -1350,27 +1455,34 @@ fn find_plain(haystack: &[u8], needle: &[u8]) -> Option<usize> {
         .position(|w| w == needle)
 }
 
-fn capture_to_value(cap: &Capture, source: &[u8], gc: &mut Gc) -> Value {
+fn capture_to_value(cap: &Capture, source: &[u8], gc: &mut Gc) -> Result<Value, LuaError> {
     match cap.len {
         CaptureLen::Len(len) => {
             let s = gc.new_string(&source[cap.start..cap.start + len]);
-            Value::Object(s)
+            Ok(Value::Object(s))
         }
-        CaptureLen::Position => Value::Integer(cap.start as i64 + 1),
-        CaptureLen::Unfinished => Value::Nil,
+        CaptureLen::Position => Ok(Value::Integer(cap.start as i64 + 1)),
+        CaptureLen::Unfinished => Err(LuaError::new("unfinished capture")),
     }
 }
 
-pub(crate) fn get_captures(ms: &MatchState, source: &[u8], start: usize, end: usize, gc: &mut Gc) -> Vec<Value> {
+pub(crate) fn get_captures(
+    ms: &MatchState,
+    source: &[u8],
+    start: usize,
+    end: usize,
+    gc: &mut Gc,
+) -> Result<Vec<Value>, LuaError> {
     if ms.captures.is_empty() {
         // No explicit captures: return whole match
         let s = gc.new_string(&source[start..end]);
-        vec![Value::Object(s)]
+        Ok(vec![Value::Object(s)])
     } else {
-        ms.captures
-            .iter()
-            .map(|cap| capture_to_value(cap, source, gc))
-            .collect()
+        let mut out = Vec::with_capacity(ms.captures.len());
+        for cap in &ms.captures {
+            out.push(capture_to_value(cap, source, gc)?);
+        }
+        Ok(out)
     }
 }
 
