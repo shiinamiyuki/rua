@@ -134,9 +134,15 @@ impl<'src> Lexer<'src> {
     fn advance(&mut self) -> u8 {
         let ch = self.source[self.pos];
         self.pos += 1;
-        if ch == b'\n' {
+        if ch == b'\n' || ch == b'\r' {
             self.line += 1;
             self.column = 1;
+            // A "\n\r" or "\r\n" pair counts as a single line break.
+            if let Some(&next) = self.source.get(self.pos) {
+                if (next == b'\n' || next == b'\r') && next != ch {
+                    self.pos += 1;
+                }
+            }
         } else {
             self.column += 1;
         }
