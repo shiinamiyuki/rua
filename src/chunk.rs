@@ -161,6 +161,7 @@ impl Writer {
             self.u32(p.locals.len() as u32);
             for l in &p.locals {
                 self.bytes(l.name.as_bytes());
+                self.u8(l.reg);
                 self.u32(l.start_pc);
                 self.u32(l.end_pc);
             }
@@ -341,10 +342,12 @@ impl<'a> Reader<'a> {
         proto.locals.reserve(nlocals);
         for _ in 0..nlocals {
             let name = String::from_utf8_lossy(&self.bytes()?).to_string();
+            let reg = self.u8()?;
             let start_pc = self.u32()?;
             let end_pc = self.u32()?;
             proto.locals.push(LocalVarInfo {
                 name,
+                reg,
                 start_pc,
                 end_pc,
             });
@@ -437,6 +440,7 @@ mod tests {
         });
         p.locals.push(LocalVarInfo {
             name: "x".to_string(),
+            reg: 0,
             start_pc: 0,
             end_pc: 2,
         });

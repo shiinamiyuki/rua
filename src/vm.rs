@@ -88,6 +88,11 @@ pub(crate) struct CallFrame {
     pub(crate) hook_seen_event: bool,
     /// Cached: does this proto have at most one distinct nonzero line?
     pub(crate) hook_single_line: Option<bool>,
+    /// Metamethod name when this frame was invoked as a metamethod.
+    pub(crate) metamethod: Option<String>,
+    /// True when this frame was entered from a C-level call (protected
+    /// call, metamethod, coroutine resume, ...) rather than a Lua CALL.
+    pub(crate) called_from_c: bool,
 }
 
 /// Saved pcall/xpcall context for yield-across-pcall support.
@@ -241,6 +246,34 @@ pub struct Vm {
 
     /// Re-entrancy guard for `__gc` finalizer dispatch.
     in_finalizer: bool,
+
+    /// Values that must stay rooted across operations that may trigger GC
+    /// (e.g. error objects held in Rust locals while closing TBC vars).
+    extra_roots: Vec<Value>,
+
+    /// Metamethod associated with the next pushed frame (consumed by
+    /// `do_call`).
+    pending_metamethod: Option<String>,
+
+    /// Whether the next pushed frame is entered from a C-level call.
+    pending_c_call: bool,
+
+    /// True while running an error handler; the stack limit is relaxed so
+    /// the handler has room even at maximum recursion depth.
+    error_handling: bool,
+
+    /// Name of a C function whose return hook is being fired (so
+    /// debug.getinfo(2) inside the hook can name it).
+    return_hook_c_name: Option<String>,
+
+    /// Name of the protected call whose frame is being unwound, if any.
+    /// Closing methods report it through debug.getinfo (reference Lua keeps
+    /// the C `pcall` frame as their caller).
+    closing_pcall_name: Option<&'static str>,
+
+    /// Source and line of a closing method that raised the current error,
+    /// reported at the top of tracebacks.
+    close_frame_info: Option<(String, u32)>,
 }
 
 impl Vm {
@@ -315,6 +348,13 @@ impl Vm {
             warn_on: false,
             warn_store: false,
             in_finalizer: false,
+            extra_roots: Vec::new(),
+            pending_metamethod: None,
+            pending_c_call: false,
+            error_handling: false,
+            return_hook_c_name: None,
+            closing_pcall_name: None,
+            close_frame_info: None,
         }
     }
 
@@ -376,6 +416,8 @@ impl Vm {
             hook_last_pc: 0,
             hook_seen_event: false,
             hook_single_line: None,
+            metamethod: None,
+            called_from_c: true,
         });
 
         self.execute()
@@ -1104,41 +1146,91 @@ impl Vm {
     /// Calls `__close` metamethod in reverse order. `err_obj` is the error
     /// object (if any) that caused the scope exit.
     fn close_tbc_vars(&mut self, from: usize, err_obj: Option<Value>) -> Result<(), LuaError> {
-        // Collect TBC slots at or above `from` in reverse order
-        let mut to_close: Vec<usize> = Vec::new();
-        while let Some(&slot) = self.tbc_slots.last() {
-            if slot >= from {
-                self.tbc_slots.pop();
-                to_close.push(slot);
-            } else {
-                break;
-            }
+        // Mirror `luaD_closeprotected`: close from the innermost variable
+        // outwards; when a closing method raises an error, the remaining
+        // variables are closed with that new error object.
+        // Keep the values (and the in-flight error) rooted across calls.
+        let rooted_len = self.extra_roots.len();
+        let slots: Vec<usize> = self
+            .tbc_slots
+            .iter()
+            .copied()
+            .filter(|&s| s >= from)
+            .collect();
+        for &s in &slots {
+            self.extra_roots.push(self.stack[s]);
         }
-
-        let mut first_err: Option<LuaError> = None;
-        for slot in to_close {
+        if let Some(e) = err_obj {
+            self.extra_roots.push(e);
+        }
+        let mut status_err = err_obj;
+        loop {
+            let slot = match self.tbc_slots.last() {
+                Some(&s) if s >= from => {
+                    self.tbc_slots.pop();
+                    s
+                }
+                _ => break,
+            };
             let val = self.stack[slot];
             // nil and false are silently ignored
             if val == Value::Nil || val == Value::Boolean(false) {
                 continue;
             }
             if let Some(mm) = self.get_metamethod(val, MM_CLOSE) {
-                let err_arg = err_obj.unwrap_or(Value::Nil);
-                let result = self.call_value(mm, &[val, err_arg]);
+                // The error object is passed only when unwinding an error.
+                let args: Vec<Value> = match status_err {
+                    Some(e) => vec![val, e],
+                    None => vec![val],
+                };
+                let saved_depth = self.frames.len();
+                let saved_uv = self.open_upvalues.len();
+                self.pending_metamethod = Some("close".to_string());
+                let result = self.call_value(mm, &args);
                 if let Err(e) = result {
-                    if first_err.is_none() {
-                        first_err = Some(e);
+                    let e = self.position_error(e);
+                    let ev = e.to_value(&mut self.gc);
+                    // Remember where the closing method was, for tracebacks.
+                    if let Some(fr) = self.frames.last() {
+                        let pc = fr.pc.saturating_sub(1);
+                        let line =
+                            fr.proto.line_info.get(pc).copied().unwrap_or(0);
+                        let src = fr.proto.source.clone().unwrap_or_default();
+                        self.close_frame_info = Some((src, line));
                     }
+                    // Pop any frames left by the failed closing method
+                    // (its own TBC variables stay on the list and are
+                    // closed by this loop with the new error object).
+                    while self.frames.len() > saved_depth {
+                        let fb = self.frames.last().unwrap().base;
+                        self.close_upvalues(fb);
+                        self.frames.pop();
+                    }
+                    self.open_upvalues.truncate(saved_uv);
+                    self.extra_roots.push(ev);
+                    status_err = Some(ev);
                 }
+            } else {
+                // The metamethod may have been removed after the variable
+                // was marked; calling a missing value is an error.
+                let msg = self
+                    .gc
+                    .new_string(b"attempt to call a nil value (metamethod 'close')");
+                let ev = Value::Object(msg);
+                self.extra_roots.push(ev);
+                status_err = Some(ev);
             }
-            // Per spec: value must have __close or be nil/false
-            // If it has neither, that's an error (already validated at TBC time)
         }
 
-        if let Some(e) = first_err {
-            return Err(e);
+        self.extra_roots.truncate(rooted_len);
+        match status_err {
+            Some(ev) => {
+                let mut e = LuaError::with_value(ev);
+                e.positioned = true;
+                Err(e)
+            }
+            None => Ok(()),
         }
-        Ok(())
     }
 
     // ── Metamethod infrastructure ─────────────────────────────────
@@ -1201,6 +1293,7 @@ impl Vm {
         let saved_depth = self.frames.len();
         let result_base = call_base;
 
+        self.pending_c_call = true;
         self.do_call(func, call_base, args, result_base, -1)?;
 
         if self.frames.len() > saved_depth {
@@ -1217,13 +1310,18 @@ impl Vm {
 
     /// Find a safe call_base for internal metamethod calls (above all active frames).
     fn find_call_base(&self) -> usize {
-        let stack_top = if self.frames.is_empty() {
+        let mut stack_top = if self.frames.is_empty() {
             self.top
         } else {
             let last = &self.frames[self.frames.len() - 1];
             let frame_top = last.base + last.proto.max_stack_size as usize;
             self.top.max(frame_top)
         };
+        // Pending to-be-closed variables may live above the current frames
+        // (e.g. while unwinding); keep calls clear of their slots.
+        if let Some(&max_slot) = self.tbc_slots.iter().max() {
+            stack_top = stack_top.max(max_slot + 8);
+        }
         stack_top + 2
     }
 
@@ -1599,6 +1697,12 @@ impl Vm {
                     }
                 }
             }
+            OpCode::Move => {
+                let src = decode_b(inst);
+                if let Some(local) = local_at_reg(proto, src, pc as u32) {
+                    return (Some(local), "local");
+                }
+            }
             OpCode::GetUpval => {
                 let uv = decode_b(inst);
                 if let Some(u) = proto.upvalues.get(uv as usize) {
@@ -1919,6 +2023,13 @@ impl Vm {
     /// Gather all GC roots from the VM state and run a collection cycle.
     fn collect_garbage(&mut self) {
         let mut roots = Vec::new();
+
+        // Root: temporary values held in Rust locals.
+        for val in &self.extra_roots {
+            if let Value::Object(r) = val {
+                roots.push(*r);
+            }
+        }
 
         // Root: stack values. For each frame we scan only the *active*
         // register window — from `base` through `base + nactvar_at(pc)`.
@@ -2983,6 +3094,7 @@ impl Vm {
                                 .collect();
                             self.handle_debug_sethook(&args)?;
                             self.place_results(base + a, num_results, &[]);
+                            self.fire_return_hook(Some("sethook"))?;
                         }
                         27 => { // debug.gethook
                             let args: Vec<Value> = (0..num_args)
@@ -3235,12 +3347,28 @@ impl Vm {
                     let val = self.reg(base, a);
                     if val != Value::Nil && val != Value::Boolean(false) {
                         if self.get_metamethod(val, MM_CLOSE).is_none() {
-                            return Err(LuaError::new(
-                                "variable is not closable (no __close metamethod)",
-                            ));
+                            let name = local_at_reg(&self.frames[fi].proto, a as u8, pc as u32)
+                                .unwrap_or_else(|| "?".to_string());
+                            return Err(LuaError::new(format!(
+                                "variable '{name}' got a non-closable value"
+                            )));
                         }
                     }
                     self.tbc_slots.push(base + a);
+                }
+
+                OpCode::ErrNNil => {
+                    if !self.reg(base, a).is_nil() {
+                        let name = if bx > 0 {
+                            constant_string(&self.frames[fi].proto.constants, bx - 1)
+                                .unwrap_or_else(|| "?".to_string())
+                        } else {
+                            "?".to_string()
+                        };
+                        return Err(LuaError::new(format!(
+                            "global '{name}' already defined"
+                        )));
+                    }
                 }
 
                 OpCode::ExtraArg => {
@@ -3451,6 +3579,7 @@ impl Vm {
                     _ => unreachable!(),
                 };
                 self.place_results(result_base, num_results, &results);
+                self.fire_return_hook(None)?;
             } else {
                 let (proto, upvalues) = match gc_ref.as_object().as_closure().unwrap() {
                     Closure::Lua(lc) => (Rc::clone(&lc.proto), lc.upvalues.clone()),
@@ -3462,6 +3591,16 @@ impl Vm {
                 let is_vararg = proto.is_vararg;
                 let max_stack = proto.max_stack_size as usize;
 
+                // Reference Lua's stack limit (LUAI_MAXSTACK slots plus a
+                // reserve for error handling).
+                let stack_limit = if self.error_handling {
+                    1_600_000
+                } else {
+                    1_100_000
+                };
+                if new_base + max_stack > stack_limit {
+                    return Err(LuaError::new("stack overflow"));
+                }
                 self.ensure_stack(new_base + max_stack);
 
                 // Place arguments into registers
@@ -3504,7 +3643,10 @@ impl Vm {
                     hook_last_pc: 0,
                     hook_seen_event: false,
                     hook_single_line: None,
+                    metamethod: self.pending_metamethod.take(),
+                    called_from_c: self.pending_c_call,
                 });
+                self.pending_c_call = false;
 
                 // Call hook (after the frame is in place so the hook can
                 // inspect it with debug.getinfo).
@@ -3608,6 +3750,7 @@ impl Vm {
             self.stack[inner_result_base + 1 + i] = *arg;
         }
 
+        self.pending_c_call = true;
         let call_result = self.do_call(
             func,
             inner_result_base,
@@ -3647,7 +3790,17 @@ impl Vm {
                         Err(e) => {
                             let e = self.position_error(e);
                             let err_val = e.to_value(&mut self.gc);
-                            self.recover_from_error(saved_depth, saved_open_uv_len, Some(err_val));
+                            let prev = self.closing_pcall_name;
+                            self.closing_pcall_name = Some("pcall");
+                            let err_val = self
+                                .recover_from_error(
+                                    saved_depth,
+                                    saved_open_uv_len,
+                                    Some(err_val),
+                                )
+                                .unwrap_or(err_val);
+                            self.closing_pcall_name = prev;
+                            self.close_frame_info = None;
                             self.place_results(
                                 result_base,
                                 num_results,
@@ -3669,7 +3822,13 @@ impl Vm {
                 // The call itself failed (e.g. calling a non-function)
                 let e = self.position_error(e);
                 let err_val = e.to_value(&mut self.gc);
-                self.recover_from_error(saved_depth, saved_open_uv_len, Some(err_val));
+                let prev = self.closing_pcall_name;
+                self.closing_pcall_name = Some("pcall");
+                let err_val = self
+                    .recover_from_error(saved_depth, saved_open_uv_len, Some(err_val))
+                    .unwrap_or(err_val);
+                self.closing_pcall_name = prev;
+                self.close_frame_info = None;
                 self.place_results(
                     result_base,
                     num_results,
@@ -3681,19 +3840,46 @@ impl Vm {
     }
 
     /// Unwind frames and upvalues back to a saved checkpoint after an error.
-    fn recover_from_error(&mut self, saved_depth: usize, saved_open_uv_len: usize, err_obj: Option<Value>) {
-        // Close TBC vars for all frames being unwound
-        if self.frames.len() > saved_depth {
-            let from = self.frames[saved_depth].base;
-            let _ = self.close_tbc_vars(from, err_obj);
-        }
+    fn recover_from_error(
+        &mut self,
+        saved_depth: usize,
+        saved_open_uv_len: usize,
+        err_obj: Option<Value>,
+    ) -> Option<Value> {
+        // Pop the unwound frames first (closing their upvalues), so that
+        // closing methods see the protected function as their caller
+        // (reference Lua closes variables after restoring the caller).
+        let had_frames = self.frames.len() > saved_depth;
+        let from = self
+            .frames
+            .get(saved_depth)
+            .map(|f| f.base)
+            .unwrap_or(0);
         while self.frames.len() > saved_depth {
             let frame_base = self.frames.last().unwrap().base;
             self.close_upvalues(frame_base);
             self.frames.pop();
         }
+        // Close TBC vars for all frames that were unwound. If a closing
+        // method raises an error, that becomes the propagated error.
+        let close_err = if had_frames {
+            match self.close_tbc_vars(from, err_obj) {
+                Ok(()) => None,
+                Err(e) => Some(e.to_value(&mut self.gc)),
+            }
+        } else {
+            None
+        };
         // Trim any open upvalues that were created inside the failed call
         self.open_upvalues.truncate(saved_open_uv_len);
+        // Drop stale stack-top information left by the popped frames.
+        if let Some(last) = self.frames.last() {
+            let ft = last.base + last.proto.max_stack_size as usize;
+            if self.top > ft {
+                self.top = ft;
+            }
+        }
+        close_err
     }
 
     // ── Coroutine operations ───────────────────────────────────────
@@ -3881,7 +4067,20 @@ impl Vm {
                             } else {
                                 err_val
                             };
-                            self.recover_from_error(guard.frame_depth, guard.open_uv_len, Some(err_val));
+                            let prev = self.closing_pcall_name;
+                            self.closing_pcall_name = Some(if guard.is_xpcall {
+                                "xpcall"
+                            } else {
+                                "pcall"
+                            });
+                            let handled = self
+                                .recover_from_error(
+                                    guard.frame_depth,
+                                    guard.open_uv_len,
+                                    Some(err_val),
+                                )
+                                .unwrap_or(handled);
+                            self.closing_pcall_name = prev;
                             self.place_results(
                                 guard.result_base,
                                 guard.num_results,
@@ -4064,7 +4263,20 @@ impl Vm {
                             } else {
                                 err_val
                             };
-                            self.recover_from_error(guard.frame_depth, guard.open_uv_len, Some(err_val));
+                            let prev = self.closing_pcall_name;
+                            self.closing_pcall_name = Some(if guard.is_xpcall {
+                                "xpcall"
+                            } else {
+                                "pcall"
+                            });
+                            let handled = self
+                                .recover_from_error(
+                                    guard.frame_depth,
+                                    guard.open_uv_len,
+                                    Some(err_val),
+                                )
+                                .unwrap_or(handled);
+                            self.closing_pcall_name = prev;
                             self.place_results(
                                 guard.result_base,
                                 guard.num_results,
@@ -4343,6 +4555,7 @@ impl Vm {
             self.stack[inner_result_base + 1 + i] = *arg;
         }
 
+        self.pending_c_call = true;
         let call_result = self.do_call(
             func,
             inner_result_base,
@@ -4407,9 +4620,13 @@ impl Vm {
     fn call_message_handler(&mut self, msgh: Value, err_val: Value) -> Value {
         // If the handler itself errors, reference Lua reports
         // "error in error handling".
-        match self.call_value(msgh, &[err_val]) {
+        let prev = self.error_handling;
+        self.error_handling = true;
+        let result = self.call_value(msgh, &[err_val]);
+        self.error_handling = prev;
+        match result {
             Ok(results) => results.into_iter().next().unwrap_or(Value::Nil),
-            Err(_) => {
+            Err(e) => {
                 let msg = self.gc.new_string(b"error in error handling");
                 Value::Object(msg)
             }
@@ -4426,6 +4643,13 @@ impl Vm {
             result.push('\n');
         }
         result.push_str("stack traceback:");
+        if let Some((src, line)) = &self.close_frame_info {
+            result.push_str("\n\t");
+            result.push_str(&chunkid(src));
+            result.push(':');
+            result.push_str(&line.to_string());
+            result.push_str(": in metamethod 'close'");
+        }
 
         let num_frames = self.frames.len();
         // Level 1 = the function that called `debug.traceback` (which is
@@ -4453,6 +4677,12 @@ impl Vm {
 
             // Try to find function name
             let closure = frame.closure.as_object().as_closure().unwrap();
+            if let Some(mm) = &frame.metamethod {
+                result.push_str("metamethod '");
+                result.push_str(mm);
+                result.push('\'');
+                continue;
+            }
             match closure {
                 Closure::Lua(_) => {
                     if frame.is_hook {
@@ -5357,6 +5587,20 @@ impl Vm {
     }
 
     /// Handle debug.traceback([message [, level]])
+    /// Fire a return hook for a C-level call (which has no stack frame).
+    fn fire_return_hook(&mut self, c_name: Option<&str>) -> Result<(), LuaError> {
+        if self.hook_mask & HOOK_RET != 0 && !self.in_hook {
+            let prev = self.return_hook_c_name.take();
+            if let Some(n) = c_name {
+                self.return_hook_c_name = Some(n.to_string());
+            }
+            let r = self.call_hook("return", None);
+            self.return_hook_c_name = prev;
+            r?;
+        }
+        Ok(())
+    }
+
     fn handle_debug_traceback(&mut self, args: &[Value], result_base: usize, num_results: i32) {
         // If message is not a string and not nil, return it directly
         let msg_arg = args.first().copied().unwrap_or(Value::Nil);
@@ -5440,6 +5684,40 @@ impl Vm {
 
         match func_or_level {
             Ok(level) => {
+                // A return hook for a C function: level 2 names that function.
+                if level == 2 {
+                    if let Some(name) = self.return_hook_c_name.clone() {
+                        if self.frames.last().map(|f| f.is_hook).unwrap_or(false) {
+                            let info =
+                                self.build_c_getinfo_table(&name, None, &what);
+                            let info_ref = self.gc.new_table(info);
+                            self.place_results(
+                                result_base,
+                                num_results,
+                                &[Value::Object(info_ref)],
+                            );
+                            return Ok(());
+                        }
+                    }
+                }
+                // While unwinding a protected call, its frame is not on the
+                // stack; present it as level 2 (reference Lua keeps the C
+                // `pcall` frame on the stack during closing methods).
+                let mut level = level;
+                if self.closing_pcall_name.is_some() && level >= 2 {
+                    if level == 2 {
+                        let name = self.closing_pcall_name.unwrap().to_string();
+                        let info = self.build_c_getinfo_table(&name, None, &what);
+                        let info_ref = self.gc.new_table(info);
+                        self.place_results(
+                            result_base,
+                            num_results,
+                            &[Value::Object(info_ref)],
+                        );
+                        return Ok(());
+                    }
+                    level -= 1;
+                }
                 // Level 0 = getinfo itself (which is not on the stack), so
                 // level 1 = the function that called getinfo = top frame
                 let num_frames = self.frames.len();
@@ -5515,7 +5793,18 @@ impl Vm {
     /// Try to determine the name under which the function of frame `fi`
     /// was called, by inspecting the call instruction in the caller.
     fn function_name_at(&self, fi: usize) -> (Option<String>, &'static str) {
+        if let Some(mm) = &self.frames[fi].metamethod {
+            return (Some(mm.clone()), "metamethod");
+        }
         if fi == 0 {
+            // While unwinding a protected call, its frame is gone; report
+            // the protected call itself as the caller (like reference Lua).
+            if let Some(name) = self.closing_pcall_name {
+                return (Some(name.to_string()), "global");
+            }
+            return (None, "");
+        }
+        if self.frames[fi].called_from_c {
             return (None, "");
         }
         let caller = &self.frames[fi - 1];
@@ -5532,6 +5821,11 @@ impl Vm {
         let a = decode_a(call_inst);
         if call_pc == 0 {
             return (None, "");
+        }
+
+        // If the function register is a local, that is its name.
+        if let Some(local) = local_at_reg(proto, a, call_pc as u32) {
+            return (Some(local), "local");
         }
 
         // Find the instruction that produced the function value in register
@@ -5596,6 +5890,12 @@ impl Vm {
                         }
                         break;
                     }
+                }
+            }
+            OpCode::Move => {
+                let src = decode_b(inst);
+                if let Some(local) = local_at_reg(proto, src, call_pc as u32) {
+                    return (Some(local), "local");
                 }
             }
             OpCode::GetUpval => {
@@ -7425,13 +7725,12 @@ fn constant_string(constants: &[Constant], idx: usize) -> Option<String> {
 /// Name of the local that occupies register `reg` at `pc`, if any. Locals
 /// map 1:1 to registers in declaration order.
 fn local_at_reg(proto: &Proto, reg: u8, pc: u32) -> Option<String> {
-    let mut active: Vec<&LocalVarInfo> = proto
+    proto
         .locals
         .iter()
-        .filter(|l| l.start_pc <= pc && pc < l.end_pc)
-        .collect();
-    active.sort_by_key(|l| l.start_pc);
-    active.get(reg as usize).map(|l| l.name.clone())
+        .rev()
+        .find(|l| l.reg == reg && l.start_pc <= pc && pc < l.end_pc)
+        .map(|l| l.name.clone())
 }
 
 fn lua_shr(x: i64, y: i64) -> i64 {

@@ -171,6 +171,24 @@ impl Parser {
 
     fn parse_stat(&mut self) -> Result<Stat, ParseError> {
         let loc = self.current_location();
+        // `global` is a contextual keyword (LUA_COMPAT_GLOBAL): it starts a
+        // global declaration only when followed by a name, '*', '<' or
+        // 'function'.
+        if let TokenKind::Name(n) = self.peek() {
+            if n == "global" {
+                let is_decl = matches!(
+                    self.tokens.get(self.pos + 1).map(|t| &t.kind),
+                    Some(TokenKind::Lt)
+                        | Some(TokenKind::Star)
+                        | Some(TokenKind::Function)
+                        | Some(TokenKind::Name(_))
+                );
+                if is_decl {
+                    let kind = self.parse_global_stat()?;
+                    return Ok(Stat::new(kind, loc));
+                }
+            }
+        }
         let kind = match self.peek().clone() {
             TokenKind::If => self.parse_if_stat()?,
             TokenKind::While => self.parse_while_stat()?,
@@ -337,7 +355,15 @@ impl Parser {
     /// `global attnamelist ['=' explist]`
     /// `global [attrib] '*'`
     fn parse_global_stat(&mut self) -> Result<StatKind, ParseError> {
-        self.expect(TokenKind::Global)?;
+        match self.peek() {
+            TokenKind::Global => {
+                self.advance();
+            }
+            TokenKind::Name(n) if n == "global" => {
+                self.advance();
+            }
+            _ => return Err(self.error("'global' expected")),
+        }
 
         if self.eat(&TokenKind::Function) {
             let name = self.expect_name()?;

@@ -84,12 +84,13 @@ pub enum OpCode {
     Close = 47,     // ABC:  close upvalues >= R[A], close TBC vars
     Tbc = 48,       // ABC:  mark R[A] as to-be-closed
     ExtraArg = 49,  // special: 24-bit extra argument (A:Bx combined)
+    ErrNNil = 51,   // ABx:  error if R[A] ~= nil: "global 'K[Bx-1]' already defined"
 }
 
 impl OpCode {
     /// Convert from u8 to OpCode.
     pub fn from_u8(v: u8) -> Option<OpCode> {
-        if v <= 49 || v == 50 {
+        if v <= 49 || v == 50 || v == 51 {
             // SAFETY: all values 0..=49 and 50 are valid OpCode variants with repr(u8).
             Some(unsafe { std::mem::transmute(v) })
         } else {
@@ -141,6 +142,7 @@ impl OpCode {
             OpCode::ForLoop => "FORLOOP",
             OpCode::TForPrep => "TFORPREP",
             OpCode::TForCall => "TFORCALL",
+            OpCode::ErrNNil => "ERRNNIL",
             OpCode::TForLoop => "TFORLOOP",
             OpCode::Closure => "CLOSURE",
             OpCode::Call => "CALL",
@@ -321,6 +323,8 @@ pub struct UpvalueDesc {
 pub struct LocalVarInfo {
     /// Variable name.
     pub name: String,
+    /// Register where this local lives.
+    pub reg: u8,
     /// First instruction where the variable is active (inclusive).
     pub start_pc: u32,
     /// Last instruction where the variable is active (inclusive).
@@ -418,6 +422,7 @@ impl Proto {
                         format!("{a} {bx} ; {k_str}")
                     }
                     OpCode::LoadKX => format!("{a}"),
+                    OpCode::ErrNNil => format!("{a} {bx}"),
                     OpCode::Closure => format!("{a} {bx}"),
 
                     // ABC format with constant references
@@ -540,7 +545,8 @@ mod tests {
         assert_eq!(OpCode::from_u8(0), Some(OpCode::Move));
         assert_eq!(OpCode::from_u8(49), Some(OpCode::ExtraArg));
         assert_eq!(OpCode::from_u8(50), Some(OpCode::TForCall));
-        assert_eq!(OpCode::from_u8(51), None);
+        assert_eq!(OpCode::from_u8(51), Some(OpCode::ErrNNil));
+        assert_eq!(OpCode::from_u8(52), None);
         assert_eq!(OpCode::from_u8(255), None);
     }
 }

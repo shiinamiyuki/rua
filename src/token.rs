@@ -133,7 +133,6 @@ impl TokenKind {
             "false" => Some(TokenKind::False),
             "for" => Some(TokenKind::For),
             "function" => Some(TokenKind::Function),
-            "global" => Some(TokenKind::Global),
             "goto" => Some(TokenKind::Goto),
             "if" => Some(TokenKind::If),
             "in" => Some(TokenKind::In),

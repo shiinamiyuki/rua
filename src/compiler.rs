@@ -54,6 +54,30 @@ struct Local {
     /// Is this local a `<close>` (to-be-closed) local?
     #[allow(dead_code)]
     is_close: bool,
+    /// Declaration order (for shadowing by global declarations).
+    seq: u64,
+}
+
+/// A global declaration active in some scope (`global a` / `global *`).
+#[derive(Debug, Clone)]
+struct GlobalDecl {
+    /// None represents the collective declaration `*`.
+    name: Option<String>,
+    is_const: bool,
+    /// Declaration order (for shadowing by later locals).
+    seq: u64,
+    /// Scope depth at the declaration.
+    depth: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum GlobalStatus {
+    /// No global declaration has been seen: globals are implicitly declared.
+    Implicit,
+    /// Some global declaration exists but not this name: it is an error.
+    NotDeclared,
+    /// Declared (possibly read-only).
+    Declared(bool),
 }
 
 /// A pending goto that needs to be patched.
@@ -110,9 +134,12 @@ struct FuncState {
     scopes: Vec<BlockScope>,
     /// Next available register.
     free_reg: u8,
-    /// Const global declarations visible in the current scope:
-    /// (scope depth, name).
-    const_globals: Vec<(usize, String)>,
+    /// Active global declarations in this function (innermost scope last).
+    global_decls: Vec<GlobalDecl>,
+    /// Global declaration groups inherited from enclosing functions.
+    outer_globals: Vec<Vec<GlobalDecl>>,
+    /// Monotonic declaration order counter.
+    next_seq: u64,
     /// Pending goto statements that haven't been resolved yet.
     pending_gotos: Vec<PendingGoto>,
     /// Labels defined in the function.
@@ -130,7 +157,9 @@ impl FuncState {
             locals: Vec::new(),
             scopes: Vec::new(),
             free_reg: 0,
-            const_globals: Vec::new(),
+            global_decls: Vec::new(),
+            outer_globals: Vec::new(),
+            next_seq: 0,
             pending_gotos: Vec::new(),
             labels: Vec::new(),
             enclosing,
@@ -146,6 +175,7 @@ impl FuncState {
         for local in &self.locals {
             self.proto.locals.push(LocalVarInfo {
                 name: local.name.clone(),
+                reg: local.reg,
                 start_pc: local.start_pc,
                 end_pc,
             });
@@ -306,7 +336,7 @@ impl FuncState {
     fn leave_scope_unpatched(&mut self, line: u32) -> Result<Vec<usize>, LuaError> {
         let scope = self.scopes.pop().expect("unbalanced scopes");
         let depth = self.scopes.len() + 1;
-        self.const_globals.retain(|(d, _)| *d < depth);
+        self.global_decls.retain(|d| d.depth < depth);
 
         // Check if any locals in this scope are <close> or capture upvalues
         let has_close = self.locals[scope.first_local..]
@@ -354,6 +384,7 @@ impl FuncState {
         for local in self.locals.drain(scope.first_local..) {
             self.proto.locals.push(LocalVarInfo {
                 name: local.name.clone(),
+                reg: local.reg,
                 start_pc: local.start_pc,
                 end_pc,
             });
@@ -389,12 +420,15 @@ impl FuncState {
             return Err(LuaError::new("too many local variables"));
         }
         let reg = self.alloc_reg()?;
+        let seq = self.next_seq;
+        self.next_seq += 1;
         self.locals.push(Local {
             name,
             reg,
             start_pc: self.proto.code.len() as u32,
             is_const: false,
             is_close: false,
+            seq,
         });
         Ok(reg)
     }
@@ -406,6 +440,127 @@ impl FuncState {
             }
         }
         None
+    }
+
+    // ── Global declaration resolution ──────────────────────────────
+
+    fn named_global(&self, name: &str) -> Option<&GlobalDecl> {
+        self.global_decls
+            .iter()
+            .rev()
+            .find(|d| d.name.as_deref() == Some(name))
+    }
+
+    fn innermost_local_seq(&self, name: &str) -> Option<u64> {
+        self.locals
+            .iter()
+            .rev()
+            .find(|l| l.name == name)
+            .map(|l| l.seq)
+    }
+
+    /// True when a global declaration shadows any local binding visible here.
+    fn global_shadows(&self, name: &str) -> Option<bool> {
+        let gd = self.named_global(name)?;
+        match self.innermost_local_seq(name) {
+            Some(ls) if ls > gd.seq => None,
+            _ => Some(gd.is_const),
+        }
+    }
+
+    /// Effective declaration status for a global name, following the same
+    /// rules as reference Lua (`searchvar` + recursion into enclosing
+    /// functions).
+    fn global_status(&self, name: &str) -> GlobalStatus {
+        let mut info: i32 = -1;
+        let mut collective_const = false;
+        let groups = std::iter::once(&self.global_decls)
+            .chain(self.outer_globals.iter());
+        for group in groups {
+            for decl in group.iter().rev() {
+                match &decl.name {
+                    None => {
+                        if info < 0 {
+                            info = 1;
+                            collective_const = decl.is_const;
+                        }
+                    }
+                    Some(n) if n == name => {
+                        return GlobalStatus::Declared(decl.is_const);
+                    }
+                    Some(_) => {
+                        if info == -1 {
+                            info = -2;
+                        }
+                    }
+                }
+            }
+        }
+        match info {
+            -1 => GlobalStatus::Implicit,
+            -2 => GlobalStatus::NotDeclared,
+            _ => GlobalStatus::Declared(collective_const),
+        }
+    }
+
+    fn env_is_global(&self) -> bool {
+        let groups = std::iter::once(&self.global_decls)
+            .chain(self.outer_globals.iter());
+        for group in groups {
+            for decl in group.iter().rev() {
+                if decl.name.as_deref() == Some("_ENV") {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Validate a global reference (read or write), mirroring `buildvar`.
+    fn check_global_access(
+        &self,
+        name: &str,
+        write: bool,
+        line: u32,
+    ) -> Result<(), LuaError> {
+        let status = self.global_status(name);
+        if status == GlobalStatus::NotDeclared {
+            return Err(LuaError::new(format!(
+                "{}:{}: variable '{name}' not declared",
+                self.proto.source.as_deref().unwrap_or("?"),
+                line
+            )));
+        }
+        if self.env_is_global() {
+            return Err(LuaError::new(format!(
+                "{}:{}: _ENV is global when accessing variable '{name}'",
+                self.proto.source.as_deref().unwrap_or("?"),
+                line
+            )));
+        }
+        if write {
+            if let GlobalStatus::Declared(true) = status {
+                return Err(LuaError::new(format!(
+                    "{}:{}: attempt to assign to const variable '{name}'",
+                    self.proto.source.as_deref().unwrap_or("?"),
+                    line
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Push a new global declaration.
+    fn add_global_decl(&mut self, name: Option<String>, is_const: bool) {
+        let seq = self.next_seq;
+        self.next_seq += 1;
+        let depth = self.scopes.len();
+        self.global_decls.push(GlobalDecl {
+            name,
+            is_const,
+            seq,
+            depth,
+        });
     }
 
     // ── Upvalue resolution ─────────────────────────────────────────
@@ -420,6 +575,20 @@ impl FuncState {
 
         // Try to find in enclosing function
         if let Some(ref mut enclosing) = self.enclosing {
+            // A global declaration in the enclosing function shadows its
+            // locals (and stops the search there).
+            let shadowed_by_global = match enclosing.named_global(name) {
+                Some(gd) => enclosing
+                    .innermost_local_seq(name)
+                    .map_or(true, |ls| gd.seq > ls),
+                None => false,
+            };
+            if shadowed_by_global && enclosing.find_local(name).is_none() {
+                return None;
+            }
+            if shadowed_by_global {
+                return None;
+            }
             // Check enclosing locals
             if let Some(reg) = enclosing.find_local(name) {
                 // Mark the enclosing scope as having upvalues
@@ -620,16 +789,25 @@ fn compile_stat(fs: &mut FuncState, stat: &Stat) -> Result<(), LuaError> {
         StatKind::GlobalDecl { names, values } => {
             compile_global_decl(fs, names, values, line)?;
         }
-        StatKind::GlobalStar { .. } => {
+        StatKind::GlobalStar { attrib } => {
+            if attrib.as_deref() == Some("close") {
+                return Err(LuaError::new(
+                    "global variables cannot be to-be-closed",
+                ));
+            }
+            fs.add_global_decl(None, attrib.as_deref() == Some("const"));
             // `global *` introduces a pseudo-variable "*" so that gotos
             // cannot jump over it (reference Lua behavior).
             let reg = fs.alloc_reg()?;
+            let seq = fs.next_seq;
+            fs.next_seq += 1;
             fs.locals.push(Local {
                 name: "*".to_string(),
                 reg,
                 start_pc: fs.proto.code.len() as u32,
                 is_const: true,
                 is_close: false,
+                seq,
             });
         }
     }
@@ -656,6 +834,8 @@ fn compile_assign(
             upval: Option<u8>,
             env: Option<u8>,
             key: Option<u16>,
+            /// Local `_ENV` register (when `_ENV` is a local).
+            tab_reg: Option<u8>,
         },
         Table {
             tab: u8,
@@ -668,7 +848,31 @@ fn compile_assign(
     for target in targets {
         match target {
             Var::Name(name) => {
-                if let Some(local_reg) = fs.find_local(name) {
+                if fs.global_shadows(name).is_some() {
+                    fs.check_global_access(name, true, line)?;
+                    match env_access(fs)? {
+                        EnvAccess::Upval(env) => {
+                            let k = fs.string_constant(name.as_bytes());
+                            prepared.push(Prepared::Name {
+                                local_reg: None,
+                                upval: None,
+                                env: Some(env),
+                                key: Some(k),
+                                tab_reg: None,
+                            });
+                        }
+                        EnvAccess::Local(reg) => {
+                            let k = fs.string_constant(name.as_bytes());
+                            prepared.push(Prepared::Name {
+                                local_reg: None,
+                                upval: None,
+                                env: None,
+                                key: Some(k),
+                                tab_reg: Some(reg),
+                            });
+                        }
+                    }
+                } else if let Some(local_reg) = fs.find_local(name) {
                     // Check const
                     for local in fs.locals.iter().rev() {
                         if local.name == *name {
@@ -687,6 +891,7 @@ fn compile_assign(
                         upval: None,
                         env: None,
                         key: None,
+                                            tab_reg: None,
                     });
                 } else if let Some(uv) = fs.find_upvalue(name) {
                     if fs
@@ -707,28 +912,32 @@ fn compile_assign(
                         upval: Some(uv),
                         env: None,
                         key: None,
+                                            tab_reg: None,
                     });
                 } else {
-                    if fs
-                        .const_globals
-                        .iter()
-                        .rev()
-                        .any(|(_, n)| n == name)
-                    {
-                        return Err(LuaError::new(format!(
-                            "{}:{}: attempt to assign to const variable '{name}'",
-                            fs.proto.source.as_deref().unwrap_or("?"),
-                            line
-                        )));
+                    fs.check_global_access(name, true, line)?;
+                    match env_access(fs)? {
+                        EnvAccess::Upval(env) => {
+                            let k = fs.string_constant(name.as_bytes());
+                            prepared.push(Prepared::Name {
+                                local_reg: None,
+                                upval: None,
+                                env: Some(env),
+                                key: Some(k),
+                                tab_reg: None,
+                            });
+                        }
+                        EnvAccess::Local(reg) => {
+                            let k = fs.string_constant(name.as_bytes());
+                            prepared.push(Prepared::Name {
+                                local_reg: None,
+                                upval: None,
+                                env: None,
+                                key: Some(k),
+                                tab_reg: Some(reg),
+                            });
+                        }
                     }
-                    let env = env_upvalue(fs)?;
-                    let k = fs.string_constant(name.as_bytes());
-                    prepared.push(Prepared::Name {
-                        local_reg: None,
-                        upval: None,
-                        env: Some(env),
-                        key: Some(k),
-                    });
                 }
             }
             Var::Index { table, key } => {
@@ -782,6 +991,7 @@ fn compile_assign(
                 upval,
                 env,
                 key,
+                tab_reg,
             } => {
                 if let Some(local_reg) = local_reg {
                     if *local_reg != src_reg {
@@ -789,6 +999,11 @@ fn compile_assign(
                     }
                 } else if let Some(uv) = upval {
                     fs.emit_abc(OpCode::SetUpval, src_reg, *uv, 0, line);
+                } else if let Some(reg) = tab_reg {
+                    let key_reg = fs.alloc_reg()?;
+                    fs.emit_abx(OpCode::LoadK, key_reg, key.unwrap(), line);
+                    fs.emit_abc(OpCode::SetTable, *reg, key_reg, src_reg, line);
+                    fs.free_reg_to(key_reg);
                 } else {
                     fs.emit_settabup(env.unwrap(), key.unwrap(), src_reg, line);
                 }
@@ -993,20 +1208,26 @@ fn compile_numeric_for(
     // Internal "(for state)" pseudo-locals plus the const control variable.
     let body_start_pc = fs.proto.code.len() as u32;
     for i in 0..2 {
+        let seq = fs.next_seq;
+        fs.next_seq += 1;
         fs.locals.push(Local {
             name: "(for state)".to_string(),
             reg: base + i as u8,
             start_pc: body_start_pc,
             is_const: false,
             is_close: false,
+            seq,
         });
     }
+    let seq = fs.next_seq;
+    fs.next_seq += 1;
     fs.locals.push(Local {
         name: name.to_string(),
         reg: base + 2,
         start_pc: body_start_pc,
         is_const: true,
         is_close: false,
+        seq,
     });
 
     // Compile body
@@ -1092,21 +1313,27 @@ fn compile_generic_for(
     // Internal "(for state)" locals; the 3rd (closing) is to-be-closed.
     let ctrl_start_pc = fs.proto.code.len() as u32;
     for i in 0..3 {
+        let seq = fs.next_seq;
+        fs.next_seq += 1;
         fs.locals.push(Local {
             name: "(for state)".to_string(),
             reg: base + i as u8,
             start_pc: ctrl_start_pc,
             is_const: false,
             is_close: i == 2,
+            seq,
         });
     }
     for (i, name) in names.iter().enumerate() {
+        let seq = fs.next_seq;
+        fs.next_seq += 1;
         fs.locals.push(Local {
             name: name.clone(),
             reg: base + 3 + i as u8,
             start_pc: ctrl_start_pc,
             is_const: true,
             is_close: false,
+            seq,
         });
     }
 
@@ -1360,28 +1587,49 @@ fn compile_func_def(
     if name.path.len() == 1 && name.method.is_none() {
         // Simple: function foo() ... end → _ENV["foo"] = closure
         let func_name = &name.path[0];
-        if let Some(local_reg) = fs.find_local(func_name) {
-            fs.emit_abc(OpCode::Move, local_reg, dest, 0, line);
-        } else if let Some(uv) = fs.find_upvalue(func_name) {
-            fs.emit_abc(OpCode::SetUpval, dest, uv, 0, line);
-        } else {
-            let env = env_upvalue(fs)?;
-            let k = fs.string_constant(func_name.as_bytes());
-            fs.emit_settabup(env, k, dest, line);
+        if fs.global_shadows(func_name).is_none() {
+            if let Some(local_reg) = fs.find_local(func_name) {
+                let is_const = fs
+                    .locals
+                    .iter()
+                    .rev()
+                    .find(|l| l.name == *func_name)
+                    .map(|l| l.is_const)
+                    .unwrap_or(false);
+                if is_const {
+                    return Err(LuaError::new(format!(
+                        "{}:{}: attempt to assign to const variable '{func_name}'",
+                        fs.proto.source.as_deref().unwrap_or("?"),
+                        line
+                    )));
+                }
+                fs.emit_abc(OpCode::Move, local_reg, dest, 0, line);
+                fs.free_reg_to(base);
+                return Ok(());
+            }
+            if let Some(uv) = fs.find_upvalue(func_name) {
+                fs.emit_abc(OpCode::SetUpval, dest, uv, 0, line);
+                fs.free_reg_to(base);
+                return Ok(());
+            }
         }
+        fs.check_global_access(func_name, true, line)?;
+        emit_global_set(fs, func_name, dest, line)?;
     } else {
         // Dotted name: function a.b.c() ... end
         // First, load the base table
         let tab_reg = fs.alloc_reg()?;
         let first_name = &name.path[0];
-        if let Some(local_reg) = fs.find_local(first_name) {
+        if fs.global_shadows(first_name).is_some() {
+            fs.check_global_access(first_name, false, line)?;
+            emit_global_get(fs, tab_reg, first_name, line)?;
+        } else if let Some(local_reg) = fs.find_local(first_name) {
             fs.emit_abc(OpCode::Move, tab_reg, local_reg, 0, line);
         } else if let Some(uv) = fs.find_upvalue(first_name) {
             fs.emit_abc(OpCode::GetUpval, tab_reg, uv, 0, line);
         } else {
-            let env = env_upvalue(fs)?;
-            let k = fs.string_constant(first_name.as_bytes());
-            fs.emit_gettabup(tab_reg, env, k, line);
+            fs.check_global_access(first_name, false, line)?;
+            emit_global_get(fs, tab_reg, first_name, line)?;
         }
 
         // Chain through intermediate .path elements (the last segment, or
@@ -1434,6 +1682,10 @@ fn compile_global_func_def(
     body: &FuncBody,
     line: u32,
 ) -> Result<(), LuaError> {
+    // `global function f` declares `f` before compiling its body so the
+    // body can refer to it recursively.
+    fs.add_global_decl(Some(name.to_string()), false);
+
     let base = fs.free_reg;
     let dest = fs.alloc_reg()?;
 
@@ -1443,10 +1695,14 @@ fn compile_global_func_def(
 
     fs.emit_abx(OpCode::Closure, dest, proto_idx, body.end_line);
 
-    // Assign to _ENV[name]
-    let env = env_upvalue(fs)?;
+    // Check that the global is not already defined, then assign it.
+    let chk = fs.alloc_reg()?;
+    emit_global_get(fs, chk, name, line)?;
     let k = fs.string_constant(name.as_bytes());
-    fs.emit_settabup(env, k, dest, line);
+    let bx = if k == u16::MAX { 0 } else { k + 1 };
+    fs.emit_abx(OpCode::ErrNNil, chk, bx, line);
+    fs.free_reg_to(chk);
+    emit_global_set(fs, name, dest, line)?;
 
     fs.free_reg_to(base);
     Ok(())
@@ -1463,6 +1719,14 @@ fn compile_func_body_with_parent(
 
     let source = parent_fs.proto.source.clone();
     let mut child_fs = FuncState::new(source, None);
+
+    // Global declarations from enclosing functions are visible inside.
+    child_fs
+        .outer_globals
+        .push(parent_fs.global_decls.clone());
+    child_fs
+        .outer_globals
+        .extend(parent_fs.outer_globals.iter().cloned());
 
     child_fs.proto.num_params = body.params.len() as u8;
     child_fs.proto.is_vararg = body.has_varargs;
@@ -1515,7 +1779,9 @@ fn compile_func_body_with_parent(
         locals: parent_fs.locals.clone(),
         scopes: Vec::new(), // dummy — not used for scope tracking
         free_reg: parent_fs.free_reg,
-        const_globals: parent_fs.const_globals.clone(),
+        global_decls: parent_fs.global_decls.clone(),
+        outer_globals: parent_fs.outer_globals.clone(),
+        next_seq: parent_fs.next_seq,
         pending_gotos: Vec::new(),
         labels: Vec::new(),
         enclosing: None, // We only go one level deep here
@@ -1819,11 +2085,17 @@ fn compile_local_decl(
     let nnames = names.len();
     let nvalues = values.len();
     let base = fs.free_reg;
-    let depth = fs.scopes.len();
-    for att_name in names {
-        if att_name.attrib.as_deref() == Some("const") {
-            fs.const_globals.push((depth, att_name.name.clone()));
-        }
+
+    // At most one to-be-closed variable per declaration.
+    if names
+        .iter()
+        .filter(|n| n.attrib.as_deref() == Some("close"))
+        .count()
+        > 1
+    {
+        return Err(LuaError::new(
+            "multiple to-be-closed variables in local list",
+        ));
     }
 
     // Evaluate values
@@ -1865,12 +2137,15 @@ fn compile_local_decl(
                 fs.proto.max_stack_size = fs.free_reg;
             }
         }
+        let seq = fs.next_seq;
+        fs.next_seq += 1;
         fs.locals.push(Local {
             name: att_name.name.clone(),
             reg,
             start_pc: fs.proto.code.len() as u32,
             is_const: matches!(att_name.attrib.as_deref(), Some("const") | Some("close")),
             is_close: att_name.attrib.as_deref() == Some("close"),
+            seq,
         });
 
         // Emit TBC for <close> variables
@@ -1891,14 +2166,17 @@ fn compile_global_decl(
     let nnames = names.len();
     let nvalues = values.len();
     let base = fs.free_reg;
-    let depth = fs.scopes.len();
+
+    // Validate attributes: globals cannot be to-be-closed.
     for att_name in names {
-        if att_name.attrib.as_deref() == Some("const") {
-            fs.const_globals.push((depth, att_name.name.clone()));
+        if att_name.attrib.as_deref() == Some("close") {
+            return Err(LuaError::new(
+                "global variables cannot be to-be-closed",
+            ));
         }
     }
 
-    // Evaluate values into temp registers
+    // Evaluate values into temp registers (declarations are not active yet).
     for (i, val) in values.iter().enumerate() {
         let is_last = i == nvalues - 1;
         if is_last && nnames > nvalues {
@@ -1913,24 +2191,38 @@ fn compile_global_decl(
         }
     }
 
+    // Activate the declarations.
+    for att_name in names {
+        fs.add_global_decl(
+            Some(att_name.name.clone()),
+            att_name.attrib.as_deref() == Some("const"),
+        );
+    }
+
     // Assign to _ENV for each name. A declaration without a value
     // (`global foo`) emits no runtime code: it only declares the name.
     if nvalues == 0 {
         fs.free_reg_to(base);
         return Ok(());
     }
-    let env = env_upvalue(fs)?;
     for (i, att_name) in names.iter().enumerate() {
-        let k = fs.string_constant(att_name.name.as_bytes());
         if i < nvalues || (nvalues > 0 && nnames > nvalues) {
-            // Has a value
             let src_reg = base + i as u8;
-            fs.emit_settabup(env, k, src_reg, line);
+            if i < nvalues {
+                // Initialized declarations check that the global is not
+                // defined yet (reference Lua's OP_ERRNNIL).
+                let chk = fs.alloc_reg()?;
+                emit_global_get(fs, chk, &att_name.name, line)?;
+                let k = fs.string_constant(att_name.name.as_bytes());
+                let bx = if k == u16::MAX { 0 } else { k + 1 };
+                fs.emit_abx(OpCode::ErrNNil, chk, bx, line);
+                fs.free_reg_to(chk);
+            }
+            emit_global_set(fs, &att_name.name, src_reg, line)?;
         } else {
-            // No value — assign nil
             let tmp = fs.alloc_reg()?;
             fs.emit_abc(OpCode::LoadNil, tmp, 0, 0, line);
-            fs.emit_settabup(env, k, tmp, line);
+            emit_global_set(fs, &att_name.name, tmp, line)?;
             fs.free_reg_to(tmp);
         }
     }
@@ -2093,11 +2385,72 @@ fn compile_expr_multi(
 
 // ── Variable read ──────────────────────────────────────────────────
 
+/// How `_ENV` is reachable in the current function: as a local register
+/// (e.g. a `_ENV` parameter) or as an upvalue.
+#[derive(Clone, Copy)]
+enum EnvAccess {
+    Local(u8),
+    Upval(u8),
+}
+
 /// The upvalue index holding `_ENV` in the current function. Global
 /// accesses resolve it lazily so upvalues appear in first-use order.
 fn env_upvalue(fs: &mut FuncState) -> Result<u8, LuaError> {
     fs.find_upvalue("_ENV")
         .ok_or_else(|| LuaError::new("cannot resolve '_ENV' upvalue"))
+}
+
+fn env_access(fs: &mut FuncState) -> Result<EnvAccess, LuaError> {
+    if let Some(reg) = fs.find_local("_ENV") {
+        return Ok(EnvAccess::Local(reg));
+    }
+    Ok(EnvAccess::Upval(env_upvalue(fs)?))
+}
+
+/// Emit `dest := _ENV[name]`.
+fn emit_global_get(
+    fs: &mut FuncState,
+    dest: u8,
+    name: &str,
+    line: u32,
+) -> Result<(), LuaError> {
+    match env_access(fs)? {
+        EnvAccess::Upval(uv) => {
+            let k = fs.string_constant(name.as_bytes());
+            fs.emit_gettabup(dest, uv, k, line);
+        }
+        EnvAccess::Local(reg) => {
+            let k = fs.string_constant(name.as_bytes());
+            let key_reg = fs.alloc_reg()?;
+            fs.emit_abx(OpCode::LoadK, key_reg, k, line);
+            fs.emit_abc(OpCode::GetTable, dest, reg, key_reg, line);
+            fs.free_reg_to(key_reg);
+        }
+    }
+    Ok(())
+}
+
+/// Emit `_ENV[name] = src`.
+fn emit_global_set(
+    fs: &mut FuncState,
+    name: &str,
+    src: u8,
+    line: u32,
+) -> Result<(), LuaError> {
+    match env_access(fs)? {
+        EnvAccess::Upval(uv) => {
+            let k = fs.string_constant(name.as_bytes());
+            fs.emit_settabup(uv, k, src, line);
+        }
+        EnvAccess::Local(reg) => {
+            let k = fs.string_constant(name.as_bytes());
+            let key_reg = fs.alloc_reg()?;
+            fs.emit_abx(OpCode::LoadK, key_reg, k, line);
+            fs.emit_abc(OpCode::SetTable, reg, key_reg, src, line);
+            fs.free_reg_to(key_reg);
+        }
+    }
+    Ok(())
 }
 
 fn compile_var_read(
@@ -2108,6 +2461,10 @@ fn compile_var_read(
 ) -> Result<(), LuaError> {
     match var {
         Var::Name(name) => {
+            if fs.global_shadows(name).is_some() {
+                fs.check_global_access(name, false, line)?;
+                return emit_global_get(fs, dest, name, line);
+            }
             if let Some(local_reg) = fs.find_local(name) {
                 if local_reg != dest {
                     fs.emit_abc(OpCode::Move, dest, local_reg, 0, line);
@@ -2116,9 +2473,8 @@ fn compile_var_read(
                 fs.emit_abc(OpCode::GetUpval, dest, uv, 0, line);
             } else {
                 // Global: _ENV[name]
-                let env = env_upvalue(fs)?;
-                let k = fs.string_constant(name.as_bytes());
-                fs.emit_gettabup(dest, env, k, line);
+                fs.check_global_access(name, false, line)?;
+                emit_global_get(fs, dest, name, line)?;
             }
         }
         Var::Index { table, key } => {

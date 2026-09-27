@@ -909,11 +909,11 @@ mod tests {
 
     #[test]
     fn test_keywords() {
-        let tokens = lex("and break do else elseif end false for function global goto if in local nil not or repeat return then true until while");
+        let tokens = lex("and break do else elseif end false for function goto if in local nil not or repeat return then true until while");
         let expected = vec![
             TokenKind::And, TokenKind::Break, TokenKind::Do, TokenKind::Else,
             TokenKind::ElseIf, TokenKind::End, TokenKind::False, TokenKind::For,
-            TokenKind::Function, TokenKind::Global, TokenKind::Goto, TokenKind::If,
+            TokenKind::Function, TokenKind::Goto, TokenKind::If,
             TokenKind::In, TokenKind::Local, TokenKind::Nil, TokenKind::Not,
             TokenKind::Or, TokenKind::Repeat, TokenKind::Return, TokenKind::Then,
             TokenKind::True, TokenKind::Until, TokenKind::While, TokenKind::Eof,
